@@ -526,7 +526,12 @@ void DestroyNativeGuestJit(
     UnregisterGuestVmEpochParticipant(
         &runtime->vmEpochParticipant);
     // Pool before the id is released, so its next owner finds this JIT.
-    if (runtime->jit != nullptr) runtime->jit->ClearExclusiveState();
+    // bsdthread_terminate leaves a level-triggered Exit halt set after Run()
+    // returned; clear every halt or the next thread stops immediately.
+    if (runtime->jit != nullptr) {
+        runtime->jit->ClearExclusiveState();
+        runtime->jit->ClearHalt(static_cast<Dynarmic::HaltReason>(~u32{0}));
+    }
     if (runtime->jit == nullptr || !PoolNativeGuestJit(runtime->processorId,
             PooledNativeGuestJit{runtime->jit, runtime->cpsr,
                                  runtime->callbacks})) {
