@@ -64,6 +64,11 @@ static void testQueue(void) {
     SCNetworkReachabilityContext replacement = {0, &context, retainContext, releaseContext, NULL};
     check("same-context-replace", SCNetworkReachabilitySetCallback(target, callback, &replacement));
     dispatch_sync_f(queue, NULL, drain);
+    check("same-callback-not-redelivered", context.callbacks == 1 && context.references == 2);
+    SCNetworkReachabilityContext other = {0, &context.callbacks, NULL, NULL, NULL};
+    check("other-context-replace", SCNetworkReachabilitySetCallback(target, callback, &other));
+    check("other-context-restore", SCNetworkReachabilitySetCallback(target, callback, &replacement));
+    dispatch_sync_f(queue, NULL, drain);
     check("replacement-delivered", context.callbacks == 2 && context.references == 2);
     check("remove-callback", SCNetworkReachabilitySetCallback(target, NULL, NULL));
     check("context-released", context.references == 1);

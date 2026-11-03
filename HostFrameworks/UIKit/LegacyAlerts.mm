@@ -18,6 +18,7 @@
 
 struct LC32AlertBuildVersion { uint32_t platform, version; };
 extern "C" bool dyld_program_sdk_at_least(LC32AlertBuildVersion version);
+extern "C" void LC32RestoreEmbeddedMoviePresenter(UIViewController *presenter);
 
 namespace {
 struct NativeMethod {
@@ -172,8 +173,11 @@ void Dismiss(UIViewController *self, SEL selector, int transition, void (^comple
 void DismissFrom(UIViewController *self, SEL selector, int transition,
                  UIViewController *from, void (^completion)(void)) {
     PolicyScope scope(from ? IsAlert(from) : DismissesAlert(self), privateDismiss);
+    UIViewController *presenter = self.presentedViewController
+        ? self : self.presentingViewController;
     ((void (*)(id, SEL, int, UIViewController *, void (^)(void)))privateDismiss.original)(
         self, selector, transition, from, completion);
+    LC32RestoreEmbeddedMoviePresenter(presenter);
 }
 
 void FinishDismiss(UIViewController *self, SEL selector) {

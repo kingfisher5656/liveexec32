@@ -68,25 +68,214 @@ private:
     bool active;
 };
 
+/*
+ * Guests run under LiveContainer's (or the bare simulator app's) entitlements,
+ * not their own. Their keychain calls can then fail with
+ * errSecMissingEntitlement, and old games that keep a device ID in the
+ * keychain mint a new one every launch. Gamevil games (Zenonia 5) refuse
+ * their own saves once that ID changes, then loop forever on the rejected
+ * data. Keep generic/internet password items the host keychain will not
+ * hold in a private per-container plist, so they persist like the keychain.
+ */
+NSString *FallbackKeychainPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:
+        @"Library/Preferences/LC32Keychain.plist"];
+}
+
+NSMutableArray *FallbackKeychainItems(void) {
+    static NSMutableArray *items;
+    if(!items) {
+        NSArray *stored = [NSArray arrayWithContentsOfFile:
+            FallbackKeychainPath()];
+        items = stored ? [stored mutableCopy] : [NSMutableArray new];
+    }
+    return items;
+}
+
+void SaveFallbackKeychain(void) {
+    NSString *path = FallbackKeychainPath();
+    [NSFileManager.defaultManager
+        createDirectoryAtPath:path.stringByDeletingLastPathComponent
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    [FallbackKeychainItems() writeToFile:path atomically:YES];
+}
+
+bool FallbackSupportsClass(NSDictionary *dictionary) {
+    id itemClass = dictionary[(id)kSecClass];
+    return [itemClass isEqual:(id)kSecClassGenericPassword] ||
+        [itemClass isEqual:(id)kSecClassInternetPassword];
+}
+
+/* Item attributes are the plist-safe keys that are not search, return,
+ * use or value parameters; the access group is ignored on purpose. */
+bool FallbackIsItemAttribute(NSString *key, id value) {
+    if(![key isKindOfClass:NSString.class] ||
+            [key isEqualToString:(NSString *)kSecAttrAccessGroup] ||
+            [key isEqualToString:(NSString *)kSecValueData] ||
+            [key hasPrefix:@"m_"] || [key hasPrefix:@"r_"] ||
+            [key hasPrefix:@"u_"] || [key hasPrefix:@"v_"]) return false;
+    return [value isKindOfClass:NSString.class] ||
+        [value isKindOfClass:NSData.class] ||
+        [value isKindOfClass:NSNumber.class] ||
+        [value isKindOfClass:NSDate.class];
+}
+
+bool FallbackItemMatches(NSDictionary *item, NSDictionary *query) {
+    for(NSString *key in query) {
+        id value = query[key];
+        if((FallbackIsItemAttribute(key, value) ||
+                [key isEqualToString:(NSString *)kSecClass]) &&
+                ![item[key] isEqual:value]) return false;
+    }
+    return true;
+}
+
+NSArray *FallbackMatches(NSDictionary *query) {
+    NSMutableArray *matches = [NSMutableArray array];
+    for(NSDictionary *item in FallbackKeychainItems()) {
+        if(FallbackItemMatches(item, query)) [matches addObject:item];
+    }
+    return matches;
+}
+
+id FallbackResultForItem(NSDictionary *item, NSDictionary *query) {
+    const bool wantsData = [query[(id)kSecReturnData] boolValue];
+    const bool wantsAttributes = [query[(id)kSecReturnAttributes] boolValue];
+    if(wantsAttributes) {
+        NSMutableDictionary *result = [[item mutableCopy] autorelease];
+        if(!wantsData) [result removeObjectForKey:(id)kSecValueData];
+        return result;
+    }
+    return wantsData ? item[(id)kSecValueData] : nil;
+}
+
+OSStatus FallbackCopyMatching(NSDictionary *query, CFTypeRef *result) {
+    if(!FallbackSupportsClass(query)) return errSecItemNotFound;
+    NSArray *matches = FallbackMatches(query);
+    if(!matches.count) return errSecItemNotFound;
+    if(!result) return errSecSuccess;
+    id value;
+    if([query[(id)kSecMatchLimit] isEqual:(id)kSecMatchLimitAll]) {
+        NSMutableArray *all = [NSMutableArray array];
+        for(NSDictionary *item in matches) {
+            id one = FallbackResultForItem(item, query);
+            if(one) [all addObject:one];
+        }
+        value = all;
+    } else {
+        value = FallbackResultForItem(matches.firstObject, query);
+    }
+    *result = value ? CFRetain((CFTypeRef)value) : nullptr;
+    return errSecSuccess;
+}
+
+OSStatus FallbackAdd(NSDictionary *attributes) {
+    if(!FallbackSupportsClass(attributes)) return errSecMissingEntitlement;
+    NSMutableDictionary *item = [NSMutableDictionary dictionary];
+    for(NSString *key in attributes) {
+        id value = attributes[key];
+        if(FallbackIsItemAttribute(key, value) ||
+                [key isEqualToString:(NSString *)kSecClass] ||
+                ([key isEqualToString:(NSString *)kSecValueData] &&
+                 [value isKindOfClass:NSData.class])) {
+            item[key] = value;
+        }
+    }
+    NSMutableDictionary *identity = [NSMutableDictionary dictionary];
+    for(NSString *key in @[(id)kSecClass, (id)kSecAttrAccount,
+            (id)kSecAttrService, (id)kSecAttrServer]) {
+        if(item[key]) identity[key] = item[key];
+    }
+    if(FallbackMatches(identity).count) return errSecDuplicateItem;
+    [FallbackKeychainItems() addObject:item];
+    SaveFallbackKeychain();
+    return errSecSuccess;
+}
+
+OSStatus FallbackUpdate(NSDictionary *query, NSDictionary *attributes) {
+    if(!FallbackSupportsClass(query)) return errSecItemNotFound;
+    NSMutableArray *items = FallbackKeychainItems();
+    bool updated = false;
+    for(NSUInteger index = 0; index < items.count; ++index) {
+        if(!FallbackItemMatches(items[index], query)) continue;
+        NSMutableDictionary *item = [[items[index] mutableCopy] autorelease];
+        for(NSString *key in attributes) {
+            id value = attributes[key];
+            if(FallbackIsItemAttribute(key, value) ||
+                    ([key isEqualToString:(NSString *)kSecValueData] &&
+                     [value isKindOfClass:NSData.class])) {
+                item[key] = value;
+            }
+        }
+        items[index] = item;
+        updated = true;
+    }
+    if(!updated) return errSecItemNotFound;
+    SaveFallbackKeychain();
+    return errSecSuccess;
+}
+
+OSStatus FallbackDelete(NSDictionary *query) {
+    if(!FallbackSupportsClass(query)) return errSecItemNotFound;
+    NSArray *matches = FallbackMatches(query);
+    if(!matches.count) return errSecItemNotFound;
+    [FallbackKeychainItems() removeObjectsInArray:matches];
+    SaveFallbackKeychain();
+    return errSecSuccess;
+}
+
 OSStatus CallItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     SecurityHostCallQuiescence quiescence;
-    return SecItemAdd(attributes, result);
+    OSStatus status = SecItemAdd(attributes, result);
+    NSDictionary *dictionary = (NSDictionary *)attributes;
+    if(status == errSecMissingEntitlement &&
+            dictionary[(id)kSecAttrAccessGroup]) {
+        /* The guest's own team access group (Gamevil's
+         * "D2E48J33S9.gamevilGames") is never ours to use. */
+        NSMutableDictionary *withoutGroup =
+            [[dictionary mutableCopy] autorelease];
+        [withoutGroup removeObjectForKey:(id)kSecAttrAccessGroup];
+        status = SecItemAdd((CFDictionaryRef)withoutGroup, result);
+    }
+    if(status == errSecMissingEntitlement) {
+        if(result) *result = nullptr;
+        status = FallbackAdd(dictionary);
+    }
+    return status;
 }
 
 OSStatus CallItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     SecurityHostCallQuiescence quiescence;
-    return SecItemCopyMatching(query, result);
+    OSStatus status = SecItemCopyMatching(query, result);
+    if(status == errSecMissingEntitlement ||
+            status == errSecItemNotFound) {
+        const OSStatus fallback =
+            FallbackCopyMatching((NSDictionary *)query, result);
+        if(fallback == errSecSuccess ||
+                status == errSecMissingEntitlement) status = fallback;
+    }
+    return status;
 }
 
 OSStatus CallItemDelete(CFDictionaryRef query) {
     SecurityHostCallQuiescence quiescence;
-    return SecItemDelete(query);
+    const OSStatus status = SecItemDelete(query);
+    const OSStatus fallback = FallbackDelete((NSDictionary *)query);
+    return status == errSecSuccess || fallback == errSecSuccess
+        ? errSecSuccess
+        : status == errSecMissingEntitlement ? fallback : status;
 }
 
 OSStatus CallItemUpdate(CFDictionaryRef query,
                         CFDictionaryRef attributes) {
     SecurityHostCallQuiescence quiescence;
-    return SecItemUpdate(query, attributes);
+    const OSStatus status = SecItemUpdate(query, attributes);
+    if(status != errSecMissingEntitlement &&
+            status != errSecItemNotFound) return status;
+    const OSStatus fallback = FallbackUpdate((NSDictionary *)query,
+        (NSDictionary *)attributes);
+    return fallback == errSecSuccess || status == errSecMissingEntitlement
+        ? fallback : status;
 }
 
 CFDictionaryRef CallTrustCopyInfo(SecTrustRef trust) {

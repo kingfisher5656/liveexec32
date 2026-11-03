@@ -327,6 +327,53 @@ void SyncBitmapBacking(CGContextRef context,
     }
 }
 
+/* The guest owns the buffer it passed to CGBitmapContextCreate and may write
+ * it directly between calls: Gamevil's glyph cache (Zenonia 4/5) clears its
+ * bitmap with memset before drawing each glyph. Bring those writes into the
+ * host copy before Core Graphics composites over it, or every glyph lands on
+ * all the previous ones and SyncBitmapBacking pushes the pile back. */
+void PullBitmapBacking(BitmapBacking *backing) {
+    if(!backing || !backing->guestData || !backing->guestByteCount ||
+            !backing->bytes) return;
+    if(backing->guestBytesPerRow == backing->hostBytesPerRow) {
+        (void)Dynarmic_mem_1read(backing->guestData, backing->guestByteCount,
+            reinterpret_cast<char *>(backing->bytes.get()));
+        return;
+    }
+    for(size_t row = 0; row < backing->height; ++row) {
+        const u32 guestRow = backing->guestData +
+            static_cast<u32>(row * backing->guestBytesPerRow);
+        (void)Dynarmic_mem_1read(guestRow, backing->guestBytesPerRow,
+            reinterpret_cast<char *>(backing->bytes.get() +
+                row * backing->hostBytesPerRow));
+    }
+}
+
+bool OpcodeWritesBitmap(LC32CoreGraphicsOpcode opcode) {
+    switch(opcode) {
+        case LC32CoreGraphicsOpBitmapContextGetData:
+        case LC32CoreGraphicsOpContextClearRect:
+        case LC32CoreGraphicsOpContextDrawLinearGradient:
+        case LC32CoreGraphicsOpContextDrawPath:
+        case LC32CoreGraphicsOpContextDrawRadialGradient:
+        case LC32CoreGraphicsOpContextDrawTiledImage:
+        case LC32CoreGraphicsOpContextEndTransparencyLayer:
+        case LC32CoreGraphicsOpContextFillEllipseInRect:
+        case LC32CoreGraphicsOpContextFillPath:
+        case LC32CoreGraphicsOpContextFillRect:
+        case LC32CoreGraphicsOpContextFlush:
+        case LC32CoreGraphicsOpContextShowGlyphsAtPoint:
+        case LC32CoreGraphicsOpContextShowGlyphsAtPositions:
+        case LC32CoreGraphicsOpContextStrokeEllipseInRect:
+        case LC32CoreGraphicsOpContextStrokeLineSegments:
+        case LC32CoreGraphicsOpContextStrokePath:
+        case LC32CoreGraphicsOpContextStrokeRect:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void ReleaseBitmapBacking(void *releaseInfo, void *) {
     auto *backing = static_cast<BitmapBacking *>(releaseInfo);
     if(!backing) return;
@@ -365,9 +412,18 @@ void LC32CoreGraphicsSyncBitmapBacking(CGContextRef context) {
     if(context) SyncBitmapBacking(context, FindBitmapBacking(context));
 }
 
+void LC32CoreGraphicsPrepareBitmapBacking(CGContextRef context) {
+    if(context) PullBitmapBacking(FindBitmapBacking(context));
+}
+
 u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
     LC32CoreGraphicsCall call;
     if(!ReadCoreGraphicsCall(guestCall, call)) return 0;
+    if(call.slotCount && OpcodeWritesBitmap(
+            static_cast<LC32CoreGraphicsOpcode>(opcode))) {
+        PullBitmapBacking(FindBitmapBacking(
+            SlotHostObject<CGContextRef>(call, 0)));
+    }
 
     switch(static_cast<LC32CoreGraphicsOpcode>(opcode)) {
         case LC32CoreGraphicsOpBitmapContextCreate: {

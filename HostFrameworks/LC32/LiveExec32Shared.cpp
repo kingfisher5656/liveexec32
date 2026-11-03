@@ -950,6 +950,49 @@ void setupPathEnvs(char* argv0) {
     setenv("DYLD_PATH", path, 0);
 }
 
+/*
+ * Before iOS 8 the bundle lived in HOME, so games reach their data as
+ * <bundle>/../Documents (Starfront's replay.dat). Here the bundle is in
+ * LiveContainer's Applications folder (or anywhere in the Simulator), so
+ * that path missed and the game used the NULL file. Guest paths are
+ * normalized lexically, which lets a guest-only alias send these siblings
+ * to HOME. Existing host siblings are left alone.
+ */
+static void ExposeLegacyHomeBesideBundle(const std::string &guestHome,
+                                         const char *executablePath,
+                                         uint32_t sdkVersion) {
+    if(sdkVersion >= 0x00080000 || guestHome.empty() ||
+            executablePath == nullptr || executablePath[0] != '/') {
+        return;
+    }
+    const std::string executable(executablePath);
+    const size_t executableSlash = executable.find_last_of('/');
+    if(executableSlash == 0 || executableSlash == std::string::npos) return;
+    const std::string bundle = executable.substr(0, executableSlash);
+    if(bundle.size() <= 4 ||
+            bundle.compare(bundle.size() - 4, 4, ".app") != 0) {
+        return;
+    }
+    const size_t bundleSlash = bundle.find_last_of('/');
+    if(bundleSlash == 0 || bundleSlash == std::string::npos) return;
+    const std::string parent = bundle.substr(0, bundleSlash);
+    char resolvedParent[PATH_MAX];
+    char resolvedHome[PATH_MAX];
+    if(!realpath(parent.c_str(), resolvedParent) ||
+            !realpath(guestHome.c_str(), resolvedHome) ||
+            strcmp(resolvedParent, resolvedHome) == 0) {
+        return;
+    }
+    for(const char *name : {"Documents", "Library", "tmp"}) {
+        const std::string sibling = parent + "/" + name;
+        struct stat metadata = {};
+        if(lstat(sibling.c_str(), &metadata) == 0) continue;
+        sharedHandle.fs->addGuestPathAlias(sibling, guestHome + "/" + name);
+        LC32_DEBUG_PRINTF("legacy HOME alias %s -> %s/%s\n",
+            sibling.c_str(), guestHome.c_str(), name);
+    }
+}
+
 int LC32RunGuest(int argc, char* argv[], char* envp[]) {
     if(argc < 2 || argv == nullptr || argv[0] == nullptr ||
             argv[1] == nullptr) {
@@ -1056,6 +1099,8 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
         fprintf(stderr, "LC32: could not expose the legacy app bundle in HOME: %s\n",
             strerror(legacyLayoutError));
     }
+    ExposeLegacyHomeBesideBundle(guestHome, execPath,
+        guestExecutableSDKVersion);
     setenv("LC32_GUEST_EXECUTABLE", execPath, 1);
     LC32ConfigureLegacyAppTransportSecurity(
         guestExecutableSDKVersion);
@@ -1065,6 +1110,7 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
     LC32_DEBUG_PRINTF("Loading dyld at DYLD_PATH %s\n", dyldPath);
     Dynarmic_map_file(true, 0x10000000, dyldPath);
     InstallGuestTracepointsFromEnvironment();
+    Dynarmic_apply_guest_code_fixups();
     LC32_DEBUG_PRINTF("entry point: 0x%x\n", threadHandle.jit->Regs()[15]);
     
     // commpage 0xffff4000+0x1000

@@ -3234,6 +3234,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
     bool returnsBlock = false;
     bool returnsNSRange = false;
     unsigned indirectStructReturnSize = 0;
+    char returnHomogeneousFloat = 0;
     if(hasMethodSignature) {
         char *returnType = copyReturnType();
         if(returnType) {
@@ -3251,9 +3252,10 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                 unqualifiedType[1] == '?';
             returnsNSRange = LC32NativeNSRangeType(unqualifiedType);
             LC32PODType pod = {};
-            if(LC32PODStructType(unqualifiedType, true, &pod) &&
-                    pod.size > 16 && !LC32PODHomogeneousFloat(&pod)) {
-                indirectStructReturnSize = pod.size;
+            if(LC32PODStructType(unqualifiedType, true, &pod)) {
+                returnHomogeneousFloat = LC32PODHomogeneousFloat(&pod);
+                if(pod.size > 16 && !returnHomogeneousFloat)
+                    indirectStructReturnSize = pod.size;
             }
             free(returnType);
         }
@@ -3364,12 +3366,23 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     (char *)&result);
                 break;
             }
+            case 3 * sizeof(double):
+                // A three-double HFA such as CMAcceleration or
+                // CMRotationRate returns in d0-d2. Read it through the
+                // four-double trampoline and copy only the three members.
+                if(returnHomogeneousFloat != 'd') {
+                    printf("LC32: unsupported host struct return size %u "
+                           "for selector %s\n", structLen,
+                           sel_getName(selector));
+                    break;
+                }
+                [[fallthrough]];
             case sizeof(LC32HostMessageFourDoubles): {
                 LC32GuestHostCallQuiescence quiescence;
                 const LC32HostMessageFourDoubles result =
                     LC32InvokeHostMessageFourDoubles(&invocation);
                 quiescence.finish();
-                (void)Dynarmic_mem_1write(structPtr, sizeof(result),
+                (void)Dynarmic_mem_1write(structPtr, structLen,
                     (char *)&result);
                 break;
             }
@@ -3481,9 +3494,78 @@ static u32 LC32CachedGuestSelector(std::atomic<u32> &cache,
 }
 
 static thread_local u32 LC32GuestCallbackNesting = 0;
+/* Guest SP at the start of the innermost host -> guest callback on this
+ * thread, or 0 for the thread's outermost guest run. Guest frames older than
+ * this callback live at or above it, behind native frames that a guest
+ * longjmp cannot unwind. */
+static thread_local u32 LC32GuestCallbackEntrySP = 0;
 
 u32 LC32GuestCallbackDepth(void) {
     return LC32GuestCallbackNesting;
+}
+
+#pragma mark Native exceptions -> guest @catch
+
+/* armv7 guests use SjLj exceptions. libunwind keeps the innermost registered
+ * _Unwind_FunctionContext in pthread TSD slot 18 (__PTK_LIBC_DYLD_Unwind_SjLj_Key),
+ * i.e. at (TPIDRURO & ~3) + 0x48 in the iOS 10 libunwind. */
+static constexpr u32 LC32GuestSjLjTSDOffset = 18 * sizeof(u32);
+
+/* True when the innermost guest @try/@catch (or cleanup) context was
+ * registered by a guest frame that is still live and belongs to the current
+ * callback level, so a guest throw resumes without crossing native frames. */
+static bool LC32GuestHasCurrentLevelSjLjContext(void) {
+    if(threadHandle.jit == nullptr || threadHandle.cb == nullptr) return false;
+    const std::shared_ptr<DynarmicCP15> &cp15 =
+        DynarmicCallbacks32CP15(threadHandle.cb);
+    if(!cp15) return false;
+    const u32 tsd = cp15->uro & ~3u;
+    if(!tsd) return false;
+    const u32 context = Dynarmic_current_user_callbacks()->MemoryRead32(
+        tsd + LC32GuestSjLjTSDOffset);
+    const u32 sp = threadHandle.jit->Regs()[Reg::SP];
+    if(!context || context < sp) return false;
+    const u32 entrySP = LC32GuestCallbackEntrySP;
+    return entrySP == 0 || context < entrySP;
+}
+
+u64 LC32InvokeHostSelectorFromGuest(u64 host_self, u64 host_cmd,
+                                    u64 va_args, u32 *guestException) {
+    *guestException = 0;
+    @try {
+        return LC32InvokeHostSelector(host_self, host_cmd, va_args);
+    } @catch(NSException *exception) {
+        /*
+         * Old games rely on catching Foundation exceptions, for example
+         * Grabatron's -[NSMutableArray addObject:nil] inside @try. A native
+         * throw cannot reach a guest @catch, so hand a guest proxy of the
+         * exception to the guest's own objc_exception_throw instead. Keep the
+         * previous native behavior when no guest handler can safely receive
+         * it.
+         */
+        if(LC32IsGuestCrashException(exception) ||
+                !LC32GuestHasCurrentLevelSjLjContext()) {
+            @throw;
+        }
+        static std::atomic<u32> guestThrowFunction{0};
+        const u32 throwFunction = LC32CachedGuestSymbol(
+            guestThrowFunction, "objc_exception_throw");
+        if(!throwFunction) {
+            @throw;
+        }
+        // On failure the conversion consumes the +1 itself.
+        const u32 guestObject = LC32GuestObjectForOwnedHostObject(
+            (CFTypeRef)[exception retain]);
+        if(!guestObject) {
+            @throw;
+        }
+        fprintf(stderr,
+            "LC32: forwarding native %s to guest @catch: %s\n",
+            exception.name.UTF8String ?: "NSException",
+            exception.reason.UTF8String ?: "(no reason)");
+        *guestException = guestObject;
+        return throwFunction;
+    }
 }
 
 u64 LC32InvokeGuestC(u32 pc, bool ret64, int argc, u32 *args) {
@@ -3517,6 +3599,14 @@ u64 LC32InvokeGuestC(u32 pc, bool ret64, int argc, u32 *args) {
         Dynarmic_current_user_callbacks()->MemoryWrite32(regs[Reg::SP] -= sizeof(u32), args[i]);
     }
     regs[12] = pc;
+    struct CallbackEntrySPScope {
+        explicit CallbackEntrySPScope(u32 sp)
+            : previous(LC32GuestCallbackEntrySP) {
+            LC32GuestCallbackEntrySP = sp;
+        }
+        ~CallbackEntrySPScope() { LC32GuestCallbackEntrySP = previous; }
+        u32 previous;
+    } callbackEntrySPScope(regs[Reg::SP]);
     Dynarmic::HaltReason reason =
         Dynarmic_emu_1start(sharedHandle.guest_LC32InvokeGuestC);
     bool callbackSteppedOut = false;
@@ -4900,6 +4990,31 @@ static u64 LC32InvokeGuestSelectorRaw(id self, SEL _cmd,
     return guest_objc_msgSend((int)guest_argc, guest_args);
 }
 
+static u8 *LC32GuestMirrorRetiringState(id hostObject);
+
+static bool LC32SelectorIsInitFamily(SEL selector) {
+    const char *name = selector ? sel_getName(selector) : nullptr;
+    return name && strncmp(name, "init", 4) == 0 &&
+        !(name[4] >= 'a' && name[4] <= 'z');
+}
+
+/* Native code (NSKeyedUnarchiver) can allocate an instance of a guest class
+ * and run its initializer. Old class-cluster initializers replace self:
+ * Chillingo's -[CCAbstractServerData initWithCoder:] autoreleases the
+ * allocation and returns [replacement retain]. Natively that discarded
+ * allocation simply dies. Here its synthesized mirror is still pinned by the
+ * native allocation's +1, which the caller now treats as consumed, so the
+ * guest's last release cannot tear it down and the bridge aborts. Keep the
+ * discarded allocation alive instead (a small, bounded leak). */
+static void LC32KeepReplacedGuestInitializerReceiver(
+        id self, SEL selector, const char *returnType, u64 hostResult) {
+    if(!returnType || returnType[0] != '@' || !hostResult ||
+            (id)(uintptr_t)hostResult == self ||
+            !LC32SelectorIsInitFamily(selector) ||
+            !LC32GuestMirrorRetiringState(self)) return;
+    (void)LC32InvokeGuestSelectorWordsRaw(self, @selector(retain), nullptr, 0);
+}
+
 u64 LC32InvokeGuestSelector(id self, SEL _cmd, u64 arg2, u64 arg3,
                             u64 arg4, u64 arg5, u64 arg6, u64 arg7, ...) {
     va_list hostStackArguments;
@@ -4913,6 +5028,8 @@ u64 LC32InvokeGuestSelector(id self, SEL _cmd, u64 arg2, u64 arg3,
 
     char *returnType = method_copyReturnType(method);
     u64 host_result = LC32GuestToHostReturnType(returnType, guest_result);
+    LC32KeepReplacedGuestInitializerReceiver(
+        self, _cmd, returnType, host_result);
     free(returnType);
     return host_result;
 }

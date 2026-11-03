@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1915,6 +1916,55 @@ uint32_t DispatchInfoLog(const LC32OpenGLESCall &call, bool shader) {
     return 0;
 }
 
+// Legacy engines (Gameloft's Glitch, Irrlicht forks) only allow NPOT
+// textures and render targets when GL_EXTENSIONS names an NPOT extension.
+// PowerVR-era iOS listed GL_APPLE_texture_2D_limited_npot for ES1 and ES2;
+// Apple-GPU devices stopped listing it although every ES2+ context still
+// supports limited NPOT, so screen-sized render targets fail and the guest
+// dereferences the null texture. Keep advertising it.
+bool GuestGLString(GLenum name, std::string &value) {
+    const GLubyte *native = glGetString(name);
+    if(!native) return false;
+    value = reinterpret_cast<const char *>(native);
+    if(name != GL_EXTENSIONS) return true;
+    // Debug aid: LC32_GL_HIDE_EXTENSIONS="A B" drops names, e.g. to give the
+    // Simulator a device-like list.
+    if(const char *hidden = getenv("LC32_GL_HIDE_EXTENSIONS")) {
+        std::string list = hidden, kept, token;
+        for(size_t i = 0; i <= value.size(); ++i) {
+            if(i < value.size() && value[i] != ' ') {
+                token += value[i];
+                continue;
+            }
+            if(!token.empty() && (" " + list + " ").find(
+                    " " + token + " ") == std::string::npos) {
+                kept += token + ' ';
+            }
+            token.clear();
+        }
+        value = kept;
+    }
+    static const char *const kLegacyExtensions[] = {
+        "GL_APPLE_texture_2D_limited_npot",
+    };
+    for(const char *extension : kLegacyExtensions) {
+        const std::string padded = " " + value + " ";
+        if(padded.find(std::string(" ") + extension + " ") !=
+           std::string::npos) continue;
+        // Keep the trailing space Apple's strings end with: Glitch only
+        // matches a name once it reaches the space after it.
+        if(!value.empty() && value.back() != ' ') value += ' ';
+        value += extension;
+        value += ' ';
+        static std::once_flag logged;
+        std::call_once(logged, [extension] {
+            fprintf(stderr, "LC32: GL_EXTENSIONS lacks %s; advertising it\n",
+                extension);
+        });
+    }
+    return true;
+}
+
 bool ReadGuestGLString(int32_t length, uint32_t guestAddress,
                        std::vector<GLchar> &storage,
                        const GLchar *&string) {
@@ -2434,18 +2484,18 @@ extern "C" uint32_t LC32_OpenGLES_Dispatch(uint32_t opcode,
         }
         case LC32OpenGLESOpGetStringLength: {
             REQUIRE(1);
-            const GLubyte *value = glGetString(U(0));
-            if(!value) return 0;
-            size_t length = strlen(reinterpret_cast<const char *>(value)) + 1;
+            std::string value;
+            if(!GuestGLString(U(0), value)) return 0;
+            size_t length = value.size() + 1;
             return length <= UINT32_MAX ? static_cast<uint32_t>(length) : 0;
         }
         case LC32OpenGLESOpGetStringCopy: {
             REQUIRE(3);
-            const GLubyte *value = glGetString(U(0));
-            if(!value) return 0;
-            size_t length = strlen(reinterpret_cast<const char *>(value)) + 1;
+            std::string value;
+            if(!GuestGLString(U(0), value)) return 0;
+            size_t length = value.size() + 1;
             if(length > U(2) || length > UINT32_MAX ||
-               !WriteGuestBytes(U(1), value, length)) return 0;
+               !WriteGuestBytes(U(1), value.c_str(), length)) return 0;
             return static_cast<uint32_t>(length);
         }
         case LC32OpenGLESOpGetError: {

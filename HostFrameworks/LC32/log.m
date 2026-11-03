@@ -38,8 +38,9 @@ static void LC32LogBuildAndDeviceInfo(void) {
 }
 
 __attribute__((constructor)) void logToFileIfNeeded() {
-    // Don't log in CLI
-    if(getppid() != 1) return;
+    // Don't log in CLI. LiveContainer may launch the guest from a process
+    // whose parent is not launchd, so its environment marker also counts.
+    if(getppid() != 1 && !getenv("LC_HOME_PATH")) return;
 
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *home = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask]

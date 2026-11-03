@@ -127,6 +127,8 @@ u32 LC32UIKitLegacyCompatibilityEnabled(void);
 // iPad-on-phone canvas virtualization is independent of the process SDK's
 // rotation policy. Native iPadOS windows do not use this adapter.
 u32 LC32UIKitLegacyIPadCanvasEnabled(void);
+// The fixed 320x480 phone canvas when native pre-iOS-8 UIKit owns rotation.
+u32 LC32UIKitNativeFixedPhoneCanvasEnabled(void);
 // Lets framework bridges add native compatibility entry points after all
 // guest methods have been mirrored but before the class is registered.
 void LC32UIKitPrepareGuestClass(Class cls);

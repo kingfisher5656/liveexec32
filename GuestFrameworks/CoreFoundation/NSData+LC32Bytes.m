@@ -55,7 +55,10 @@ static BOOL LC32GrowDataGuestBuffer(LC32DataGuestBuffer *buffer,
     /* Keep a stable, dereferenceable pointer for zero-length mutable data. */
     const uint32_t required = length ? length : 1;
     if(buffer->_capacity >= required) return YES;
-    UInt8 *grown = realloc(buffer->_bytes, required);
+    /* One spare byte past the capacity keeps -bytes NUL-terminated; legacy
+     * clients (Gamevil's GvCIH key setup) strlen() small NSData buffers,
+     * which native Foundation's malloc slack usually lets them get away with. */
+    UInt8 *grown = realloc(buffer->_bytes, (size_t)required + 1);
     if(!grown) return NO;
     buffer->_bytes = grown;
     UInt8 *grownBaseline = realloc(buffer->_baseline, required);
@@ -182,6 +185,7 @@ uint64_t LC32SynchronizeMutableDataGuestBytes(NSMutableData *data) {
             self.host_self, buffer->_bytes, (uint32_t)length, 0) ==
                 (uint32_t)length;
         if(copied) {
+            ((UInt8 *)buffer->_bytes)[length] = 0;
             if(length) memcpy(buffer->_baseline, buffer->_bytes, length);
             buffer->_length = (uint32_t)length;
             buffer->_valid = YES;
@@ -197,6 +201,11 @@ uint64_t LC32SynchronizeMutableDataGuestBytes(NSMutableData *data) {
 }
 
 - (void)getBytes:(void *)buffer length:(NSUInteger)length {
+    // Foundation copies at most the receiver's length here; only
+    // getBytes:range: raises for a range past the end.  Gamevil's GvCIH
+    // module asks for a fixed 64-byte key from shorter decoded data.
+    const NSUInteger available = self.length;
+    if(length > available) length = available;
     if(length > UINT32_MAX || LC32CopyHostDataBytes(
             self.host_self, buffer, (uint32_t)length, 0) != length) {
         CRSetCrashLogMessage(

@@ -2,6 +2,7 @@
 #include "dynarmic_syscalls.h"
 #include "darwin_file_syscalls.h"
 #include "crash_exception.h"
+#include <mach/mach_time.h>
 
 namespace {
 static kern_return_t WaitForGuestSemaphore(
@@ -2238,10 +2239,25 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 }
                 u64 host_self = (u64)cpu->Regs()[0] | ((u64)cpu->Regs()[1] << 32);
                 u64 host_cmd = (u64)cpu->Regs()[2] | ((u64)cpu->Regs()[3] << 32);
+                u32 guestException = 0;
                 u64 result = InvokeNativeGuestHostCall([&] {
-                    return LC32InvokeHostSelector(
-                        host_self, host_cmd, cpu->Regs()[Reg::SP]);
+                    return LC32InvokeHostSelectorFromGuest(
+                        host_self, host_cmd, cpu->Regs()[Reg::SP],
+                        &guestException);
                 });
+                if(guestException) {
+                    // The guest stub is `svc; bx lr`, so resuming in
+                    // objc_exception_throw(exception) with LR untouched is a
+                    // tail call from the stub. SjLj unwinding then reaches
+                    // the guest's own @catch.
+                    const u32 throwFunction = (u32)result;
+                    const u32 cpsr = cpu->Cpsr();
+                    cpu->Regs()[0] = guestException;
+                    cpu->Regs()[15] = throwFunction & ~1u;
+                    cpu->SetCpsr((throwFunction & 1) ?
+                        (cpsr | 0x20) : (cpsr & ~0x20u));
+                    break;
+                }
                 cpu->Regs()[0] = (u32)result;
                 cpu->Regs()[1] = (u32)(result >> 32);
                 break;

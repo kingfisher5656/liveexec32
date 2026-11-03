@@ -17,6 +17,7 @@
 @end
 
 struct LC32RotationBuildVersion { uint32_t platform, version; };
+extern "C" bool LC32FullScreenRootlessHostingActive(void);
 extern "C" bool dyld_program_sdk_at_least(LC32RotationBuildVersion version);
 
 namespace {
@@ -43,11 +44,16 @@ UIInterfaceOrientationMask LegacySupportedOrientations(id, SEL) {
     // This is a policy query, not a rotation request. In particular, old Unity
     // writes its pending orientation even when shouldAutorotate returns NO.
     // Probing all four directions here would leave an arbitrary pending turn.
-    return DeclaredOrientations();
+    // A portrait-hosted full-screen game (UIKit.mm) keeps its scene portrait;
+    // a landscape-only movie controller it presents would turn it back.
+    return LC32FullScreenRootlessHostingActive()
+        ? DeclaredOrientations() | UIInterfaceOrientationMaskPortrait
+        : DeclaredOrientations();
 }
 
 UIInterfaceOrientation LegacyPreferredOrientation(id, SEL) {
-    return PreferredOrientation();
+    return LC32FullScreenRootlessHostingActive()
+        ? UIInterfaceOrientationPortrait : PreferredOrientation();
 }
 
 bool RegisteredClass(Class cls) {

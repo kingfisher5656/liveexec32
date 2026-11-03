@@ -20,12 +20,17 @@ public:
 
     LC32Filesystem() {}
     void addMountpoint(string guest, string host);
+    // Guest-only rewrite applied after normalization, before mount lookup.
+    // Host->guest translation is unchanged, so host paths keep one spelling.
+    void addGuestPathAlias(string guest, string target);
     bool pathGuestToHost(uint32_t inputAddr, char *output);
     bool pathGuestToHost(const char *input, char *output);
     bool pathHostToGuest(const char *input, uint32_t outputAddr);
     bool pathHostToGuest(const char *input, char *output);
 
     vector<string> guestmpVec;
+    vector<string> guestAliasVec;
+    vector<string> guestAliasTargetVec;
     vector<string> hostmpVec;
 };
 

@@ -103,6 +103,11 @@ typedef enum : uint32_t {
     LC32CoreTextOpRunGetAdvances = 52,
     LC32CoreTextOpRunGetStringIndices = 53,
     LC32CoreTextOpTypesetterSuggestLineBreak = 54,
+    LC32CoreTextOpFontCopyDisplayName = 55,
+    LC32CoreTextOpFontCreateForString = 56,
+    LC32CoreTextOpFontGetCapHeight = 57,
+    LC32CoreTextOpFontGetXHeight = 58,
+    LC32CoreTextOpFontGetUnderlinePosition = 59,
 } LC32CoreTextOpcode;
 
 #endif

@@ -350,17 +350,77 @@ private:
     void *token = nullptr;
 };
 
-static NativeGuestJit *CreateNativeGuestJit(
-        const context32 &initial, size_t processorId) {
-    auto *runtime = new NativeGuestJit();
-    runtime->processorId = processorId;
-    runtime->callbacks =
+/*
+ * On iOS 26 every new JIT region is prepared by the attached JIT debugger
+ * (oaknut's JIT26PrepareRegion traps with brk #0xf00d for it). Once that
+ * connection is gone, e.g. after the app was in the background, the next
+ * guest pthread's fresh 16 MiB code cache kills the process with SIGTRAP
+ * (Air Mail: a Crystal achievement popup thread after a mission). Keep the
+ * JIT of an exited guest thread for the next thread that gets its processor
+ * id (ids are handed out lowest-first), and prepare a few spares while the
+ * first guest thread is created, when the debugger is known to be attached.
+ */
+struct PooledNativeGuestJit {
+    Dynarmic::A32::Jit *jit = nullptr;
+    DynarmicCpsr *cpsr = nullptr;
+    DynarmicCallbacks32 *callbacks = nullptr;
+};
+static std::mutex pooledNativeGuestJitMutex;
+static PooledNativeGuestJit pooledNativeGuestJits[MaxNativeGuestProcessors];
+static constexpr size_t PrewarmedNativeGuestJits = 12;
+
+static bool BuildNativeGuestJitParts(
+        size_t processorId, PooledNativeGuestJit &parts);
+
+static bool TakePooledNativeGuestJit(
+        size_t processorId, PooledNativeGuestJit &parts) {
+    if (processorId >= MaxNativeGuestProcessors) return false;
+    std::lock_guard<std::mutex> lock(pooledNativeGuestJitMutex);
+    PooledNativeGuestJit &slot = pooledNativeGuestJits[processorId];
+    if (slot.jit == nullptr) return false;
+    parts = slot;
+    slot = PooledNativeGuestJit{};
+    return true;
+}
+
+static bool PoolNativeGuestJit(
+        size_t processorId, const PooledNativeGuestJit &parts) {
+    if (processorId >= MaxNativeGuestProcessors) return false;
+    std::lock_guard<std::mutex> lock(pooledNativeGuestJitMutex);
+    PooledNativeGuestJit &slot = pooledNativeGuestJits[processorId];
+    if (slot.jit != nullptr) return false;
+    slot = parts;
+    return true;
+}
+
+static void PrewarmNativeGuestJits(size_t firstProcessorId) {
+    static std::once_flag once;
+    std::call_once(once, [firstProcessorId] {
+        for (size_t id = 1;
+                id <= PrewarmedNativeGuestJits &&
+                    id < MaxNativeGuestProcessors;
+                ++id) {
+            if (id == firstProcessorId) continue;
+            PooledNativeGuestJit parts;
+            if (!BuildNativeGuestJitParts(id, parts)) break;
+            if (!PoolNativeGuestJit(id, parts)) {
+                delete parts.cpsr;
+                delete parts.jit;
+                DestroyDynarmicCallbacks32(parts.callbacks);
+            }
+        }
+    });
+}
+
+static bool BuildNativeGuestJitParts(
+        size_t processorId, PooledNativeGuestJit &parts) {
+    parts.callbacks =
         CreateDynarmicCallbacks32(sharedHandle.memory);
 
     Dynarmic::A32::UserConfig config;
     config.callbacks =
-        DynarmicCallbacks32UserCallbacks(runtime->callbacks);
-    config.coprocessors[15] = DynarmicCallbacks32CP15(runtime->callbacks);
+        DynarmicCallbacks32UserCallbacks(parts.callbacks);
+    config.coprocessors[15] = DynarmicCallbacks32CP15(parts.callbacks);
     config.processor_id = processorId;
     config.global_monitor = sharedHandle.monitor;
     config.always_little_endian = false;
@@ -372,7 +432,7 @@ static NativeGuestJit *CreateNativeGuestJit(
     config.code_cache_size = 16 * 1024 * 1024;
 
     DynarmicCallbacks32SetPageTable(
-        runtime->callbacks,
+        parts.callbacks,
         sharedHandle.num_page_table_entries,
         sharedHandle.page_table);
     if (sharedHandle.page_table != nullptr) {
@@ -388,21 +448,39 @@ static NativeGuestJit *CreateNativeGuestJit(
     }
 
     try {
-        runtime->jit =
+        parts.jit =
             new Dynarmic::A32::Jit(config);
-        runtime->cpsr =
-            new DynarmicCpsr(runtime->jit);
+        parts.cpsr =
+            new DynarmicCpsr(parts.jit);
     } catch (const std::exception &exception) {
         fprintf(stderr,
             "LC32: native guest JIT creation failed: %s\n",
             exception.what());
-        if (runtime->jit != nullptr) {
-            delete runtime->jit;
+        if (parts.jit != nullptr) {
+            delete parts.jit;
         }
-        DestroyDynarmicCallbacks32(runtime->callbacks);
+        DestroyDynarmicCallbacks32(parts.callbacks);
+        parts = PooledNativeGuestJit{};
+        return false;
+    }
+    return true;
+}
+
+static NativeGuestJit *CreateNativeGuestJit(
+        const context32 &initial, size_t processorId) {
+    auto *runtime = new NativeGuestJit();
+    runtime->processorId = processorId;
+    PooledNativeGuestJit parts;
+    if (TakePooledNativeGuestJit(processorId, parts)) {
+        parts.jit->Reset();
+    } else if (!BuildNativeGuestJitParts(processorId, parts)) {
         delete runtime;
         return nullptr;
     }
+    runtime->jit = parts.jit;
+    runtime->cpsr = parts.cpsr;
+    runtime->callbacks = parts.callbacks;
+    PrewarmNativeGuestJits(processorId);
 
     DynarmicCallbacks32BindJit(
         runtime->callbacks, runtime->jit,
@@ -445,17 +523,23 @@ void DestroyNativeGuestJit(
         sharedHandle.monitor->ClearProcessor(
             runtime->processorId);
     }
+    UnregisterGuestVmEpochParticipant(
+        &runtime->vmEpochParticipant);
+    // Pool before the id is released, so its next owner finds this JIT.
+    if (runtime->jit != nullptr) runtime->jit->ClearExclusiveState();
+    if (runtime->jit == nullptr || !PoolNativeGuestJit(runtime->processorId,
+            PooledNativeGuestJit{runtime->jit, runtime->cpsr,
+                                 runtime->callbacks})) {
+        delete runtime->cpsr;
+        delete runtime->jit;
+        DestroyDynarmicCallbacks32(runtime->callbacks);
+    }
     {
         std::lock_guard<std::recursive_mutex> lock(
             guestThreadMutex);
         guestProcessorIdsInUse &=
             ~(uint64_t{1} << runtime->processorId);
     }
-    UnregisterGuestVmEpochParticipant(
-        &runtime->vmEpochParticipant);
-    delete runtime->cpsr;
-    delete runtime->jit;
-    DestroyDynarmicCallbacks32(runtime->callbacks);
     delete runtime;
 }
 

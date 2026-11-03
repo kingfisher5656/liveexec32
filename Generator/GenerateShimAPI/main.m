@@ -431,8 +431,13 @@ static BOOL LC32KnownStructHasFixedLayout(LC32KnownStruct type) {
             @"LC32DestroyHostObjectArray(host_arg%d);", self.index];
     }
     if(self.objectOutPointerSignature) {
+        /* Cocoa stores an out object (NSError **) only when it has one and
+         * leaves the caller's slot untouched otherwise. Old games depend on
+         * that: Starfront passes its path string as error:, and storing nil
+         * on success zeroed the string's isa. The host cell starts at 0, so
+         * 0 afterwards means "not written". */
         return [NSString stringWithFormat:
-            @"if(guest_arg%1$d) *guest_arg%1$d = host_arg%1$d ? LC32HostToGuestObject(host_arg%1$d) : nil;",
+            @"if(guest_arg%1$d && host_arg%1$d) *guest_arg%1$d = LC32HostToGuestObject(host_arg%1$d);",
             self.index];
     }
     if(LC32EncodingIsOpaqueCFObjectPointer(self.signature)) {
@@ -1319,6 +1324,58 @@ static BOOL LC32MethodHasIndirectObjectBuffer(NSString *className,
     }
     if([self.className isEqualToString:@"GKLocalPlayer"]) {
         [string appendString:@"@dynamic authenticateHandler, authenticated;\n"];
+    }
+    /* Modern GameKit serves these SDK properties through
+     * -forwardingTargetForSelector: (GK*Internal), so the host class method
+     * lists omit them and Clang would synthesize guest-only ivars: a guest
+     * -[GKScore setValue:] never reached the native score. Manual accessors
+     * in GameKit+LC32ForwardedProperties.m message the native object. */
+    if([self.className isEqualToString:@"GKScore"]) {
+        [string appendString:@"@dynamic value, formattedValue, "
+            "leaderboardIdentifier, context, date, rank;\n"];
+    }
+    if([self.className isEqualToString:@"GKLeaderboard"]) {
+        [string appendString:
+            @"@dynamic identifier, title, maxRange, groupIdentifier;\n"];
+    }
+    if([self.className isEqualToString:@"GKAchievementDescription"]) {
+        [string appendString:@"@dynamic identifier, groupIdentifier, title, "
+            "achievedDescription, unachievedDescription, maximumPoints, "
+            "hidden, replayable;\n"];
+    }
+    if([self.className isEqualToString:@"GKLeaderboardSet"]) {
+        [string appendString:
+            @"@dynamic title, groupIdentifier, identifier;\n"];
+    }
+    if([self.className isEqualToString:@"GKMatchRequest"]) {
+        [string appendString:@"@dynamic minPlayers, maxPlayers, playerGroup, "
+            "playerAttributes, inviteMessage, defaultNumberOfPlayers;\n"];
+    }
+    if([self.className isEqualToString:@"GKInvite"]) {
+        [string appendString:@"@dynamic playerGroup, playerAttributes;\n"];
+    }
+    if([self.className isEqualToString:@"GKChallenge"]) {
+        [string appendString:
+            @"@dynamic state, issueDate, completionDate, message;\n"];
+    }
+    if([self.className isEqualToString:@"GKTurnBasedMatch"]) {
+        [string appendString:@"@dynamic matchID, creationDate, matchData;\n"];
+    }
+    if([self.className isEqualToString:@"GKTurnBasedParticipant"]) {
+        [string appendString:@"@dynamic matchOutcome, timeoutDate;\n"];
+    }
+    if([self.className isEqualToString:@"GKTurnBasedExchange"]) {
+        [string appendString:@"@dynamic exchangeID, data, sendDate, "
+            "timeoutDate, completionDate;\n"];
+    }
+    if([self.className isEqualToString:@"GKTurnBasedExchangeReply"]) {
+        [string appendString:@"@dynamic data, replyDate;\n"];
+    }
+    if([self.className isEqualToString:@"GKPlayer"]) {
+        [string appendString:@"@dynamic alias, guestIdentifier;\n"];
+    }
+    if([self.className isEqualToString:@"GKLocalPlayer"]) {
+        [string appendString:@"@dynamic underage;\n"];
     }
     if([self.className isEqualToString:@"UIImage"]) {
         [string appendString:@"@dynamic CGImage;\n"];

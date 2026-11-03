@@ -155,6 +155,20 @@ CFStringRef CTFontCopyFamilyName(CTFontRef font) {
         LC32CoreTextOpFontCopyFamilyName, LC32_CT_HOST(font)) : NULL;
 }
 
+CFStringRef CTFontCopyDisplayName(CTFontRef font) {
+    return font ? (CFStringRef)LC32_CT_CALL(
+        LC32CoreTextOpFontCopyDisplayName, LC32_CT_HOST(font)) : NULL;
+}
+
+CTFontRef CTFontCreateForString(CTFontRef currentFont, CFStringRef string,
+                                CFRange range) {
+    if(!currentFont || !string || range.location < 0 || range.length < 0)
+        return NULL;
+    return (CTFontRef)LC32_CT_CALL(LC32CoreTextOpFontCreateForString,
+        LC32_CT_HOST(currentFont), LC32_CT_HOST(string),
+        LC32_CT_INDEX(range.location), LC32_CT_INDEX(range.length));
+}
+
 CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font) {
     return font ? (CTFontDescriptorRef)LC32_CT_CALL(
         LC32CoreTextOpFontCopyFontDescriptor, LC32_CT_HOST(font)) : NULL;
@@ -220,6 +234,9 @@ LC32_CT_FONT_METRIC(CTFontGetLeading, LC32CoreTextOpFontGetLeading)
 LC32_CT_FONT_METRIC(CTFontGetSize, LC32CoreTextOpFontGetSize)
 LC32_CT_FONT_METRIC(CTFontGetSlantAngle, LC32CoreTextOpFontGetSlantAngle)
 LC32_CT_FONT_METRIC(CTFontGetUnderlineThickness, LC32CoreTextOpFontGetUnderlineThickness)
+LC32_CT_FONT_METRIC(CTFontGetCapHeight, LC32CoreTextOpFontGetCapHeight)
+LC32_CT_FONT_METRIC(CTFontGetXHeight, LC32CoreTextOpFontGetXHeight)
+LC32_CT_FONT_METRIC(CTFontGetUnderlinePosition, LC32CoreTextOpFontGetUnderlinePosition)
 #undef LC32_CT_FONT_METRIC
 
 CTFontSymbolicTraits CTFontGetSymbolicTraits(CTFontRef font) {

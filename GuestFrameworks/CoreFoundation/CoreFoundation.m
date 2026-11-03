@@ -1,6 +1,9 @@
 #import <LC32/LC32.h>
 #import <CoreFoundation/CoreFoundation+LC32.h>
 
+#include <limits.h>
+#include <sys/stat.h>
+
 const CFAllocatorRef kCFAllocatorDefault = NULL;
 
 // Set CF version to iOS 10.3.3
@@ -310,6 +313,53 @@ Boolean CFURLGetFileSystemRepresentation(
         LC32_CF_HOST(url), LC32_CF_U32(resolveAgainstBase),
         LC32_CF_U32((uintptr_t)buffer),
         LC32_CF_U32(maxBufferLength));
+}
+
+/*
+ * Deprecated CFURLAccess property lookup (Gamevil's Zenonia 1-4 size their
+ * resource reads with kCFURLFileLength).  Only file URLs were ever supported
+ * on iOS, so answer from a guest stat() of the URL's path.
+ */
+CFTypeRef CFURLCreatePropertyFromResource(
+        CFAllocatorRef allocator, CFURLRef url, CFStringRef property,
+        SInt32 *errorCode) {
+    UInt8 path[PATH_MAX];
+    struct stat info;
+    if(errorCode) *errorCode = 0;
+    if(!url || !property) {
+        if(errorCode) *errorCode = kCFURLImproperArgumentsError;
+        return NULL;
+    }
+    if(!CFURLGetFileSystemRepresentation(url, true, path, sizeof(path))) {
+        if(errorCode) *errorCode = kCFURLUnknownSchemeError;
+        return NULL;
+    }
+    const BOOL exists = stat((const char *)path, &info) == 0;
+    if(CFEqual(property, kCFURLFileExists))
+        return CFRetain(exists ? kCFBooleanTrue : kCFBooleanFalse);
+    if(!exists) {
+        if(errorCode) *errorCode = kCFURLResourceNotFoundError;
+        return NULL;
+    }
+    if(CFEqual(property, kCFURLFileLength)) {
+        const SInt64 length = info.st_size;
+        return CFNumberCreate(allocator, kCFNumberSInt64Type, &length);
+    }
+    if(CFEqual(property, kCFURLFilePOSIXMode)) {
+        const SInt32 mode = info.st_mode;
+        return CFNumberCreate(allocator, kCFNumberSInt32Type, &mode);
+    }
+    if(CFEqual(property, kCFURLFileOwnerID)) {
+        const SInt32 owner = info.st_uid;
+        return CFNumberCreate(allocator, kCFNumberSInt32Type, &owner);
+    }
+    if(CFEqual(property, kCFURLFileLastModificationTime)) {
+        return CFDateCreate(allocator, (CFAbsoluteTime)info.st_mtimespec.tv_sec -
+            kCFAbsoluteTimeIntervalSince1970 +
+            info.st_mtimespec.tv_nsec / 1.0e9);
+    }
+    if(errorCode) *errorCode = kCFURLUnknownPropertyKeyError;
+    return NULL;
 }
 
 CFIndex CFURLGetBytes(CFURLRef url, UInt8 *buffer,

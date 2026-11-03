@@ -305,6 +305,9 @@ bool Dynarmic_debugger_has_breakpoint(u32 address);
 // Installs an opt-in, one-shot Thumb tracepoint.  Unlike debugger
 // breakpoints it logs and immediately replays the original instruction.
 bool Dynarmic_guest_tracepoint_set(u64 address);
+// Patches known races in shipped guest code (matched by instruction
+// signature, never by app identity) before the guest starts running.
+void Dynarmic_apply_guest_code_fixups();
 size_t Dynarmic_debugger_thread_ids(
     gdb_thread_id_t *ids, size_t capacity);
 gdb_thread_id_t Dynarmic_debugger_current_thread();
@@ -363,6 +366,11 @@ u32 LC32UpdateHostMapping(u32 guest_object,
                           u64 host_object);
 u64 LC32GetHostSelector(u32 guest_selector);
 u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args);
+// SVC 1006 entry. When a native NSException can be caught by a live guest
+// handler, returns the guest objc_exception_throw address and stores the
+// guest exception object in *guestException; otherwise as above.
+u64 LC32InvokeHostSelectorFromGuest(u64 host_self, u64 host_cmd,
+                                    u64 va_args, u32 *guestException);
 u64 LC32InvokeHostNSStringFormat(u64 host_self,
                                  u64 host_selector,
                                  u64 host_format,

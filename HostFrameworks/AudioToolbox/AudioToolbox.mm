@@ -1763,7 +1763,18 @@ OSStatus DispatchRemoteIOOutputSubmit(
                 }
                 return false;
             });
-        if(!available) return kAudioUnitErr_RenderTimeout;
+        if(!available) {
+            // The native queue can stop returning buffers for a while, e.g.
+            // when a movie player's audio session interrupts it at launch
+            // (9mm's VOX starts RemoteIO just before the intro video). Any
+            // error makes the guest abandon host output for good, so drop
+            // this quantum, nudge the queue to resume, and keep the route.
+            // The wait above already paced the guest's render thread.
+            AudioQueueRef stalledQueue = entry->queue;
+            lock.unlock();
+            if(stalledQueue) (void)AudioQueueStart(stalledQueue, nullptr);
+            return noErr;
+        }
         if(entry->disposing || !entry->queue)
             return kAudioUnitErr_Uninitialized;
         for(auto &buffer : entry->buffers) {
@@ -2204,6 +2215,58 @@ OSStatus PublishAudioFile(
     return kAudio_ParamError;
 }
 
+// armv7 packs SInt64 at 4-byte alignment: AudioFramePacketTranslation is 20
+// bytes there and 24 natively.
+constexpr u32 kGuestFramePacketTranslationSize = 20;
+static_assert(sizeof(AudioFramePacketTranslation) == 24);
+static_assert(sizeof(AudioBytePacketTranslation) == 24);
+static_assert(sizeof(AudioPacketRollDistanceTranslation) == 16);
+
+bool IsFramePacketTranslationProperty(AudioFilePropertyID property) {
+    return property == kAudioFilePropertyFrameToPacket ||
+        property == kAudioFilePropertyPacketToFrame;
+}
+
+// Translation properties are in/out: the caller fills in the source field.
+bool IsAudioFileTranslationProperty(AudioFilePropertyID property) {
+    return IsFramePacketTranslationProperty(property) ||
+        property == kAudioFilePropertyByteToPacket ||
+        property == kAudioFilePropertyPacketToByte ||
+        property == kAudioFilePropertyPacketToRollDistance;
+}
+
+OSStatus DispatchAudioFileFramePacketTranslation(
+        const LC32AudioToolboxCall &call,
+        const std::shared_ptr<AudioFileEntry> &entry) {
+    u32 requestedSize = 0;
+    if(!ReadGuestU32(SlotU32(call, 2), requestedSize))
+        return kAudio_ParamError;
+    if(requestedSize != kGuestFramePacketTranslationSize || !SlotU32(call, 3))
+        return kAudioFileBadPropertySizeError;
+    u32 guest[5] = {};
+    if(!ReadGuestBytes(SlotU32(call, 3), sizeof(guest), guest))
+        return kAudio_ParamError;
+    AudioFramePacketTranslation translation = {};
+    memcpy(&translation.mFrame, &guest[0], sizeof(translation.mFrame));
+    memcpy(&translation.mPacket, &guest[2], sizeof(translation.mPacket));
+    translation.mFrameOffsetInPacket = guest[4];
+    UInt32 size = sizeof(translation);
+    OSStatus status;
+    {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        if(!entry->file) return kAudio_ParamError;
+        status = AudioFileGetProperty(entry->file, SlotU32(call, 1),
+            &size, &translation);
+    }
+    if(status != noErr) return status;
+    memcpy(&guest[0], &translation.mFrame, sizeof(translation.mFrame));
+    memcpy(&guest[2], &translation.mPacket, sizeof(translation.mPacket));
+    guest[4] = translation.mFrameOffsetInPacket;
+    if(!WriteGuestBytes(SlotU32(call, 3), sizeof(guest), guest))
+        return kAudio_ParamError;
+    return noErr;
+}
+
 OSStatus DispatchAudioFileGetPropertyInfo(
         const LC32AudioToolboxCall &call) {
     if(!RequireSlots(call, 4)) return kAudio_ParamError;
@@ -2220,6 +2283,8 @@ OSStatus DispatchAudioFileGetPropertyInfo(
             &dataSize, &isWritable);
     }
     if(status != noErr) return status;
+    if(IsFramePacketTranslationProperty(SlotU32(call, 1)))
+        dataSize = kGuestFramePacketTranslationSize;
     if((SlotU32(call, 2) &&
             !WriteGuestU32(SlotU32(call, 2), dataSize)) ||
        (SlotU32(call, 3) &&
@@ -2234,6 +2299,8 @@ OSStatus DispatchAudioFileGetProperty(
     if(!RequireSlots(call, 4)) return kAudio_ParamError;
     auto entry = FindAudioFile(SlotU32(call, 0));
     if(!entry) return kAudio_ParamError;
+    if(IsFramePacketTranslationProperty(SlotU32(call, 1)))
+        return DispatchAudioFileFramePacketTranslation(call, entry);
 
     u32 requestedSize = 0;
     if(!ReadGuestU32(SlotU32(call, 2), requestedSize) ||
@@ -2243,6 +2310,9 @@ OSStatus DispatchAudioFileGetProperty(
     }
 
     std::vector<uint8_t> bytes(requestedSize ? requestedSize : 1);
+    if(IsAudioFileTranslationProperty(SlotU32(call, 1)) && requestedSize &&
+       !ReadGuestBytes(SlotU32(call, 3), requestedSize, bytes.data()))
+        return kAudio_ParamError;
     UInt32 returnedSize = requestedSize;
     OSStatus status;
     {
@@ -2632,6 +2702,15 @@ bool IsRawAudioQueueProperty(AudioQueuePropertyID property) {
         case kAudioQueueProperty_EnableLevelMetering:
         case kAudioQueueProperty_CurrentLevelMeter:
         case kAudioQueueProperty_CurrentLevelMeterDB:
+        // Plain UInt32 values. FMOD (Unity 3.x) sets the codec policy before
+        // using an offline-render queue as its MP3/AAC decoder and gives up
+        // on the stream when that fails.
+        case kAudioQueueProperty_DecodeBufferSizeFrames:
+        case kAudioQueueProperty_ConverterError:
+        case kAudioQueueProperty_EnableTimePitch:
+        case kAudioQueueProperty_TimePitchAlgorithm:
+        case kAudioQueueProperty_TimePitchBypass:
+        case kAudioQueueProperty_HardwareCodecPolicy:
             return true;
         default:
             return false;

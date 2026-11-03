@@ -131,6 +131,11 @@ void LC32Filesystem::addMountpoint(string guest, string host) {
     hostmpVec.push_back(realHostPath);
 }
 
+void LC32Filesystem::addGuestPathAlias(string guest, string target) {
+    guestAliasVec.push_back(guest);
+    guestAliasTargetVec.push_back(target);
+}
+
 // Translate path between emulated mount point paths
 bool LC32Filesystem::pathLeftToRight(vector<string> leftVec, vector<string> rightVec, const char *input, char *output) {
     if(input == nullptr || output == nullptr) {
@@ -206,6 +211,21 @@ bool LC32Filesystem::pathGuestToHost(const char *input, char *output) {
         }
     } else if(!NormalizeGuestAbsolutePath(input, normalizedPath)) {
         return false;
+    }
+    for(size_t index = 0; index < guestAliasVec.size(); index++) {
+        const string &alias = guestAliasVec[index];
+        if(!isSubpath(normalizedPath, alias)) continue;
+        const string &target = guestAliasTargetVec[index];
+        const char *suffix = normalizedPath + alias.size();
+        if(target.size() + strlen(suffix) >= PATH_MAX) {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+        char aliasedPath[PATH_MAX];
+        snprintf(aliasedPath, sizeof(aliasedPath), "%s%s",
+            target.c_str(), suffix);
+        memcpy(normalizedPath, aliasedPath, strlen(aliasedPath) + 1);
+        break;
     }
     return pathLeftToRight(
         guestmpVec, hostmpVec, normalizedPath, output);

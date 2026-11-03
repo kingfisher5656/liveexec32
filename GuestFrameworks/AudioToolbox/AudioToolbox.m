@@ -325,6 +325,9 @@ typedef struct LC32SilentAudioUnit {
     UInt32 mixerInputBusCount;
     struct LC32SilentAudioUnit *connectedMixer;
     AudioUnitParameterValue outputVolume;
+    /* RemoteIO kAudioOutputUnitProperty_EnableIO: [0] input bus (microphone,
+     * never captured here), [1] output bus. */
+    UInt32 enableIO[2];
     AURenderCallbackStruct renderCallback;
     LC32SilentAudioRenderNotify *renderNotifies;
     size_t renderNotifyCount;
@@ -1002,6 +1005,7 @@ OSStatus AudioComponentInstanceNew(AudioComponent inComponent,
     } else {
         silent->format = LC32SilentAudioCanonicalFormat(2);
         silent->format.mSampleRate = 0;
+        silent->enableIO[1] = 1;
     }
     *outInstance = (AudioComponentInstance)silent;
     return noErr;
@@ -1045,6 +1049,21 @@ static OSStatus LC32AudioUnitSetProperty(AudioUnit inUnit, AudioUnitPropertyID i
     pthread_mutex_lock(&silent->mutex);
 
     if(silent->kind == LC32SilentAudioUnitKindRemoteIO) {
+        /* Gameloft's VOX enables the output bus before anything else and
+         * abandons audio if this fails. Bus 1 is the input (microphone) bus,
+         * reached through its output scope; bus 0 is the output bus. */
+        if(inID == kAudioOutputUnitProperty_EnableIO &&
+           inDataSize == sizeof(UInt32) &&
+           ((inScope == kAudioUnitScope_Output && inElement == 0) ||
+            (inScope == kAudioUnitScope_Input && inElement == 1))) {
+            if(silent->initialized || silent->renderThreadJoinable) {
+                pthread_mutex_unlock(&silent->mutex);
+                return kAudioUnitErr_Initialized;
+            }
+            silent->enableIO[inElement == 0] = *(const UInt32 *)inData != 0;
+            pthread_mutex_unlock(&silent->mutex);
+            return noErr;
+        }
         if(inID == kAudioUnitProperty_StreamFormat &&
            inScope == kAudioUnitScope_Input && inElement == 0 &&
            inDataSize == sizeof(silent->format)) {
@@ -1267,6 +1286,22 @@ OSStatus AudioUnitGetProperty(AudioUnit inUnit, AudioUnitPropertyID inID,
         }
         *(UInt32 *)outData = __atomic_load_n(
             &silent->started, __ATOMIC_ACQUIRE) != 0;
+        *ioDataSize = required;
+        pthread_mutex_unlock(&silent->mutex);
+        return noErr;
+    }
+
+    if(silent->kind == LC32SilentAudioUnitKindRemoteIO &&
+       inID == kAudioOutputUnitProperty_EnableIO &&
+       ((inScope == kAudioUnitScope_Output && inElement == 0) ||
+        (inScope == kAudioUnitScope_Input && inElement == 1))) {
+        const UInt32 required = sizeof(UInt32);
+        if(*ioDataSize < required) {
+            *ioDataSize = required;
+            pthread_mutex_unlock(&silent->mutex);
+            return kAudio_ParamError;
+        }
+        *(UInt32 *)outData = silent->enableIO[inElement == 0];
         *ioDataSize = required;
         pthread_mutex_unlock(&silent->mutex);
         return noErr;

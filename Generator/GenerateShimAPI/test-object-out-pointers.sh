@@ -75,7 +75,7 @@ def check_output(key, indices, table=fixture):
         for line in (
             f"uint64_t {host} = 0;",
             f"LC32HostIndirectArgument({arg} ? &{host} : NULL)",
-            f"if({arg}) *{arg} = {host} ? LC32HostToGuestObject({host}) : nil;",
+            f"if({arg} && {host}) *{arg} = LC32HostToGuestObject({host});",
         ):
             require(line in body, f"Missing {key} output handling: {line}")
         require(f"[{arg} host_self]" not in body and f"*{arg} host_self" not in body,

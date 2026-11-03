@@ -66,6 +66,117 @@
 }
 @end
 
+extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void);
+
+// Weak reference (this file is not ARC); see objc_storeWeak.
+static id LC32GuestKeyWindow;
+
+@interface LC32GuestKeyWindowHooks : NSObject
+@end
+@implementation LC32GuestKeyWindowHooks
++ (void)load {
+    // Only the game's own calls reach these, never the hosting app's.
+    auto madeKey = [](id window, const uint64_t *) {
+        objc_storeWeak(&LC32GuestKeyWindow, window);
+    };
+    LC32RegisterHostSelectorHook(UIWindow.class,
+        @selector(makeKeyAndVisible), {nullptr, madeKey});
+    LC32RegisterHostSelectorHook(UIWindow.class,
+        @selector(makeKeyWindow), {nullptr, madeKey});
+    for(Class cls : {UITextField.class, UITextView.class})
+        LC32RegisterHostSelectorHook(cls, @selector(becomeFirstResponder),
+            {@selector(lc32_guestBecomeFirstResponder), nullptr});
+}
+@end
+
+@interface UIView (LC32GuestKeyWindowEditing)
+- (BOOL)lc32_guestBecomeFirstResponder;
+@end
+
+@implementation UIView (LC32GuestKeyWindowEditing)
+// Text input only reaches the key window. A game window that the hosting
+// app's own window displaced would get no keyboard, so make it key first,
+// as tapping the game would.
+- (BOOL)lc32_guestBecomeFirstResponder {
+    UIWindow *window = self.window;
+    if(window && !window.isKeyWindow) [window makeKeyWindow];
+    const SEL original = @selector(becomeFirstResponder);
+    using Become = BOOL (*)(id, SEL);
+    return ((Become)LC32NativeHostMethod(self, original))(self, original);
+}
+@end
+
+@interface UIApplication (LC32GuestStatusBarOrientation)
+- (UIInterfaceOrientation)lc32_guestStatusBarOrientation;
+- (void)lc32_guestSetStatusBarHidden:(BOOL)hidden animated:(BOOL)animated;
+- (void)lc32_guestSetStatusBarHidden:(BOOL)hidden;
+- (UIWindow *)lc32_guestKeyWindow;
+@end
+
+@implementation UIApplication (LC32GuestStatusBarOrientation)
++ (void)load {
+    LC32RegisterHostSelectorHook(self, @selector(statusBarOrientation),
+        {@selector(lc32_guestStatusBarOrientation), nullptr});
+    LC32RegisterHostSelectorHook(self, @selector(setStatusBarHidden:animated:),
+        {@selector(lc32_guestSetStatusBarHidden:animated:), nullptr});
+    LC32RegisterHostSelectorHook(self, @selector(setStatusBarHidden:),
+        {@selector(lc32_guestSetStatusBarHidden:), nullptr});
+    LC32RegisterHostSelectorHook(self, @selector(keyWindow),
+        {@selector(lc32_guestKeyWindow), nullptr});
+}
+
+// iPhone OS games reach their UI through keyWindow (Zenonia 5 adds its
+// nickname UITextField to keyWindow.rootViewController.view and messages
+// that controller). In a hosting app the process-wide key window can be nil
+// or one of the host's own windows, which leaves such views outside the game
+// or sends game selectors to a host controller. Answer with the window the
+// game itself last made key while it is still on screen.
+- (UIWindow *)lc32_guestKeyWindow {
+    const SEL original = @selector(keyWindow);
+    using GetWindow = UIWindow *(*)(id, SEL);
+    UIWindow *key =
+        ((GetWindow)LC32NativeHostMethod(self, original))(self, original);
+    UIWindow *guestKey = objc_loadWeak(&LC32GuestKeyWindow);
+    if(!guestKey || guestKey == key || guestKey.hidden || !guestKey.windowScene)
+        return key;
+    static BOOL logged;
+    if(!logged) {
+        logged = YES;
+        fprintf(stderr, "LC32: guest keyWindow is %p, not %p\n", guestKey, key);
+    }
+    return guestKey;
+}
+
+// The game's landscape status bar would only appear as a portrait strip over
+// its sideways canvas, and showing it re-lays out the scaled game window (pause
+// menus toggle it). Keep it hidden while the game is shown that way.
+- (void)lc32_guestSetStatusBarHidden:(BOOL)hidden animated:(BOOL)animated {
+    if(LC32UIKitPortraitHostedStatusBarOrientation()) hidden = YES;
+    const SEL original = @selector(setStatusBarHidden:animated:);
+    using SetHidden = void (*)(id, SEL, BOOL, BOOL);
+    ((SetHidden)LC32NativeHostMethod(self, original))(
+        self, original, hidden, animated);
+}
+
+- (void)lc32_guestSetStatusBarHidden:(BOOL)hidden {
+    if(LC32UIKitPortraitHostedStatusBarOrientation()) hidden = YES;
+    const SEL original = @selector(setStatusBarHidden:);
+    using SetHidden = void (*)(id, SEL, BOOL);
+    ((SetHidden)LC32NativeHostMethod(self, original))(self, original, hidden);
+}
+
+- (UIInterfaceOrientation)lc32_guestStatusBarOrientation {
+    // A landscape game shown sideways in a portrait scene converts its touches
+    // with this; report its landscape side as iPhone OS did. UIKit's own reads
+    // are unaffected.
+    const NSInteger hosted = LC32UIKitPortraitHostedStatusBarOrientation();
+    if(hosted) return (UIInterfaceOrientation)hosted;
+    const SEL original = @selector(statusBarOrientation);
+    using GetOrientation = UIInterfaceOrientation (*)(id, SEL);
+    return ((GetOrientation)LC32NativeHostMethod(self, original))(self, original);
+}
+@end
+
 #if LC32_UIKIT_COMPATIBILITY
 @interface LC32GuestViewMutationHooks : NSObject
 @end

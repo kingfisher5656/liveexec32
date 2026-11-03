@@ -150,6 +150,30 @@ static inline BOOL LC32BundleContainsTallPhoneLaunchArt(
                [info objectForKey:@"UILaunchImages~iphone"]);
 }
 
+static inline BOOL LC32BundleContainsIPadLaunchArt(
+        NSBundle *bundle, NSDictionary *info) {
+    BOOL result =
+        LC32BundleContainsLegacyLaunchImage(bundle, @"Default-Portrait") ||
+        LC32BundleContainsLegacyLaunchImage(bundle,
+                                             @"Default-Portrait@2x") ||
+        LC32BundleContainsLegacyLaunchImage(bundle,
+                                             @"Default-Portrait~ipad") ||
+        LC32BundleContainsLegacyLaunchImage(bundle,
+                                             @"Default-Portrait@2x~ipad") ||
+        LC32BundleContainsLegacyLaunchImage(bundle, @"Default-Landscape") ||
+        LC32BundleContainsLegacyLaunchImage(bundle,
+                                             @"Default-Landscape@2x") ||
+        LC32BundleContainsLegacyLaunchImage(bundle,
+                                             @"Default-Landscape~ipad") ||
+        LC32BundleContainsLegacyLaunchImage(bundle,
+                                             @"Default-Landscape@2x~ipad");
+    NSString *explicitIPadImage =
+        [info objectForKey:@"UILaunchImageFile~ipad"];
+    result |= LC32BundleContainsLegacyLaunchImage(
+        bundle, explicitIPadImage);
+    return result;
+}
+
 /* Some early App Store binaries advertise both device families even though
  * their bundle contains only an iPad UI.  On a phone-sized modern scene they
  * still require the old 768x1024 compatibility canvas.  Restrict this
@@ -169,25 +193,8 @@ static inline LC32LegacyIPadCanvasKind LC32BundleLegacyIPadCanvasKind(
         return LC32LegacyIPadCanvasNone;
     }
 
-    BOOL hasIPadLaunchArt =
-        LC32BundleContainsLegacyLaunchImage(bundle, @"Default-Portrait") ||
-        LC32BundleContainsLegacyLaunchImage(bundle,
-                                             @"Default-Portrait@2x") ||
-        LC32BundleContainsLegacyLaunchImage(bundle,
-                                             @"Default-Portrait~ipad") ||
-        LC32BundleContainsLegacyLaunchImage(bundle,
-                                             @"Default-Portrait@2x~ipad") ||
-        LC32BundleContainsLegacyLaunchImage(bundle, @"Default-Landscape") ||
-        LC32BundleContainsLegacyLaunchImage(bundle,
-                                             @"Default-Landscape@2x") ||
-        LC32BundleContainsLegacyLaunchImage(bundle,
-                                             @"Default-Landscape~ipad") ||
-        LC32BundleContainsLegacyLaunchImage(bundle,
-                                             @"Default-Landscape@2x~ipad");
-    NSString *explicitIPadImage =
-        [info objectForKey:@"UILaunchImageFile~ipad"];
-    hasIPadLaunchArt |= LC32BundleContainsLegacyLaunchImage(
-        bundle, explicitIPadImage);
+    const BOOL hasIPadLaunchArt =
+        LC32BundleContainsIPadLaunchArt(bundle, info);
 
     const BOOL hasPhoneLaunchArt =
         LC32BundleContainsPhoneLaunchArt(bundle, info);
@@ -269,20 +276,73 @@ static inline BOOL LC32BundleUsesFixedLandscapeIPadCanvas(
 /* Pre-iPhone-5 phone applications without 568-point launch art were given a
  * fixed 320x480 logical screen by iOS, even on larger devices.  SDK zero is
  * intentional here: early LC_VERSION_MIN_IPHONEOS commands encode it as
- * "n/a", whereas a missing host getter is filtered by the guest caller. */
-static inline BOOL LC32BundleUsesFixedLandscapePhoneCanvas(
-        NSBundle *bundle, uint32_t sdkVersion) {
+ * "n/a", whereas a missing host getter is filtered by the guest caller.
+ * iOS applied the same rule to universal applications on an iPhone, whose
+ * iPad half only takes effect on an iPad; pass allowUniversal for a phone
+ * host. */
+static inline BOOL LC32BundleUsesFixedLandscapePhoneCanvasForHost(
+        NSBundle *bundle, uint32_t sdkVersion, BOOL allowUniversal) {
     const LC32SupportedDeviceFamilies families =
         LC32BundleSupportedDeviceFamilies(bundle);
-    if(!families.supportsPhone || families.supportsPad ||
+    if(!families.supportsPhone ||
+            (families.supportsPad && !allowUniversal) ||
+            sdkVersion >= 0x00080000) {
+        return NO;
+    }
+    NSDictionary *info = [bundle infoDictionary];
+    /* A bundle with no launch art at all (Alien Space Retro) was letterboxed
+     * the same way: only 568-point art opted an application out. */
+    return (LC32BundleContainsPhoneLaunchArt(bundle, info) ||
+            !LC32BundleContainsIPadLaunchArt(bundle, info)) &&
+        !LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
+        LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
+        LC32BundleDeclaresStableLandscapeSide(bundle);
+}
+
+/* iOS showed pre-iOS-8 phone applications with 568-point launch art, but no
+ * iPhone 6 art or launch storyboard, in a 320x568 window on larger iPhones.
+ * Universal landscape games such as 9mm otherwise stretch a 16:9 layout over
+ * a modern scene, so give them the same fixed canvas at 568 points. Phone-only
+ * bundles stay with LC32BundleMayRetainLegacyLandscapePhoneCanvas, which
+ * covers games that keep a 480x320 drawable despite their tall launch art. */
+static inline BOOL LC32BundleUsesFixedLandscapeTallPhoneCanvasForHost(
+        NSBundle *bundle, uint32_t sdkVersion, BOOL phoneHost) {
+    const LC32SupportedDeviceFamilies families =
+        LC32BundleSupportedDeviceFamilies(bundle);
+    if(!phoneHost || !families.supportsPhone || !families.supportsPad ||
+            sdkVersion >= 0x00080000) {
+        return NO;
+    }
+    NSDictionary *info = [bundle infoDictionary];
+    return LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
+        LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
+        LC32BundleDeclaresStableLandscapeSide(bundle);
+}
+
+/* The portrait counterpart: a pre-iPhone-5 phone application that declares no
+ * landscape-only policy also ran on a fixed 320x480 screen, which iOS
+ * letterboxed on taller iPhones. Several (Zenonia 1/3) draw a landscape game
+ * sideways into that portrait drawable themselves, so it must stay exactly
+ * 320x480 and be scaled whole. */
+static inline BOOL LC32BundleUsesFixedPortraitPhoneCanvasForHost(
+        NSBundle *bundle, uint32_t sdkVersion, BOOL allowUniversal) {
+    const LC32SupportedDeviceFamilies families =
+        LC32BundleSupportedDeviceFamilies(bundle);
+    if(!families.supportsPhone ||
+            (families.supportsPad && !allowUniversal) ||
             sdkVersion >= 0x00080000) {
         return NO;
     }
     NSDictionary *info = [bundle infoDictionary];
     return LC32BundleContainsPhoneLaunchArt(bundle, info) &&
         !LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
-        LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
-        LC32BundleDeclaresStableLandscapeSide(bundle);
+        !LC32BundleUsesLandscapeOnlyPhonePolicy(bundle);
+}
+
+static inline BOOL LC32BundleUsesFixedLandscapePhoneCanvas(
+        NSBundle *bundle, uint32_t sdkVersion) {
+    return LC32BundleUsesFixedLandscapePhoneCanvasForHost(
+        bundle, sdkVersion, NO);
 }
 
 /* Some pre-iOS-8 phone-only games ship 568-point launch art but continue to

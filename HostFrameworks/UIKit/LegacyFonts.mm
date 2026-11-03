@@ -271,3 +271,69 @@ static void swizzle(Class cls, SEL originalAction, SEL swizzledAction) {
     });
 }
 @end
+
+extern "C" uint32_t LC32GetGuestExecutableSDKVersion(void);
+
+/* iOS 6 and earlier returned whole-point sizes from the UIStringDrawing
+ * methods; iOS 7 made them fractional. cocos2d-x labels (Zenonia 5) size a
+ * bitmap from the float width (bytesPerRow = width * 4, e.g. 31 for 7.75pt)
+ * but upload it with the truncated integer width, so fractional sizes skew
+ * every row of the glyph texture into colored noise. Round up for guests
+ * built before iOS 7, as Apple's migration notes prescribe. */
+static CGSize LC32LegacyStringSize(CGSize size) {
+    if(LC32GetGuestExecutableSDKVersion() >= 0x70000) return size;
+    return CGSizeMake(std::ceil(size.width), std::ceil(size.height));
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+@implementation NSString (LC32LegacyStringMetrics)
++ (void)load {
+    auto wrap = [](SEL selector, id (^make)(IMP original)) {
+        Method method = class_getInstanceMethod(NSString.class, selector);
+        if(method) method_setImplementation(method,
+            imp_implementationWithBlock(make(method_getImplementation(method))));
+    };
+    wrap(@selector(sizeWithFont:), ^id(IMP original) {
+        return ^CGSize(NSString *self, UIFont *font) {
+            return LC32LegacyStringSize(((CGSize (*)(id, SEL, UIFont *))original)(
+                self, @selector(sizeWithFont:), font));
+        };
+    });
+    wrap(@selector(sizeWithFont:forWidth:lineBreakMode:), ^id(IMP original) {
+        return ^CGSize(NSString *self, UIFont *font, CGFloat width,
+                       NSLineBreakMode mode) {
+            return LC32LegacyStringSize(((CGSize (*)(id, SEL, UIFont *, CGFloat,
+                NSLineBreakMode))original)(self,
+                @selector(sizeWithFont:forWidth:lineBreakMode:), font, width, mode));
+        };
+    });
+    wrap(@selector(sizeWithFont:constrainedToSize:), ^id(IMP original) {
+        return ^CGSize(NSString *self, UIFont *font, CGSize constraint) {
+            return LC32LegacyStringSize(((CGSize (*)(id, SEL, UIFont *, CGSize))
+                original)(self, @selector(sizeWithFont:constrainedToSize:),
+                font, constraint));
+        };
+    });
+    wrap(@selector(sizeWithFont:constrainedToSize:lineBreakMode:), ^id(IMP original) {
+        return ^CGSize(NSString *self, UIFont *font, CGSize constraint,
+                       NSLineBreakMode mode) {
+            return LC32LegacyStringSize(((CGSize (*)(id, SEL, UIFont *, CGSize,
+                NSLineBreakMode))original)(self,
+                @selector(sizeWithFont:constrainedToSize:lineBreakMode:),
+                font, constraint, mode));
+        };
+    });
+    wrap(@selector(sizeWithFont:minFontSize:actualFontSize:forWidth:lineBreakMode:),
+            ^id(IMP original) {
+        return ^CGSize(NSString *self, UIFont *font, CGFloat minimum,
+                       CGFloat *actual, CGFloat width, NSLineBreakMode mode) {
+            return LC32LegacyStringSize(((CGSize (*)(id, SEL, UIFont *, CGFloat,
+                CGFloat *, CGFloat, NSLineBreakMode))original)(self,
+                @selector(sizeWithFont:minFontSize:actualFontSize:forWidth:lineBreakMode:),
+                font, minimum, actual, width, mode));
+        };
+    });
+}
+@end
+#pragma clang diagnostic pop

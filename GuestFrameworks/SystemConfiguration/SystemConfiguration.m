@@ -99,6 +99,10 @@ typedef struct LC32SCNetworkReachabilityRegistration {
     BOOL _initialCallbackPending;
     dispatch_queue_t _dispatchQueue;
     uint64_t _dispatchGeneration;
+    // What the current scheduling already reported (see SetCallback).
+    SCNetworkReachabilityCallBack _deliveredCallback;
+    const void *_deliveredInfo;
+    BOOL _deliveredThisSchedule;
 }
 - (void)lc32_deliverInitialReachability:(uint64_t)generation;
 @end
@@ -122,6 +126,11 @@ typedef struct LC32SCNetworkReachabilityRegistration {
             _initialCallbackPending = NO;
             callback = _callback;
             info = _context.info;
+            if(callback) {
+                _deliveredCallback = callback;
+                _deliveredInfo = info;
+                _deliveredThisSchedule = YES;
+            }
             if(callback && _context.retain && info) {
                 info = _context.retain(info);
                 releaseInfo = _context.release;
@@ -287,7 +296,17 @@ Boolean SCNetworkReachabilitySetCallback(
         if(oldContext.release && oldContext.info)
             oldContext.release(oldContext.info);
 
-        if(callback) LC32SCNetworkReachabilitySignalInitial(reachability);
+        /*
+         * Native SystemConfiguration reports changes only; re-installing the
+         * callback a scheduled target already reported produces no callback.
+         * Crystal (Air Mail) calls -startNotifier from its change handler,
+         * so a redelivery here becomes an endless main-thread loop.
+         */
+        const BOOL alreadyReported = reachability->_deliveredThisSchedule &&
+            callback == reachability->_deliveredCallback &&
+            newContext.info == reachability->_deliveredInfo;
+        if(callback && !alreadyReported)
+            LC32SCNetworkReachabilitySignalInitial(reachability);
         return true;
     }
 }
@@ -382,6 +401,7 @@ Boolean SCNetworkReachabilityUnscheduleFromRunLoop(
             CFRunLoopSourceRef source = reachability->_source;
             reachability->_source = NULL;
             reachability->_initialCallbackPending = NO;
+            reachability->_deliveredThisSchedule = NO;
             CFRunLoopSourceInvalidate(source);
             CFRelease(source);
         }
@@ -413,6 +433,7 @@ Boolean SCNetworkReachabilitySetDispatchQueue(
             reachability->_dispatchQueue = NULL;
             reachability->_scheduled = NO;
             reachability->_initialCallbackPending = NO;
+            reachability->_deliveredThisSchedule = NO;
         }
     }
     if(oldQueue) {

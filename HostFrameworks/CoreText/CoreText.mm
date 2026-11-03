@@ -69,6 +69,27 @@ double SlotDouble(const LC32CoreTextCall &call, size_t index) {
     return value;
 }
 
+/* Modern display names are localized full names ("AppleGothic 일반체" in a
+ * Korean locale) that CGFontCreateWithFontName cannot resolve. iOS 6 games
+ * (Gamevil's Zenonia 4/5) build their glyph CGFont from this name for the
+ * CTFontCreateForString fallback, then draw that font's glyph IDs with it;
+ * a failed lookup renders Hangul from the wrong font. Keep the display name
+ * when it still names a font, else answer with the PostScript name. */
+CFStringRef CopyGraphicsFontResolvableDisplayName(CTFontRef font) {
+    CFStringRef displayName = CTFontCopyDisplayName(font);
+    if(displayName) {
+        CGFontRef graphicsFont = CGFontCreateWithFontName(displayName);
+        if(graphicsFont) {
+            CGFontRelease(graphicsFont);
+            return displayName;
+        }
+    }
+    CFStringRef postScriptName = CTFontCopyPostScriptName(font);
+    if(!postScriptName) return displayName;
+    if(displayName) CFRelease(displayName);
+    return postScriptName;
+}
+
 u32 ReturnCGFloat(CGFloat value) {
     const float narrowed = static_cast<float>(value);
     u32 bits;
@@ -328,6 +349,9 @@ u32 LC32_CoreText_Dispatch(u32 opcode, u32 guestCall, u32) {
         case LC32CoreTextOpFontGetSize:
         case LC32CoreTextOpFontGetSlantAngle:
         case LC32CoreTextOpFontGetUnderlineThickness:
+        case LC32CoreTextOpFontGetCapHeight:
+        case LC32CoreTextOpFontGetXHeight:
+        case LC32CoreTextOpFontGetUnderlinePosition:
         case LC32CoreTextOpFontGetSymbolicTraits:
         case LC32CoreTextOpFontGetGlyphCount: {
             if(!RequireCoreTextSlots(call, 1)) return 0;
@@ -340,6 +364,9 @@ u32 LC32_CoreText_Dispatch(u32 opcode, u32 guestCall, u32) {
                 case LC32CoreTextOpFontGetSize: return ReturnCGFloat(CTFontGetSize(font));
                 case LC32CoreTextOpFontGetSlantAngle: return ReturnCGFloat(CTFontGetSlantAngle(font));
                 case LC32CoreTextOpFontGetUnderlineThickness: return ReturnCGFloat(CTFontGetUnderlineThickness(font));
+                case LC32CoreTextOpFontGetCapHeight: return ReturnCGFloat(CTFontGetCapHeight(font));
+                case LC32CoreTextOpFontGetXHeight: return ReturnCGFloat(CTFontGetXHeight(font));
+                case LC32CoreTextOpFontGetUnderlinePosition: return ReturnCGFloat(CTFontGetUnderlinePosition(font));
                 case LC32CoreTextOpFontGetSymbolicTraits: return CTFontGetSymbolicTraits(font);
                 default: return static_cast<u32>(CTFontGetGlyphCount(font));
             }
@@ -392,13 +419,29 @@ u32 LC32_CoreText_Dispatch(u32 opcode, u32 guestCall, u32) {
         }
 
         case LC32CoreTextOpFontCopyFamilyName:
+        case LC32CoreTextOpFontCopyDisplayName:
         case LC32CoreTextOpFontCopyFontDescriptor: {
             if(!RequireCoreTextSlots(call, 1)) return 0;
             CTFontRef font = SlotHostObject<CTFontRef>(call, 0);
             if(!font) return 0;
             CFTypeRef result = opcode == LC32CoreTextOpFontCopyFamilyName
                 ? (CFTypeRef)CTFontCopyFamilyName(font)
+                : opcode == LC32CoreTextOpFontCopyDisplayName
+                ? (CFTypeRef)CopyGraphicsFontResolvableDisplayName(font)
                 : (CFTypeRef)CTFontCopyFontDescriptor(font);
+            return result ? LC32GuestObjectForOwnedHostObject(result) : 0;
+        }
+
+        case LC32CoreTextOpFontCreateForString: {
+            if(!RequireCoreTextSlots(call, 4)) return 0;
+            CTFontRef font = SlotHostObject<CTFontRef>(call, 0);
+            CFStringRef string = SlotHostObject<CFStringRef>(call, 1);
+            const CFIndex location = SlotIndex(call, 2);
+            const CFIndex length = SlotIndex(call, 3);
+            if(!font || !string || location < 0 || length < 0 ||
+               location > CFStringGetLength(string) - length) return 0;
+            CTFontRef result = CTFontCreateForString(font, string,
+                CFRangeMake(location, length));
             return result ? LC32GuestObjectForOwnedHostObject(result) : 0;
         }
         case LC32CoreTextOpFontDrawGlyphs: {
@@ -417,6 +460,7 @@ u32 LC32_CoreText_Dispatch(u32 opcode, u32 guestCall, u32) {
                 memcpy(&y, &pairs[i].second, sizeof(y));
                 positions[i] = CGPointMake(x, y);
             }
+            LC32CoreGraphicsPrepareBitmapBacking(context);
             CTFontDrawGlyphs(font, glyphs.data(), positions.data(), glyphs.size(), context);
             LC32CoreGraphicsSyncBitmapBacking(context);
             return 1;
@@ -525,6 +569,7 @@ u32 LC32_CoreText_Dispatch(u32 opcode, u32 guestCall, u32) {
             CTFrameRef frame = SlotHostObject<CTFrameRef>(call, 0);
             CGContextRef context = SlotHostObject<CGContextRef>(call, 1);
             if(!frame || !context) return 0;
+            LC32CoreGraphicsPrepareBitmapBacking(context);
             CTFrameDraw(frame, context);
             LC32CoreGraphicsSyncBitmapBacking(context);
             return 1;
@@ -649,6 +694,7 @@ u32 LC32_CoreText_Dispatch(u32 opcode, u32 guestCall, u32) {
             CTLineRef line = SlotHostObject<CTLineRef>(call, 0);
             CGContextRef context = SlotHostObject<CGContextRef>(call, 1);
             if(!line || !context) return 0;
+            LC32CoreGraphicsPrepareBitmapBacking(context);
             CTLineDraw(line, context);
             LC32CoreGraphicsSyncBitmapBacking(context);
             return 1;

@@ -822,7 +822,6 @@ u32 Dynarmic_mmap(
         return UINT32_MAX;
     }
     address = static_cast<u32>(reservedAddress);
-
     const int guestProtection = protection;
     const bool debuggerWritableExecutableFile =
         (guestProtection & PROT_EXEC) != 0 &&
@@ -1556,6 +1555,149 @@ static int DebuggerWritePhysicalMemory(u64 address,
     return 0;
 }
 
+static bool ReadGuestCodeWord(u32 address, u32 *value) {
+    const char *page = get_memory_page(address & ~DYN_PAGE_MASK);
+    if (page == nullptr) {
+        return false;
+    }
+    memcpy(value, page + (address & DYN_PAGE_MASK), sizeof(*value));
+    return true;
+}
+
+/*
+ * Gameloft's XPlayer networking library (2009-2011 games such as Starfront
+ * Collision) resolves each host on its own pthread. threadGetHostByNameProcess
+ * appends the result to a 4-entry global table, but after allocating the slot
+ * it re-reads the shared count for every later access instead of keeping its
+ * index. Two lookups finishing together (the game starts two for
+ * gllive.gameloft.com at launch) then memset/store through an empty slot and
+ * crash. Single-core iPhones rarely interleaved there; native guest threads
+ * do, roughly one launch in six.
+ *
+ * Keep the index the function already loaded into r8 (callee-saved), and
+ * publish count = index + 1 at the end. The count is stored through r11, which
+ * holds the table base, so the fixup only applies when the literal pool proves
+ * the count directly follows the 4-entry table.
+ */
+static const struct {
+    u32 offset;
+    u32 value;
+    u32 mask;
+} XPlayerHostTableSignature[] = {
+    {0x00, 0xe59f00bc, ~0u},  // ldr r0, =count - (pc)
+    {0x04, 0xe79f8000, ~0u},  // ldr r8, [pc, r0]      ; r8 = index
+    {0x08, 0xe3580003, ~0u},  // cmp r8, #3
+    {0x0c, 0xca000027, ~0u},  // bgt done
+    {0x10, 0xe59f00b0, ~0u},  // ldr r0, =table - (pc)
+    {0x14, 0xe59fa0b0, ~0u},  // ldr r10, =count - (pc)
+    {0x18, 0xe08fb000, ~0u},  // add r11, pc, r0       ; r11 = table
+    {0x1c, 0xe3a00014, ~0u},  // mov r0, #20
+    {0x20, 0xeb000000, 0xff000000u},  // bl operator new
+    {0x24, 0xe78b0108, ~0u},  // str r0, [r11, r8, lsl #2]
+    {0x28, 0xe08f800a, ~0u},  // add r8, pc, r10       ; r8 = &count
+    {0x2c, 0xe3a01000, ~0u},
+    {0x30, 0xe3a02014, ~0u},
+    {0x34, 0xe5980000, ~0u},  // ldr r0, [r8]
+    {0x38, 0xe79b0100, ~0u},
+    {0x3c, 0xeb000000, 0xff000000u},  // bl memset
+    {0x40, 0xe5980000, ~0u},
+    {0x44, 0xe596100c, ~0u},
+    {0x48, 0xe79b0100, ~0u},
+    {0x4c, 0xe580100c, ~0u},
+    {0x50, 0xe5980000, ~0u},
+    {0x54, 0xe79ba100, ~0u},
+    {0x58, 0xe1a00005, ~0u},
+    {0x5c, 0xeb000000, 0xff000000u},  // bl strnew
+    {0x60, 0xe58a0000, ~0u},
+    {0x64, 0xe5980000, ~0u},
+    {0x68, 0xe79ba100, ~0u},
+    {0x6c, 0xe3a00004, ~0u},
+    {0x70, 0xeb000000, 0xff000000u},  // bl operator new[]
+    {0x74, 0xe58a0010, ~0u},
+    {0x78, 0xe5980000, ~0u},
+    {0x7c, 0xe5961010, ~0u},
+    {0x80, 0xe79b0100, ~0u},
+    {0x84, 0xe5906010, ~0u},
+    {0x88, 0xe5910000, ~0u},
+    {0x8c, 0xeb000000, 0xff000000u},  // bl strnew
+    {0x90, 0xe5860000, ~0u},
+    {0x94, 0xe5980000, ~0u},
+    {0x98, 0xe59f1030, ~0u},
+    {0x9c, 0xe2800001, ~0u},  // add r0, r0, #1
+    {0xa0, 0xe5880000, ~0u},  // str r0, [r8]
+};
+
+static const struct {
+    u32 offset;
+    u32 value;
+} XPlayerHostTablePatch[] = {
+    {0x28, 0xe1a00000},  // nop: r8 keeps the index
+    {0x34, 0xe1a00008},  // mov r0, r8
+    {0x40, 0xe1a00008},
+    {0x50, 0xe1a00008},
+    {0x64, 0xe1a00008},
+    {0x78, 0xe1a00008},
+    {0x94, 0xe1a00008},
+    {0xa0, 0xe58b0010},  // str r0, [r11, #16]    ; count = index + 1
+};
+
+static bool XPlayerHostTableMatches(u32 site) {
+    for (const auto &word : XPlayerHostTableSignature) {
+        u32 value = 0;
+        if (!ReadGuestCodeWord(site + word.offset, &value) ||
+                (value & word.mask) != word.value) {
+            return false;
+        }
+    }
+    // Literal pool: +0x00 loads +0xc4 (count, used at +0x04 with pc +0x0c),
+    // +0x10 loads +0xc8 (table, used at +0x18 with pc +0x20), and +0x14 loads
+    // +0xcc (count again, used at +0x28 with pc +0x30).
+    u32 countLiteral = 0, tableLiteral = 0, countLiteral2 = 0;
+    if (!ReadGuestCodeWord(site + 0xc4, &countLiteral) ||
+            !ReadGuestCodeWord(site + 0xc8, &tableLiteral) ||
+            !ReadGuestCodeWord(site + 0xcc, &countLiteral2)) {
+        return false;
+    }
+    const u32 count = site + 0x0c + countLiteral;
+    const u32 table = site + 0x20 + tableLiteral;
+    if (site + 0x30 + countLiteral2 != count) {
+        return false;
+    }
+    return count == table + 0x10;
+}
+
+void Dynarmic_apply_guest_code_fixups() {
+    u32 start = 0, end = 0;
+    {
+        std::lock_guard<std::mutex> lock(guestMappingMutex);
+        if (guestMappingLen < 1) {
+            return;
+        }
+        start = guestMappings[0].start;
+        end = guestMappings[0].end;
+    }
+    for (u32 site = (start + 3) & ~3u; site + 0xd0 <= end; site += 4) {
+        u32 first = 0;
+        if (!ReadGuestCodeWord(site, &first) ||
+                first != XPlayerHostTableSignature[0].value ||
+                !XPlayerHostTableMatches(site)) {
+            continue;
+        }
+        bool patched = true;
+        for (const auto &word : XPlayerHostTablePatch) {
+            if (DebuggerWritePhysicalMemory(site + word.offset,
+                    sizeof(word.value),
+                    reinterpret_cast<const char *>(&word.value)) != 0) {
+                patched = false;
+            }
+        }
+        InvalidateAllGuestJits(site, 0xa4);
+        fprintf(stderr,
+            "LC32: %s XPlayer host-table race fixup at 0x%08x\n",
+            patched ? "applied" : "FAILED to apply", site);
+    }
+}
+
 bool Dynarmic_guest_tracepoint_set(u64 address) {
     if (address > UINT32_MAX) {
         return false;
@@ -1691,6 +1833,19 @@ bool ConsumeGuestSoftwareTracepoint(
                     r0IsaWords[6], r0IsaWords[7]);
             }
 #endif
+        }
+        std::array<u32, 10> r1Words = {};
+        if (registers[Reg::R1] != 0 &&
+                Dynarmic_mem_1read(
+                    registers[Reg::R1], sizeof(r1Words),
+                    reinterpret_cast<char *>(r1Words.data())) == 0) {
+            fprintf(stderr,
+                "LC32 guest tracepoint 0x%08x r1_words="
+                "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+                guestAddress,
+                r1Words[0], r1Words[1], r1Words[2], r1Words[3],
+                r1Words[4], r1Words[5], r1Words[6], r1Words[7],
+                r1Words[8], r1Words[9]);
         }
         std::array<u32, 10> r2Words = {};
         if (registers[Reg::R2] != 0 &&
