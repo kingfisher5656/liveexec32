@@ -1106,6 +1106,19 @@ static void LoadUserEnvironmentFile(const char *guestExecutable) {
         executable.substr(0, applications) + "/LiveExec32.env";
     FILE *file = fopen(path.c_str(), "r");
     if(file == nullptr) return;
+    // Game and launcher usually share one folder; read each file once.
+    static dev_t loadedDevice;
+    static ino_t loadedInode;
+    struct stat metadata = {};
+    if(fstat(fileno(file), &metadata) == 0) {
+        if(loadedInode != 0 && metadata.st_dev == loadedDevice &&
+                metadata.st_ino == loadedInode) {
+            fclose(file);
+            return;
+        }
+        loadedDevice = metadata.st_dev;
+        loadedInode = metadata.st_ino;
+    }
     char line[512];
     while(fgets(line, sizeof(line), file) != nullptr) {
         std::string text(line);
@@ -1168,6 +1181,13 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
             name.c_str());
     }
     LoadUserEnvironmentFile(argv[1]);
+    /*
+     * The LiveExec32 app's settings screen writes the file next to the
+     * Applications folder holding LiveExec32 itself; read that one too, for
+     * games kept in another LiveContainer folder (private vs. shared). Keys
+     * already set by the game's folder file win.
+     */
+    LoadUserEnvironmentFile(argv[0]);
     LC32ProfileInitialize();
 
     // Simulator data containers may be symlinked to a shorter /var path.

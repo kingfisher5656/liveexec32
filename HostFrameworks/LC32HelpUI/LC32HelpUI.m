@@ -1,5 +1,9 @@
 #import <UIKit/UIKit.h>
 #import "LC32HelpUI.h"
+#import "LC32EnvFile.h"
+#import "LC32SettingsViewController.h"
+
+static NSString *LC32LauncherExecutablePath;
 
 static void LC32ShowLauncherWindow(UIWindow *window) {
     NSString *message;
@@ -9,12 +13,13 @@ static void LC32ShowLauncherWindow(UIWindow *window) {
         message = @"LiveExec32 is an 32-bit emulation layer for modern iOS. "
         "To use 32-bit apps, set LiveExec32 as default and launch your app from LiveContainer.";
     }
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleName"]
-        message:message preferredStyle:UIAlertControllerStyleAlert];
-    window.rootViewController = [UIViewController new];
+    NSString *path = [LC32EnvFile
+        defaultPathForExecutable:LC32LauncherExecutablePath];
+    LC32SettingsViewController *settings = [[LC32SettingsViewController alloc]
+        initWithSettingsPath:path message:message];
+    window.rootViewController = [[UINavigationController alloc]
+        initWithRootViewController:settings];
     [window makeKeyAndVisible];
-    [window.rootViewController presentViewController:alert animated:NO completion:nil];
 }
 
 API_AVAILABLE(ios(13.0))
@@ -75,6 +80,9 @@ API_AVAILABLE(ios(13.0))
 
 int LC32RunHelpUI(int argc, char *argv[]) {
     @autoreleasepool {
+        if(argc > 0 && argv != NULL && argv[0] != NULL) {
+            LC32LauncherExecutablePath = @(argv[0]);
+        }
         return UIApplicationMain(
             argc, argv, nil,
             NSStringFromClass(LC32HelpAppDelegate.class));

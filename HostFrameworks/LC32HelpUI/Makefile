@@ -14,7 +14,7 @@ include $(THEOS)/makefiles/common.mk
 
 FRAMEWORK_NAME = LC32HelpUI
 
-LC32HelpUI_FILES = LC32HelpUI.m
+LC32HelpUI_FILES = LC32HelpUI.m LC32EnvFile.m LC32SettingsViewController.m
 LC32HelpUI_CFLAGS = -fobjc-arc -I.
 LC32HelpUI_FRAMEWORKS = UIKit
 LC32HelpUI_PUBLIC_HEADERS = LC32HelpUI.h
