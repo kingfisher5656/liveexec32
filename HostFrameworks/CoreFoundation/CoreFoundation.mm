@@ -3163,15 +3163,20 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
         case LC32CoreFoundationOpDataCreateMutable: {
             if(!RequireSlots(call, 1) ||
                SlotU32(call, 0) > kMaximumDataBytes) return 0;
+            /* A nonzero capacity makes native CF data fixed-size, and
+             * modern CF overruns the native heap when a guest appends past
+             * it (Nuts! does on first launch; old 32-bit CF tolerated it).
+             * The guest capacity is only a hint: keep native data growable. */
             return GuestForCreatedObject(CFDataCreateMutable(
-                kCFAllocatorDefault, SlotU32(call, 0)));
+                kCFAllocatorDefault, 0));
         }
         case LC32CoreFoundationOpDataCreateMutableCopy: {
             if(!RequireSlots(call, 2) ||
                SlotU32(call, 0) > kMaximumDataBytes) return 0;
             CFDataRef data = SlotHostObject<CFDataRef>(call, 1);
+            /* Growable, like OpDataCreateMutable above. */
             return data ? GuestForCreatedObject(CFDataCreateMutableCopy(
-                kCFAllocatorDefault, SlotU32(call, 0), data)) : 0;
+                kCFAllocatorDefault, 0, data)) : 0;
         }
         case LC32CoreFoundationOpDataAppendBytes: {
             if(!RequireSlots(call, 3)) return 0;

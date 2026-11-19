@@ -1,3 +1,4 @@
+#include "lc32_profile.h"
 #include <stdio.h>
 #include "LC32DebugLog.h"
 #include <unistd.h>
@@ -37,6 +38,7 @@
 #include "arm_dynarmic_cp15.h"
 #include "debugger_server.h"
 #include "guest_bootstrap.h"
+#include <CoreFoundation/CoreFoundation.h>
 
 extern "C" void LC32ConfigureLegacyAppTransportSecurity(
     uint32_t guestSDKVersion);
@@ -993,6 +995,149 @@ static void ExposeLegacyHomeBesideBundle(const std::string &guestHome,
     }
 }
 
+/*
+ * The reverse direction of the alias above: pre-iOS-8 games also rebuild
+ * their bundle path as NSHomeDirectory() + "/<name>.app/..." (Death Rally
+ * uses CFBundleDisplayName + ".app/Risoursa/" and fopen()s DeathRally.ini
+ * there). LiveContainer names the bundle folder by bundle ID and keeps it
+ * outside HOME, so map HOME/<name>.app to the bundle for every name a game
+ * could have used: executable, CFBundleName and CFBundleDisplayName.
+ */
+static void AddLegacyBundleNameCandidate(std::vector<std::string> &names,
+                                         CFDictionaryRef info, CFStringRef key) {
+    if(info == nullptr) return;
+    CFTypeRef value = CFDictionaryGetValue(info, key);
+    if(value == nullptr || CFGetTypeID(value) != CFStringGetTypeID()) return;
+    char buffer[PATH_MAX];
+    if(!CFStringGetCString((CFStringRef)value, buffer, sizeof(buffer),
+            kCFStringEncodingUTF8)) {
+        return;
+    }
+    names.push_back(buffer);
+}
+
+static void ExposeLegacyBundleInHome(const std::string &guestHome,
+                                     const char *executablePath,
+                                     uint32_t sdkVersion) {
+    if(sdkVersion >= 0x00080000 || guestHome.empty() ||
+            guestHome == "/" || executablePath == nullptr ||
+            executablePath[0] != '/') {
+        return;
+    }
+    const std::string executable(executablePath);
+    const size_t executableSlash = executable.find_last_of('/');
+    if(executableSlash == 0 || executableSlash == std::string::npos) return;
+    const std::string bundle = executable.substr(0, executableSlash);
+    if(bundle.size() <= 4 ||
+            bundle.compare(bundle.size() - 4, 4, ".app") != 0) {
+        return;
+    }
+    char resolvedBundle[PATH_MAX];
+    if(!realpath(bundle.c_str(), resolvedBundle)) return;
+
+    std::vector<std::string> names;
+    names.push_back(executable.substr(executableSlash + 1));
+    const std::string infoPath = bundle + "/Info.plist";
+    CFURLRef infoURL = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, (const UInt8 *)infoPath.c_str(),
+        (CFIndex)infoPath.size(), false);
+    CFReadStreamRef stream = infoURL ?
+        CFReadStreamCreateWithFile(kCFAllocatorDefault, infoURL) : nullptr;
+    if(stream && CFReadStreamOpen(stream)) {
+        CFPropertyListRef plist = CFPropertyListCreateWithStream(
+            kCFAllocatorDefault, stream, 0, kCFPropertyListImmutable,
+            nullptr, nullptr);
+        if(plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+            CFDictionaryRef info = (CFDictionaryRef)plist;
+            AddLegacyBundleNameCandidate(names, info, CFSTR("CFBundleExecutable"));
+            AddLegacyBundleNameCandidate(names, info, CFSTR("CFBundleName"));
+            AddLegacyBundleNameCandidate(names, info, CFSTR("CFBundleDisplayName"));
+        }
+        if(plist) CFRelease(plist);
+        CFReadStreamClose(stream);
+    }
+    if(stream) CFRelease(stream);
+    if(infoURL) CFRelease(infoURL);
+
+    // Guest code may see HOME with or without the /private firmlink prefix.
+    std::vector<std::string> homes{guestHome};
+    if(guestHome.rfind("/private/var/", 0) == 0) {
+        homes.push_back(guestHome.substr(strlen("/private")));
+    } else if(guestHome.rfind("/var/", 0) == 0) {
+        homes.push_back("/private" + guestHome);
+    }
+    std::vector<std::string> added;
+    for(const std::string &home : homes)
+    for(const std::string &name : names) {
+        if(name.empty() || name == "." || name == ".." ||
+                name.find('/') != std::string::npos) {
+            continue;
+        }
+        const std::string alias = home + "/" + name + ".app";
+        if(alias == bundle) continue;
+        bool duplicate = false;
+        for(const std::string &existing : added) {
+            if(existing == alias) duplicate = true;
+        }
+        if(duplicate) continue;
+        // A real entry (the genuine pre-iOS-8 layout) wins over the alias.
+        struct stat metadata = {};
+        if(lstat(alias.c_str(), &metadata) == 0) continue;
+        sharedHandle.fs->addGuestPathAlias(alias, bundle);
+        added.push_back(alias);
+        LC32_DEBUG_PRINTF("legacy bundle alias %s -> %s\n",
+            alias.c_str(), bundle.c_str());
+    }
+}
+
+/*
+ * LiveContainer offers no way to set environment variables for an app, so
+ * LiveExec32 reads LC32_* settings from "LiveExec32.env" in LiveContainer's
+ * Documents folder (the folder holding Applications/, visible in Files as
+ * On My iPhone > LiveContainer). One KEY=VALUE per line; # starts a comment.
+ * A variable already present in the real environment wins.
+ */
+static void LoadUserEnvironmentFile(const char *guestExecutable) {
+    if(guestExecutable == nullptr) return;
+    const std::string executable(guestExecutable);
+    const size_t applications = executable.rfind("/Applications/");
+    if(applications == std::string::npos) return;
+    const std::string path =
+        executable.substr(0, applications) + "/LiveExec32.env";
+    FILE *file = fopen(path.c_str(), "r");
+    if(file == nullptr) return;
+    char line[512];
+    while(fgets(line, sizeof(line), file) != nullptr) {
+        std::string text(line);
+        const size_t comment = text.find('#');
+        if(comment != std::string::npos) text.erase(comment);
+        while(!text.empty() && isspace(static_cast<unsigned char>(text.back())))
+            text.pop_back();
+        size_t start = 0;
+        while(start < text.size() &&
+                isspace(static_cast<unsigned char>(text[start]))) start++;
+        text.erase(0, start);
+        const size_t equals = text.find('=');
+        if(text.empty() || equals == std::string::npos) continue;
+        std::string key = text.substr(0, equals);
+        std::string value = text.substr(equals + 1);
+        while(!key.empty() && isspace(static_cast<unsigned char>(key.back())))
+            key.pop_back();
+        while(!value.empty() && isspace(static_cast<unsigned char>(value.front())))
+            value.erase(0, 1);
+        if(key.compare(0, 5, "LC32_") != 0) {
+            fprintf(stderr, "LC32: LiveExec32.env: ignoring %s "
+                "(only LC32_ settings are read)\n", key.c_str());
+            continue;
+        }
+        if(getenv(key.c_str()) != nullptr) continue;
+        setenv(key.c_str(), value.c_str(), 0);
+        fprintf(stderr, "LC32: LiveExec32.env: %s=%s\n", key.c_str(),
+            value.c_str());
+    }
+    fclose(file);
+}
+
 int LC32RunGuest(int argc, char* argv[], char* envp[]) {
     if(argc < 2 || argv == nullptr || argv[0] == nullptr ||
             argv[1] == nullptr) {
@@ -1022,6 +1167,8 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
             "LC32: ignoring malformed guest environment variable %s\n",
             name.c_str());
     }
+    LoadUserEnvironmentFile(argv[1]);
+    LC32ProfileInitialize();
 
     // Simulator data containers may be symlinked to a shorter /var path.
     // Keep native Foundation search URLs consistent with the resolved home
@@ -1100,6 +1247,8 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
             strerror(legacyLayoutError));
     }
     ExposeLegacyHomeBesideBundle(guestHome, execPath,
+        guestExecutableSDKVersion);
+    ExposeLegacyBundleInHome(guestHome, execPath,
         guestExecutableSDKVersion);
     setenv("LC32_GUEST_EXECUTABLE", execPath, 1);
     LC32ConfigureLegacyAppTransportSecurity(

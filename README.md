@@ -1,6 +1,21 @@
 # LiveExec32
 Run 32-bit binaries on 64-bit iOS by passing through syscalls.
 
+> [!IMPORTANT]
+> **This is a fork** of [LiveContainer/LiveExec32](https://github.com/LiveContainer/LiveExec32) (branch `local-game-fixes`, based on upstream `dev`)
+> with compatibility and performance fixes for legacy 32-bit iOS games. Tested on **iPhone 14 Pro, iOS 27.0.1** inside LiveContainer.
+> Changes are Apache-2.0 like upstream. The `External/dynarmic` submodule points to
+> [kingfisher5656/dynarmic](https://github.com/kingfisher5656/dynarmic/tree/lc32-game-fixes) (extra NEON ops, fast FP, JIT cache changes).
+>
+> Highlights: legacy UIKit rotation/canvas handling for 3:2 and 16:9 games, embedded/legacy movie player fixes, GLES bridge fixes
+> (NPOT, BGRA, client-array index ranges), guest memory reclamation (munmap epoch), lock-free atomics and inline GL dispatch,
+> display-link frame cap (`LC32_MAX_FPS`), per-thread profiler (`LC32_PROFILE`), GameKit/CoreMotion/MediaPlayer/OpenAL/CoreText shims,
+> and `const unichar *` Foundation fixes. Games worked on include Modern Combat 4, BioShock, Asphalt 6, Dead Space, Galaxy on Fire 1/2,
+> N.O.V.A. 2, H.A.W.X, Air Mail, Zenonia 1–5, Top Gear Stunt School, Death Rally, Nuts!, Dungeon Raid, NOM5, Tapsonic and others.
+>
+> Building note: Xcode 27 has no `ld-classic`; guest frameworks were rebuilt individually with `-marm`.
+> Clone with `git clone --recurse-submodules`.
+
 Not all apps will work and will mostly run into missing symbols issue. Please open an issue for that.
 
 > [!NOTE]

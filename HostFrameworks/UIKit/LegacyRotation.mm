@@ -18,6 +18,7 @@
 
 struct LC32RotationBuildVersion { uint32_t platform, version; };
 extern "C" bool LC32FullScreenRootlessHostingActive(void);
+extern "C" void LC32RefitPortraitPhoneCanvasWindowLater(UIWindow *window);
 extern "C" bool dyld_program_sdk_at_least(LC32RotationBuildVersion version);
 
 namespace {
@@ -373,6 +374,29 @@ extern "C" void LC32PrepareNativeLegacyRotationClass(Class cls) {
             method_getTypeEncoding(class_getInstanceMethod(UIViewController.class, preferred)));
 }
 
+// The side last announced by willRotate, so each turn is announced once.
+static const void *AnnouncedOrientationKey = &AnnouncedOrientationKey;
+
+extern "C" void LC32NativeLegacyRotationWillRotate(UIViewController *root,
+        UIInterfaceOrientation orientation, NSTimeInterval duration) {
+    UIViewController *controller = LC32NativeLegacyRotationContentController(root);
+    if(!controller || !RegisteredClass(object_getClass(controller)) || !startupFinished ||
+            !LC32NativeLegacyRotationCanCallGuest()) return;
+    NSNumber *announced = objc_getAssociatedObject(controller, AnnouncedOrientationKey);
+    if(announced && announced.integerValue == orientation) return;
+    objc_setAssociatedObject(controller, AnnouncedOrientationKey, @(orientation),
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [controller willRotateToInterfaceOrientation:orientation duration:duration];
+}
+
+extern "C" void LC32NativeLegacyRotationDidRotate(UIViewController *root,
+        UIInterfaceOrientation fromOrientation) {
+    UIViewController *controller = LC32NativeLegacyRotationContentController(root);
+    if(RegisteredClass(object_getClass(controller)) && startupFinished &&
+            LC32NativeLegacyRotationCanCallGuest())
+        [controller didRotateFromInterfaceOrientation:fromOrientation];
+}
+
 extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
     if(!LC32NativeLegacyRotationEnabled()) return;
     startupFinished = true;
@@ -389,6 +413,20 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 
 @implementation UIViewController (LC32NativeLegacyRotation)
 - (void)lc32_rotationViewDidMoveToWindow:(UIWindow *)window shouldAppearOrDisappear:(BOOL)appear {
+    // A guest controller's -dealloc may remove its own view after
+    // [super dealloc] (Modern Combat 4's MoviePlayer). iOS 7 UIKit sent no
+    // callback there; modern UIKit forms a weak reference to the controller,
+    // which _objc_fatal()s for an object that is deallocating.
+    static SEL allowsWeak = sel_registerName("allowsWeakReference");
+    if(!((BOOL (*)(id, SEL))objc_msgSend)(self, allowsWeak)) {
+        static bool logged;
+        if(!logged) {
+            logged = true;
+            fprintf(stderr, "LC32: skipped viewDidMoveToWindow for deallocating %s\n",
+                object_getClassName(self));
+        }
+        return;
+    }
     [self lc32_rotationViewDidMoveToWindow:window shouldAppearOrDisappear:appear];
     if(!window || !pthread_main_np() || !RegisteredClass(object_getClass(self))) return;
     [Controllers() addObject:self];
@@ -409,9 +447,7 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 - (void)lc32_rotationWindow:(UIWindow *)window willRotateToInterfaceOrientation:(UIInterfaceOrientation)orientation
         duration:(NSTimeInterval)duration newSize:(CGSize)size {
     [self lc32_rotationWindow:window willRotateToInterfaceOrientation:orientation duration:duration newSize:size];
-    UIViewController *controller = LC32NativeLegacyRotationContentController(self);
-    if(RegisteredClass(object_getClass(controller)) && startupFinished && LC32NativeLegacyRotationCanCallGuest())
-        [controller willRotateToInterfaceOrientation:orientation duration:duration];
+    LC32NativeLegacyRotationWillRotate(self, orientation, duration);
 }
 
 - (void)lc32_rotationWindow:(UIWindow *)window didRotateFromInterfaceOrientation:(UIInterfaceOrientation)orientation
@@ -471,6 +507,8 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
         transformLayer:(CALayer *)transform {
     // A presented overlay suspends the renderer's rotation queries, not the
     // backing coordinate system of the window beneath it.
+    // A fixed portrait phone canvas must keep its 320x480 window afterwards.
+    LC32RefitPortraitPhoneCanvasWindowLater(self);
     if(!ControllerForWindow(self, true)) {
         [self lc32_configureRootLayer:root sceneTransformLayer:scene transformLayer:transform];
         return;
@@ -550,13 +588,22 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 
 + (void)lc32_nativeLegacyDeviceOrientationChanged:(NSNotification *)notification {
     (void)notification;
+    LC32NativeLegacyRotationFollowDevice();
+}
+@end
+
+extern "C" void LC32NativeLegacyRotationFollowDevice(void) {
     // The enums use the same values (the landscape *names* are opposite).
     UIInterfaceOrientation orientation = (UIInterfaceOrientation)UIDevice.currentDevice.orientation;
     if(OrientationBit(orientation)) UpdateWindows(orientation, false);
 }
-@end
 #else
 extern "C" bool LC32NativeLegacyRotationEnabled(void) { return false; }
 extern "C" void LC32PrepareNativeLegacyRotationClass(Class) {}
 extern "C" void LC32FinishNativeLegacyRotationStartup(void) {}
+extern "C" void LC32NativeLegacyRotationWillRotate(UIViewController *,
+    UIInterfaceOrientation, NSTimeInterval) {}
+extern "C" void LC32NativeLegacyRotationDidRotate(UIViewController *,
+    UIInterfaceOrientation) {}
+extern "C" void LC32NativeLegacyRotationFollowDevice(void) {}
 #endif // LC32_UIKIT_COMPATIBILITY

@@ -47,7 +47,23 @@
         (void (^)(NSError *error))completionHandler {
     void (^typedHandler)(NSError *) = nil;
     if(completionHandler) {
+        /* Modern GameKit runs this deprecated call through authenticateHandler,
+         * which can fire again later, also with a nil error (for instance while
+         * a sign-in view is pending).  The legacy contract is one callback, and
+         * a nil error promises an authenticated local player with a playerID.
+         * This guest reports isAuthenticated NO, so games that trust the nil
+         * error then read a nil playerID (BioShock: +stringWithString: nil).
+         * Deliver once, and report a host "success" the guest cannot back up
+         * as Game Center being unavailable. */
+        __block BOOL delivered = NO;
         typedHandler = ^(NSError *error) {
+            if(delivered) return;
+            delivered = YES;
+            if(!error && ![self isAuthenticated]) {
+                error = [NSError errorWithDomain:GKErrorDomain
+                                            code:GKErrorNotSupported
+                                        userInfo:nil];
+            }
             completionHandler(error);
         };
     }

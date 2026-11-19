@@ -280,6 +280,11 @@ u32 LC32GuestCallbackExecutorCreationResult(u32 error, u32 unused1,
                                             u32 unused2);
 
 bool Dynarmic_nativeInitialize();
+// Faster floating point, on unless LC32_FAST_FP=0 (environment or LiveExec32.env).
+bool LC32FastFPEnabled();
+void LC32ApplyFastFP(Dynarmic::A32::UserConfig &config);
+// FPSCR a fresh guest thread starts with.
+std::uint32_t LC32GuestInitialFpscr();
 void Dynarmic_nativeDestroy();
 int Dynarmic_munmap(u64 address, u64 size);
 u32 Dynarmic_direct_mmap(u32 address, u64 size, int protection, int flags, void *src, u64 off);
@@ -399,9 +404,17 @@ public:
 
     DynarmicGuestStackString(const char *hostPtr) {
         // align to 8-byte
-        totalLen = (strlen(hostPtr) + 1 + U64_MASK) &~ U64_MASK;
+        const size_t stringLen = strlen(hostPtr) + 1;
+        totalLen = (stringLen + U64_MASK) &~ U64_MASK;
         guestPtr = (threadHandle.jit->Regs()[Reg::SP] -= totalLen);
-        Dynarmic_mem_1write(guestPtr, totalLen, (char *)hostPtr);
+        // Copy only the string: the 8-byte padding must not read past the
+        // host allocation (guard malloc faults on it).
+        Dynarmic_mem_1write(guestPtr, stringLen, (char *)hostPtr);
+        if(totalLen > stringLen) {
+            char zeros[U64_MASK + 1] = {};
+            Dynarmic_mem_1write(guestPtr + stringLen,
+                totalLen - stringLen, zeros);
+        }
     }
 
     u32 guestPtr;

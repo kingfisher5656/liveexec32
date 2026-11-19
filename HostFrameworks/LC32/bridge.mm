@@ -2486,6 +2486,58 @@ static bool LC32SelectorIsInInitializerFamily(SEL selector) {
 }
 
 // guest to host call of objc_msgSend*
+/*
+ * Generated guest shims derive the native selector from _cmd. After a guest
+ * swizzle (e.g. Crittercism exchanging -[NSURLConnection start] with
+ * _cr_instrumented_..._start), the original shim runs with the alias as _cmd
+ * and the native object receives a selector it does not implement. The shim's
+ * own local symbol, "-[Class selector]", still names the real method. Only
+ * consulted after the native receiver rejected the selector; results are
+ * cached per guest call site.
+ */
+static SEL LC32RecoverSwizzledShimSelector(id receiver, SEL selector) {
+    if(!threadHandle.jit || !receiver || !selector) return nullptr;
+    const u32 returnAddress = threadHandle.jit->Regs()[14] & ~1u;
+    static std::mutex cacheMutex;
+    static std::unordered_map<u64, SEL> cache;
+    const u64 key = (u64)returnAddress << 32 ^ (u64)(uintptr_t)selector;
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto found = cache.find(key);
+        if(found != cache.end()) {
+            return found->second &&
+                    [receiver respondsToSelector:found->second]
+                ? found->second : nullptr;
+        }
+    }
+    SEL recovered = nullptr;
+    symbolicated_call call;
+    call.address = returnAddress;
+    symbolicate_call_stack(&call, 1, SnapshotGuestImages());
+    const std::string &name = call.symbolName;
+    if(call.imageName.find("/System/Library/Frameworks/") != std::string::npos &&
+            name.size() > 4 && (name[0] == '-' || name[0] == '+') &&
+            name[1] == '[' && name.back() == ']') {
+        const size_t space = name.find(' ');
+        if(space != std::string::npos && space + 1 < name.size() - 1) {
+            const std::string original =
+                name.substr(space + 1, name.size() - space - 2);
+            SEL candidate = sel_registerName(original.c_str());
+            if(candidate != selector) recovered = candidate;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        cache[key] = recovered;
+    }
+    if(recovered && [receiver respondsToSelector:recovered]) {
+        fprintf(stderr, "LC32: swizzled guest shim %s sent %s; using %s\n",
+            name.c_str(), sel_getName(selector), sel_getName(recovered));
+        return recovered;
+    }
+    return nullptr;
+}
+
 u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
     /* Shadow any initializer which synchronously called guest code for this
      * entire nested bridge operation—not just its native dispatch. Receiver
@@ -2640,6 +2692,15 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
     Method method = dispatchClass
         ? class_getInstanceMethod(dispatchClass, selector)
         : nullptr;
+    if(!method && !invokeSuper && dispatchClass && receiver &&
+            ![receiver respondsToSelector:selector]) {
+        if(SEL recovered = LC32RecoverSwizzledShimSelector(
+                receiver, selector)) {
+            selector = recovered;
+            host_cmd = (u64)selector;
+            method = class_getInstanceMethod(dispatchClass, selector);
+        }
+    }
     if(!method && invokeSuper) {
         /*
          * A guest-backed mirror forwarded this message to the host, but the
@@ -6019,8 +6080,21 @@ static u64 LC32GuestObjCMsgSendWithoutDeferredReleases(
     return LC32InvokeGuestC(guestPtr, true, argc, args);
 }
 
+extern "C" int LC32CoreGraphicsEnterGuestCallback(void);
+extern "C" void LC32CoreGraphicsLeaveGuestCallback(int depth);
+
+namespace {
+struct LC32GuestCallbackGraphicsScope {
+    const int depth = LC32CoreGraphicsEnterGuestCallback();
+    ~LC32GuestCallbackGraphicsScope() {
+        LC32CoreGraphicsLeaveGuestCallback(depth);
+    }
+};
+} // namespace
+
 u64 guest_objc_msgSend(int argc, u32 *args) {
     LC32DrainDeferredGuestPinReleases();
+    LC32GuestCallbackGraphicsScope graphicsScope;
     return LC32GuestObjCMsgSendWithoutDeferredReleases(argc, args);
 }
 
@@ -6915,6 +6989,35 @@ static void LC32InstallGuestMirrorReferenceCounting(Class cls) {
 }
 
 objc_hook_getClass host_getClass;
+/* Nibs compiled for iOS 6 and earlier archive rounded-rect buttons as the
+ * private UIKit class UIRoundedRectButton, which modern UIKit removed:
+ * UINibDecoder then throws NSInvalidUnarchiveOperationException (Tapsonic's
+ * BugsDialog.nib at launch). The archive still carries UIButtonType 1, which
+ * modern -[UIButton initWithCoder:] turns into a system button, so a plain
+ * UIButton subclass under the old name decodes the same object. Host objects
+ * of this class reach the guest as its UIButton (nearest guest superclass). */
+static Class LC32LegacyUIKitClass(const char *name) {
+    static const struct { const char *name, *superclass; } legacyClasses[] = {
+        {"UIRoundedRectButton", "UIButton"},
+    };
+    if(!name) return Nil;
+    for(const auto &legacy : legacyClasses) {
+        if(strcmp(name, legacy.name) != 0) continue;
+        static std::mutex publicationMutex;
+        std::lock_guard<std::mutex> lock(publicationMutex);
+        if(Class existing = objc_lookUpClass(name)) return existing;
+        Class superclass = objc_lookUpClass(legacy.superclass);
+        if(!superclass) return Nil;
+        Class cls = objc_allocateClassPair(superclass, name, 0);
+        if(!cls) return Nil;
+        objc_registerClassPair(cls);
+        fprintf(stderr, "LC32: provided removed UIKit class %s as a %s subclass\n",
+            name, legacy.superclass);
+        return cls;
+    }
+    return Nil;
+}
+
 BOOL host_hook_getClass(const char *name, Class *outClass) {
     if(host_getClass && host_getClass(name, outClass)) {
         return true;
@@ -6933,6 +7036,7 @@ BOOL host_hook_getClass(const char *name, Class *outClass) {
 
     LC32_DEBUG_PRINTF("host_hook_getClass: %s\n", name);
     *outClass = guest_objc_getClass_retHostClass(name);
+    if(!*outClass) *outClass = LC32LegacyUIKitClass(name);
     return *outClass != nil;
 }
 

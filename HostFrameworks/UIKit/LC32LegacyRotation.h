@@ -17,6 +17,14 @@ void LC32FinishNativeLegacyRotationStartup(void);
 BOOL LC32NativeLegacyRotationCanCallGuest(void);
 /* Resolve an emulator-owned canvas container without exposing it to guests. */
 UIViewController *LC32NativeLegacyRotationContentController(UIViewController *controller);
+/* Deliver the deprecated will/did pair for a scene rotation that UIKit only
+ * reported to the native root (viewWillTransitionToSize:). */
+void LC32NativeLegacyRotationWillRotate(UIViewController *root,
+    UIInterfaceOrientation orientation, NSTimeInterval duration);
+void LC32NativeLegacyRotationDidRotate(UIViewController *root,
+    UIInterfaceOrientation fromOrientation);
+/* Re-run the device-orientation rotation after the allowed sides changed. */
+void LC32NativeLegacyRotationFollowDevice(void);
 
 #ifdef __cplusplus
 }

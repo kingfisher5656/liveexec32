@@ -152,4 +152,57 @@ allowLossyConversion:(BOOL)allowLossyConversion
                                encoding:encoding] autorelease];
 }
 
+/*
+ * The generated bridge treats `const unichar *` as a pointer to one scalar,
+ * so native Foundation received only the first UTF-16 unit followed by
+ * stack bytes (Dead Space's wchar_t path round trip came back as "/").
+ * Pass the whole buffer as UTF-16LE bytes instead; ARM32 guests are always
+ * little-endian, and an explicit-endian encoding keeps a leading U+FEFF.
+ */
+- (instancetype)initWithCharacters:(const unichar *)characters
+                            length:(NSUInteger)length {
+    if((length && !characters) || length > INT32_MAX / sizeof(unichar)) {
+        CRSetCrashLogMessage("NSString initWithCharacters:length: invalid buffer");
+        return LC32DisposeFailedInit(self);
+    }
+    return [self initWithBytes:characters
+                        length:length * sizeof(unichar)
+                      encoding:NSUTF16LittleEndianStringEncoding];
+}
+
+- (instancetype)initWithCharactersNoCopy:(unichar *)characters
+                                  length:(NSUInteger)length
+                            freeWhenDone:(BOOL)freeWhenDone {
+    id result = [self initWithCharacters:characters length:length];
+    if(freeWhenDone) free(characters);
+    return result;
+}
+
++ (instancetype)stringWithCharacters:(const unichar *)characters
+                              length:(NSUInteger)length {
+    return [[[self alloc] initWithCharacters:characters
+                                      length:length] autorelease];
+}
+
+@end
+
+@implementation NSMutableString (LC32Characters)
+
+- (void)appendCharacters:(const unichar *)characters length:(NSUInteger)length {
+    if(!length) return;
+    NSString *string = [[NSString alloc] initWithCharacters:characters
+                                                     length:length];
+    if(string) [self appendString:string];
+    [string release];
+}
+
+- (void)replaceCharactersInRange:(NSRange)range
+                  withCharacters:(const unichar *)characters
+                          length:(NSUInteger)length {
+    NSString *string = [[NSString alloc] initWithCharacters:characters
+                                                     length:length];
+    if(string) [self replaceCharactersInRange:range withString:string];
+    [string release];
+}
+
 @end

@@ -361,11 +361,26 @@ static id HostObjectForGuestResult(u32 guestObject) {
         guest_objc_msgSend(2, arguments)));
 }
 
+/* Old compilers sometimes emitted a wrong signature for blocks whose return
+ * type was inferred. Tapsonic's NSComparator for sortedArrayUsingComparator:
+ * is encoded "@?12@?0@4@8" (returns a block) yet returns NSComparisonResult.
+ * Native iOS never reads that signature; the bridge does, and sent host_self
+ * to 1 (NSOrderedDescending). No ARM32 object lives in the first or last
+ * page, so such an "object" result is a small integer: pass it through
+ * sign-extended. */
+static bool GuestObjectResultIsSmallInteger(u32 result) {
+    return result != 0 && (result < 0x1000 || result >= 0xfffff000u);
+}
+
 static u64 NormalizeGuestResult(BlockValueKind kind, u64 result) {
     switch(kind) {
         case BlockValueKind::Void:
             return 0;
         case BlockValueKind::Object:
+            if(GuestObjectResultIsSmallInteger(static_cast<u32>(result))) {
+                return static_cast<u64>(static_cast<int64_t>(
+                    static_cast<int32_t>(result)));
+            }
             return reinterpret_cast<u64>(objc_autorelease(objc_retain(
                 HostObjectForGuestResult(static_cast<u32>(result)))));
         case BlockValueKind::SignedChar:

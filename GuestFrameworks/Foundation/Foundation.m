@@ -130,10 +130,83 @@ static BOOL LC32GuestUsesPopCapBundleCompatibility(void) {
     return LC32UsesPopCapBundleCompatibility;
 }
 
+/*
+ * Legacy Foundation kept a bundle's path strings in the bundle, so games
+ * could cache them unretained for the life of the process (Galaxy on Fire
+ * stores [[NSBundle mainBundle] bundlePath] in a C++ global).  Modern host
+ * Foundation builds a fresh autoreleased string on each call, so the guest
+ * proxy died at the next pool drain and its memory was reused.  Pin the
+ * first result per bundle and selector; bundles are never unloaded here.
+ */
+enum {
+    LC32BundleCachedBundlePath,
+    LC32BundleCachedResourcePath,
+    LC32BundleCachedExecutablePath,
+    LC32BundleCachedBundleIdentifier,
+    LC32BundleCachedSelectorCount,
+};
+
+static pthread_mutex_t LC32BundleCachedObjectsLock = PTHREAD_MUTEX_INITIALIZER;
+static CFMutableDictionaryRef
+    LC32BundleCachedObjects[LC32BundleCachedSelectorCount];
+static uint64_t LC32BundleCachedHostSelectors[LC32BundleCachedSelectorCount]
+    __attribute__((aligned(8)));
+
+static id LC32BundleCachedHostObject(NSBundle *bundle, SEL command,
+                                     unsigned slot) {
+    pthread_mutex_lock(&LC32BundleCachedObjectsLock);
+    if(!LC32BundleCachedObjects[slot]) {
+        // Keys are bundle pointers (not retained); values are retained.
+        LC32BundleCachedObjects[slot] = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0, NULL, &kCFTypeDictionaryValueCallBacks);
+    }
+    id cached = LC32BundleCachedObjects[slot]
+        ? (id)CFDictionaryGetValue(LC32BundleCachedObjects[slot], bundle)
+        : nil;
+    pthread_mutex_unlock(&LC32BundleCachedObjectsLock);
+    if(cached) return cached;
+
+    const uint64_t selector = LC32CachedHostSelector(
+        &LC32BundleCachedHostSelectors[slot], command, NO);
+    id result = LC32InvokeHostObjectSelector(
+        bundle.host_self, selector, (uint64_t)0);
+    if(!result) return nil;
+
+    pthread_mutex_lock(&LC32BundleCachedObjectsLock);
+    cached = LC32BundleCachedObjects[slot]
+        ? (id)CFDictionaryGetValue(LC32BundleCachedObjects[slot], bundle)
+        : nil;
+    if(!cached && LC32BundleCachedObjects[slot]) {
+        CFDictionarySetValue(LC32BundleCachedObjects[slot], bundle, result);
+        cached = result;
+    }
+    pthread_mutex_unlock(&LC32BundleCachedObjectsLock);
+    return cached ? cached : result;
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
 
 @implementation NSBundle (LC32GuestBundleCompatibility)
+
+- (NSString *)bundlePath {
+    return LC32BundleCachedHostObject(self, _cmd, LC32BundleCachedBundlePath);
+}
+
+- (NSString *)resourcePath {
+    return LC32BundleCachedHostObject(self, _cmd,
+                                      LC32BundleCachedResourcePath);
+}
+
+- (NSString *)executablePath {
+    return LC32BundleCachedHostObject(self, _cmd,
+                                      LC32BundleCachedExecutablePath);
+}
+
+- (NSString *)bundleIdentifier {
+    return LC32BundleCachedHostObject(self, _cmd,
+                                      LC32BundleCachedBundleIdentifier);
+}
 
 + (NSBundle *)mainBundle {
     /*

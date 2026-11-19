@@ -59,6 +59,7 @@ DYNARMIC_CMAKE_POLICY_FLAGS :=
 endif
 
 LiveExec32Shared_FILES = \
+	lc32_profile.cpp \
 	LiveExec32Shared.cpp guest_bootstrap.cpp debugger_server.cpp \
 	crash_exception.mm guest_dispatch.mm guest_timer_queue.cpp guest_timers.cpp \
 	arm_dynarmic_cp15.cpp dynarmic.cpp dynarmic_syscalls.cpp \
@@ -69,6 +70,7 @@ LiveExec32Shared_FILES = \
 	bridge.mm host_selector_hooks.mm block_bridge.mm bridge.s log.m \
 	../Foundation/Foundation.mm ../Foundation/NSString.mm ../Foundation/MachPort.mm \
 	../Foundation/NSInvocation.mm ../Foundation/ObjectCallbacks.mm \
+	../Foundation/LegacyLocale.mm \
 	../CoreFoundation/CoreFoundation.mm ../CFNetwork/CFNetwork.mm \
 	../Security/Security.mm ../CoreGraphics/CoreGraphics.mm \
 	../SystemConfiguration/SystemConfiguration.mm \
@@ -80,7 +82,7 @@ LiveExec32Shared_FILES = \
 	../UIKit/LegacyAutoLayout.mm ../UIKit/LegacyFonts.mm ../UIKit/LegacyAlerts.mm \
 	../UIKit/LegacyRotation.mm ../UIKit/LegacyNibLoading.mm ../UIKit/GuestSelectorHooks.mm \
 	../UIKit/GuestScreenMetrics.mm ../UIKit/GuestStatusBar.mm \
-	../UIKit/LegacyMoviePlayer.mm
+	../UIKit/LegacyMoviePlayer.mm ../UIKit/LegacyFrameRate.mm
 LiveExec32Shared_CFLAGS = \
 	-I. -I$(DYNARMIC_ROOT)/src -I../../include -DDYNARMIC_MASTER \
 	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS) \
@@ -92,6 +94,7 @@ crash_exception.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyRotation.mm_CFLAGS = -fobjc-arc
 ../UIKit/GuestStatusBar.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyMoviePlayer.mm_CFLAGS = -fobjc-arc
+../UIKit/LegacyFrameRate.mm_CFLAGS = -fobjc-arc
 LiveExec32Shared_OBJ_FILES = $(DYNARMIC_STATIC_LIBS)
 LiveExec32Shared_LDFLAGS = -L../../External/mini-gdbstub/build -Wl,-weak-lMobileGestalt
 LiveExec32Shared_LIBRARIES = gdbstub

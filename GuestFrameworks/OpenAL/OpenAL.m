@@ -316,7 +316,11 @@ ALCboolean alcIsExtensionPresent(ALCdevice *device, const ALCchar *extname) {
 
 void *alcGetProcAddress(ALCdevice *device, const ALCchar *funcname) {
     (void)device;
-    return LC32OpenALLookupALCProc(funcname);
+    /* Apple's alcGetProcAddress resolves AL entry points and extensions too;
+     * games following Apple's oalTouch sample fetch alBufferDataStatic and
+     * alcMacOSXMixerOutputRate this way and skip loading sound data if NULL. */
+    void *proc = LC32OpenALLookupALCProc(funcname);
+    return proc ? proc : LC32OpenALLookupALProc(funcname);
 }
 
 LC32_OPENAL_RET2(ALCenum, alcGetEnumValue, ALCdevice *, device, LC32_OPENAL_PTR(device), const ALCchar *, enumname, LC32_OPENAL_PTR(enumname))
@@ -342,6 +346,11 @@ LC32_OPENAL_VOID3(alcCaptureSamples, ALCdevice *, device, LC32_OPENAL_PTR(device
 void alBufferDataStatic(ALint bid, ALenum format, const ALvoid *data,
                         ALsizei size, ALsizei freq) {
     alBufferData((ALuint)bid, format, data, size, freq);
+}
+
+/* Apple extension: a mixer-rate hint. The host mixer chooses its own rate. */
+ALvoid alcMacOSXMixerOutputRate(const ALdouble value) {
+    (void)value;
 }
 
 #define LC32_OPENAL_PROC(NAME) \
@@ -448,6 +457,7 @@ static void *LC32OpenALLookupALCProc(const char *name) {
     LC32_OPENAL_PROC(alcCaptureStart);
     LC32_OPENAL_PROC(alcCaptureStop);
     LC32_OPENAL_PROC(alcCaptureSamples);
+    LC32_OPENAL_PROC(alcMacOSXMixerOutputRate);
     return NULL;
 }
 

@@ -120,14 +120,25 @@ static void protection_and_holes(void) {
         VM_INHERIT_COPY) == KERN_INVALID_ADDRESS && target == 0x12345678,
         "hole-rejected-atomically");
 #if !__LP64__
+    /* copy=TRUE yields a private snapshot with the source protection. */
+    target = 0;
     CHECK(vm_remap(mach_task_self(), &target, vm_page_size, 0,
         VM_FLAGS_ANYWHERE, mach_task_self(), source, TRUE, &current, &maximum,
-        VM_INHERIT_COPY) == KERN_NOT_SUPPORTED && target == 0x12345678,
-        "cow-explicitly-unsupported");
+        VM_INHERIT_COPY) == KERN_SUCCESS && target != source &&
+        current == VM_PROT_READ && *(uint8_t *)(uintptr_t)target == 0x93,
+        "cow-private-copy");
+    CHECK(vm_protect(mach_task_self(), target, vm_page_size, FALSE,
+        VM_PROT_READ | VM_PROT_WRITE) == KERN_SUCCESS &&
+        (*(volatile uint8_t *)(uintptr_t)target = 0x11, 1) &&
+        *(uint8_t *)(uintptr_t)source == 0x93, "cow-copy-independent");
+    vm_deallocate(mach_task_self(), target, vm_page_size);
+    /* Like XNU, an unaligned source (e.g. a Thumb pointer) maps its page. */
+    target = 0;
     CHECK(vm_remap(mach_task_self(), &target, 16, 0,
         VM_FLAGS_ANYWHERE, mach_task_self(), source + 1, FALSE, &current, &maximum,
-        VM_INHERIT_COPY) == KERN_NOT_SUPPORTED && target == 0x12345678,
-        "unaligned-explicitly-unsupported");
+        VM_INHERIT_COPY) == KERN_SUCCESS && !(target & (vm_page_size - 1)) &&
+        *(uint8_t *)(uintptr_t)target == 0x93, "unaligned-source-truncated");
+    vm_deallocate(mach_task_self(), target, vm_page_size);
 #endif
     vm_deallocate(mach_task_self(), source, vm_page_size);
 }

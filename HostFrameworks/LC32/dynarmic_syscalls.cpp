@@ -5,8 +5,13 @@
 #include "guest_mach_messages.h"
 
 #include <poll.h>
+#include <termios.h>
 #include <net/if.h>
+#include <net/if_dl.h>
+#include <net/if_types.h>
 #include <sys/sockio.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 
 /* Darwin keeps some record-lock fcntl commands as SPI, so public SDKs may
  * omit their names even though the syscall ABI remains available. */
@@ -185,6 +190,189 @@ static int CompleteGuestSysctlStorage(
     return 0;
 }
 
+/*
+ * Some 32-bit games pick their render resolution from a hard-coded list of
+ * hw.machine strings and treat any newer model as a low-end, non-retina
+ * device.  Asphalt 6 (iPhone build, com.gameloft.Asphalt6) only calls
+ * setContentScaleFactor:2 for iPhone3,x / iPhone4,x / iPod4,1 / iPad3; on
+ * "iPhone15,2" it falls into its generic iPhone class and renders 480x320.
+ * For such bundles report the newest model the game knows instead.
+ */
+static const char *GuestMachineOverride() {
+    static const char *override = []() -> const char * {
+        /* LC32_GUEST_MACHINE=<model> forces a value; set but empty disables. */
+        if(const char *forced = getenv("LC32_GUEST_MACHINE")) {
+            if(!*forced) return nullptr;
+            fprintf(stderr, "LC32: guest hw.machine forced to %s\n", forced);
+            return forced;
+        }
+        /* Matched by bundle identifier, or by executable name for games
+         * whose copies circulate under re-signed identifiers. */
+        static const struct {
+            const char *bundleIdentifier;
+            const char *executable;
+            const char *machine;
+        } overrides[] = {
+            { "com.gameloft.Asphalt6", nullptr, "iPhone4,1" },
+            /* BioShock 1.3.5 maps only single-digit models up to iPhone7,x
+             * (iPhone 6). Anything newer is "unsupported": every call
+             * re-reads hw.machine and logs it (every frame; 200k lines),
+             * and it gets no quality tier. */
+            { "com.2k.bioshock", "bioshock", "iPhone7,2" },
+        };
+        /* NSBundle.mainBundle is the guest .app under LiveContainer (and in
+         * the simulator harness); CFBundleGetMainBundle may not be. */
+        using Send = id (*)(id, SEL);
+        using SendString = const char *(*)(id, SEL);
+        id bundleClass = reinterpret_cast<id>(objc_getClass("NSBundle"));
+        id bundle = bundleClass ? reinterpret_cast<Send>(objc_msgSend)(
+            bundleClass, sel_registerName("mainBundle")) : nil;
+        id identifier = bundle ? reinterpret_cast<Send>(objc_msgSend)(
+            bundle, sel_registerName("bundleIdentifier")) : nil;
+        const char *value = identifier ? reinterpret_cast<SendString>(
+            objc_msgSend)(identifier, sel_registerName("UTF8String")) : nullptr;
+        id executablePath = bundle ? reinterpret_cast<Send>(objc_msgSend)(
+            bundle, sel_registerName("executablePath")) : nil;
+        id executableName = executablePath ? reinterpret_cast<Send>(
+            objc_msgSend)(executablePath,
+                sel_registerName("lastPathComponent")) : nil;
+        const char *executable = executableName
+            ? reinterpret_cast<SendString>(objc_msgSend)(executableName,
+                sel_registerName("UTF8String")) : nullptr;
+        for(const auto &entry : overrides) {
+            const bool byIdentifier = value && entry.bundleIdentifier &&
+                strcmp(value, entry.bundleIdentifier) == 0;
+            const bool byExecutable = executable && entry.executable &&
+                strcmp(executable, entry.executable) == 0;
+            if(byIdentifier || byExecutable) {
+                fprintf(stderr, "LC32: guest hw.machine reports %s for %s\n",
+                    entry.machine, byIdentifier ? value : executable);
+                return entry.machine;
+            }
+        }
+        return nullptr;
+    }();
+    return override;
+}
+
+static bool CompleteGuestMachineOverride(u32 guest_oldp, u32 guest_oldlenp,
+        u32 guest_newp, size_t newlen, int &result) {
+    const char *machine = GuestMachineOverride();
+    if(!machine || guest_newp || newlen) return false;
+    u32 length = static_cast<u32>(strlen(machine) + 1);
+    if(!guest_oldlenp) {
+        result = return_with_carry_direct(guest_oldp ? EFAULT : 0,
+            guest_oldp != 0);
+        return true;
+    }
+    u32 capacity = 0;
+    if(guest_oldp && Dynarmic_mem_1read(guest_oldlenp, sizeof(capacity),
+            reinterpret_cast<char *>(&capacity)) != 0) {
+        result = return_with_carry_direct(EFAULT, true);
+        return true;
+    }
+    if(guest_oldp && capacity < length) {
+        result = return_with_carry_direct(ENOMEM, true);
+        return true;
+    }
+    if(guest_oldp && Dynarmic_mem_1write(guest_oldp, length,
+            const_cast<char *>(machine)) != 0) {
+        result = return_with_carry_direct(EFAULT, true);
+        return true;
+    }
+    if(Dynarmic_mem_1write(guest_oldlenp, sizeof(length),
+            reinterpret_cast<char *>(&length)) != 0) {
+        result = return_with_carry_direct(EFAULT, true);
+        return true;
+    }
+    result = return_with_carry_direct(0, false);
+    return true;
+}
+
+/*
+ * hw.physmem and hw.usermem are 32-bit ints. The 64-bit kernel truncates its
+ * byte count to 32 bits, so a 3-4 GiB or 6-8 GiB device (or a Mac running
+ * the simulator) reads a negative or tiny value. Games treat that as a
+ * low-memory device: 9mm swaps in _low textures and halves its post-effect
+ * buffer below 300 MB. Report what the largest 32-bit iOS devices had.
+ */
+static bool CompleteGuestPhysicalMemory(int which, u32 guest_oldp,
+        u32 guest_oldlenp, u32 guest_newp, size_t newlen, int &result) {
+    if(guest_newp || newlen) return false;
+    int32_t value;
+    if(which == HW_PHYSMEM) value = 1024 * 1024 * 1024;
+    else if(which == HW_USERMEM) value = 896 * 1024 * 1024;
+    else return false;
+    if(!guest_oldlenp) {
+        result = return_with_carry_direct(guest_oldp ? EFAULT : 0,
+            guest_oldp != 0);
+        return true;
+    }
+    u32 capacity = 0;
+    if(guest_oldp && Dynarmic_mem_1read(guest_oldlenp, sizeof(capacity),
+            reinterpret_cast<char *>(&capacity)) != 0) {
+        result = return_with_carry_direct(EFAULT, true);
+        return true;
+    }
+    if(guest_oldp && capacity < sizeof(value)) {
+        result = return_with_carry_direct(ENOMEM, true);
+        return true;
+    }
+    if(guest_oldp && Dynarmic_mem_1write(guest_oldp, sizeof(value),
+            reinterpret_cast<char *>(&value)) != 0) {
+        result = return_with_carry_direct(EFAULT, true);
+        return true;
+    }
+    u32 length = sizeof(value);
+    if(Dynarmic_mem_1write(guest_oldlenp, sizeof(length),
+            reinterpret_cast<char *>(&length)) != 0) {
+        result = return_with_carry_direct(EFAULT, true);
+        return true;
+    }
+    result = return_with_carry_direct(0, false);
+    return true;
+}
+
+/*
+ * iOS 7 and later never reveal a hardware address: every Ethernet-type link
+ * address in the routing sysctl reads as 02:00:00:00:00:00. A host that does
+ * reveal one (the Simulator, Mac Catalyst) would otherwise give games a
+ * different device identifier from the iPhone, and games that key their save
+ * encryption to it (Modern Combat 4) reject saves copied from the device.
+ */
+static void HideGuestLinkAddresses(const int *name, u_int namelen,
+        GuestSysctlStorage &storage) {
+    /* <net/route.h> is not in the iOS SDK; these values are stable ABI. */
+    constexpr int RouteIfInfo = 0xe, RouteIfInfo2 = 0x12;
+    if(namelen < 5 || name[0] != CTL_NET || name[1] != PF_ROUTE ||
+            (name[4] != NET_RT_IFLIST && name[4] != NET_RT_IFLIST2)) return;
+    uint8_t *bytes = reinterpret_cast<uint8_t *>(storage.hostOldBytes.data());
+    const size_t length = std::min(storage.hostOldLength,
+        storage.hostOldCapacity);
+    for(size_t offset = 0; offset + sizeof(if_msghdr) <= length;) {
+        const auto *header = reinterpret_cast<const if_msghdr *>(bytes + offset);
+        const size_t messageLength = header->ifm_msglen;
+        if(messageLength < sizeof(u_short) * 2 || offset + messageLength > length)
+            break;
+        size_t headerLength = 0;
+        if(header->ifm_type == RouteIfInfo) headerLength = sizeof(if_msghdr);
+        else if(header->ifm_type == RouteIfInfo2) headerLength = sizeof(if_msghdr2);
+        if(headerLength && headerLength + offsetof(sockaddr_dl, sdl_data) <=
+                messageLength) {
+            auto *link = reinterpret_cast<sockaddr_dl *>(
+                bytes + offset + headerLength);
+            const size_t addressEnd = headerLength +
+                offsetof(sockaddr_dl, sdl_data) + link->sdl_nlen + link->sdl_alen;
+            if(link->sdl_family == AF_LINK && link->sdl_alen == 6 &&
+                    link->sdl_type == IFT_ETHER && addressEnd <= messageLength) {
+                static const uint8_t hidden[6] = {0x02, 0, 0, 0, 0, 0};
+                memcpy(LLADDR(link), hidden, sizeof(hidden));
+            }
+        }
+        offset += messageLength;
+    }
+}
+
 int guest___sysctl(u32 guest_name, u_int namelen, u32 guest_oldp,
         u32 guest_oldlenp, u32 guest_newp, size_t newlen) {
     // TODO: fake stuff like CPU architecture and KERN_USRSTACK32
@@ -196,6 +384,21 @@ int guest___sysctl(u32 guest_name, u_int namelen, u32 guest_oldp,
             guest_name, sizeof(int) * namelen,
             reinterpret_cast<char *>(host_name)) != 0) {
         return return_with_carry_direct(EFAULT, true);
+    }
+
+    if(namelen == 2 && host_name[0] == CTL_HW && host_name[1] == HW_MACHINE) {
+        int overrideResult;
+        if(CompleteGuestMachineOverride(guest_oldp, guest_oldlenp,
+                guest_newp, newlen, overrideResult)) {
+            return overrideResult;
+        }
+    }
+    if(namelen == 2 && host_name[0] == CTL_HW) {
+        int memoryResult;
+        if(CompleteGuestPhysicalMemory(host_name[1], guest_oldp,
+                guest_oldlenp, guest_newp, newlen, memoryResult)) {
+            return memoryResult;
+        }
     }
 
     /*
@@ -290,6 +493,8 @@ int guest___sysctl(u32 guest_name, u_int namelen, u32 guest_oldp,
         guest_oldlenp ? &storage.hostOldLength : nullptr,
         guest_newp ? storage.hostNewBytes.data() : nullptr, newlen,
         0);
+    if(result == 0 && guest_oldp)
+        HideGuestLinkAddresses(host_name, namelen, storage);
 
     const int completionError = CompleteGuestSysctlStorage(
         result, guest_oldp, guest_oldlenp, storage);
@@ -308,6 +513,24 @@ int guest___sysctlbyname(u32 guest_name, u_int namelen, u32 guest_oldp,
     if(namelen != 0 && !read_guest_memory_with_permissions(
             guest_name, host_name.data(), namelen, PROT_READ)) {
         return return_with_carry_direct(EFAULT, true);
+    }
+
+    if(strcmp(host_name.data(), "hw.machine") == 0) {
+        int overrideResult;
+        if(CompleteGuestMachineOverride(guest_oldp, guest_oldlenp,
+                guest_newp, newlen, overrideResult)) {
+            return overrideResult;
+        }
+    }
+    const int memoryName = strcmp(host_name.data(), "hw.physmem") == 0
+        ? HW_PHYSMEM : strcmp(host_name.data(), "hw.usermem") == 0
+        ? HW_USERMEM : 0;
+    if(memoryName) {
+        int memoryResult;
+        if(CompleteGuestPhysicalMemory(memoryName, guest_oldp,
+                guest_oldlenp, guest_newp, newlen, memoryResult)) {
+            return memoryResult;
+        }
     }
 
     GuestSysctlStorage storage;
@@ -4637,6 +4860,62 @@ static int guest_inout_ioctl(int fildes, u32 request, u32 guest_arg) {
     return result;
 }
 
+/*
+ * ARM32 struct termios uses 32-bit tcflag_t/speed_t (44 bytes); the arm64
+ * host uses 64-bit ones (72 bytes), so the request numbers and layout differ.
+ * isatty()/tcgetattr() issue TIOCGETA on arbitrary descriptors.
+ */
+struct LC32Termios32 {
+    uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+    uint8_t c_cc[NCCS];
+    uint32_t c_ispeed, c_ospeed;
+};
+static_assert(sizeof(LC32Termios32) == 44, "ARM32 termios ABI");
+static constexpr u32 LC32_TIOCGETA32 = _IOR('t', 19, LC32Termios32);
+static constexpr u32 LC32_TIOCSETA32 = _IOW('t', 20, LC32Termios32);
+static constexpr u32 LC32_TIOCSETAW32 = _IOW('t', 21, LC32Termios32);
+static constexpr u32 LC32_TIOCSETAF32 = _IOW('t', 22, LC32Termios32);
+static_assert(LC32_TIOCGETA32 == 0x402c7413u, "TIOCGETA32");
+
+static int guest_termios_ioctl(int fildes, u32 request, u32 guest_arg) {
+    struct termios host{};
+    LC32Termios32 guest{};
+    if (request == LC32_TIOCGETA32) {
+        const int result = syscallRetCarry(
+            SYS_ioctl, fildes, TIOCGETA, &host, 0, 0, 0, 0);
+        if (threadHandle.cpsr->hasCarry()) {
+            return result;
+        }
+        guest.c_iflag = static_cast<uint32_t>(host.c_iflag);
+        guest.c_oflag = static_cast<uint32_t>(host.c_oflag);
+        guest.c_cflag = static_cast<uint32_t>(host.c_cflag);
+        guest.c_lflag = static_cast<uint32_t>(host.c_lflag);
+        memcpy(guest.c_cc, host.c_cc, NCCS);
+        guest.c_ispeed = static_cast<uint32_t>(host.c_ispeed);
+        guest.c_ospeed = static_cast<uint32_t>(host.c_ospeed);
+        if (guest_arg == 0 || !write_guest_memory_with_permissions(
+                guest_arg, &guest, sizeof(guest), PROT_WRITE)) {
+            return return_with_carry_direct(EFAULT, true);
+        }
+        return result;
+    }
+    if (guest_arg == 0 || !read_guest_memory_with_permissions(
+            guest_arg, &guest, sizeof(guest), PROT_READ)) {
+        return return_with_carry_direct(EFAULT, true);
+    }
+    host.c_iflag = guest.c_iflag;
+    host.c_oflag = guest.c_oflag;
+    host.c_cflag = guest.c_cflag;
+    host.c_lflag = guest.c_lflag;
+    memcpy(host.c_cc, guest.c_cc, NCCS);
+    host.c_ispeed = guest.c_ispeed;
+    host.c_ospeed = guest.c_ospeed;
+    const u32 hostRequest =
+        request == LC32_TIOCSETA32 ? TIOCSETA :
+        request == LC32_TIOCSETAW32 ? TIOCSETAW : TIOCSETAF;
+    return syscallRetCarry(SYS_ioctl, fildes, hostRequest, &host, 0, 0, 0, 0);
+}
+
 int guest_ioctl(int fildes, u32 request, u32 guest_r2) {
     if (IsGuestAesFileDescriptor(fildes)) {
         return guest_aes_ioctl(request, guest_r2);
@@ -4677,6 +4956,29 @@ int guest_ioctl(int fildes, u32 request, u32 guest_r2) {
             return guest_inout_ioctl<struct ifreq>(fildes, request, guest_r2);
         case LC32_CTLIOCGINFO:
             return guest_inout_ioctl<LC32CtlInfo>(fildes, request, guest_r2);
+        case LC32_TIOCGETA32:
+        case LC32_TIOCSETA32:
+        case LC32_TIOCSETAW32:
+        case LC32_TIOCSETAF32:
+            return guest_termios_ioctl(fildes, request, guest_r2);
+        case TIOCGWINSZ:
+        case TIOCSWINSZ:
+            static_assert(sizeof(struct winsize) == 8, "winsize ABI");
+            return guest_inout_ioctl<struct winsize>(fildes, request, guest_r2);
+        case FIONREAD:
+        case FIONBIO:
+        case FIOASYNC:
+        case TIOCGPGRP:
+        case TIOCSPGRP:
+            return guest_inout_ioctl<int>(fildes, request, guest_r2);
+        case TIOCPTYGNAME: {
+            struct LC32PtyName { char name[128]; };
+            return guest_inout_ioctl<LC32PtyName>(fildes, request, guest_r2);
+        }
+        case FIOCLEX:
+        case FIONCLEX:
+        case TIOCNOTTY:
+            return syscallRetCarry(SYS_ioctl, fildes, request, 0, 0,0,0,0);
         case FIODTYPE: {
             int host_r2;
             int result = syscallRetCarry(SYS_ioctl, fildes, request, &host_r2, 0,0,0,0);

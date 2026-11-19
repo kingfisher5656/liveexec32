@@ -1,3 +1,4 @@
+#include "lc32_profile.h"
 #include "dynarmic_internal.h"
 #include "darwin_file_syscalls.h"
 #include "guest_dispatch.h"
@@ -14,6 +15,10 @@ CurrentGuestVmEpochParticipant() {
         : &mainGuestVmParticipant;
 }
 
+GuestVmEpochParticipant *CurrentGuestVmEpochParticipantForThread() {
+    return CurrentGuestVmEpochParticipant();
+}
+
 static Dynarmic::HaltReason RunGuestJit(
         Dynarmic::A32::Jit *jit) {
     for (;;) {
@@ -21,7 +26,10 @@ static Dynarmic::HaltReason RunGuestJit(
         {
             GuestVmEpochGuard guard(
                 CurrentGuestVmEpochParticipant());
+            const uint64_t profileStart = LC32ProfileNow();
             reason = jit->Run();
+            if (LC32ProfileActive)
+                LC32ProfileAddRun(mach_absolute_time() - profileStart);
         }
         if (!!reason ||
                 NativeThreadStatePauseRequestedForCurrent()) {
@@ -35,7 +43,11 @@ static Dynarmic::HaltReason StepGuestJit(
         Dynarmic::A32::Jit *jit) {
     GuestVmEpochGuard guard(
         CurrentGuestVmEpochParticipant());
-    return jit->Step();
+    const uint64_t profileStart = LC32ProfileNow();
+    const Dynarmic::HaltReason reason = jit->Step();
+    if (LC32ProfileActive)
+        LC32ProfileAddRun(mach_absolute_time() - profileStart);
+    return reason;
 }
 
 static void ServiceGuestSVC() {
@@ -44,6 +56,44 @@ static void ServiceGuestSVC() {
     DynarmicCallbacks32UserCallbacks(
         threadHandle.cb)->CallSVC(0x80);
     HandleGuestContextTransition();
+}
+
+/*
+ * Faster floating point, on by default (LC32_FAST_FP=0 turns it off).
+ *  - Fresh guest threads start in RunFast mode (FPSCR DN|FZ), which is what
+ *    iOS gives 32-bit apps. With LiveExec32's default of 0, every NEON float
+ *    instruction made the arm64 JIT rewrite FPCR before and after it (~16 ns
+ *    each on Apple cores versus ~1 ns for the math).
+ *  - Unsafe_IgnoreStandardFPCRValue keeps that switch away even if the game
+ *    changes FPSCR itself (as long as it keeps round-to-nearest).
+ *  - Unsafe_IgnoreFPExceptionFlags drops the FPSR write/read per float block;
+ *    guest reads of the exception and QC bits see zero.
+ * Results differ from the default only for denormal numbers (flushed to zero)
+ * and NaN payloads.
+ */
+bool LC32FastFPEnabled() {
+    static const bool enabled = [] {
+        const char *value = getenv("LC32_FAST_FP");
+        // On unless LC32_FAST_FP=0: RunFast is what real 32-bit iOS gave
+        // apps, and float-heavy code runs ~10x faster with it (less heat).
+        const bool on = value == nullptr || value[0] != '0';
+        fprintf(stderr, "LC32: fast floating point %s\n",
+            on ? "enabled (LC32_FAST_FP=0 turns it off)" : "disabled (LC32_FAST_FP=0)");
+        return on;
+    }();
+    return enabled;
+}
+
+void LC32ApplyFastFP(Dynarmic::A32::UserConfig &config) {
+    if (!LC32FastFPEnabled())
+        return;
+    config.unsafe_optimizations = true;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreFPExceptionFlags;
+}
+
+std::uint32_t LC32GuestInitialFpscr() {
+    return LC32FastFPEnabled() ? 0x03000000u /* DN | FZ */ : 0u;
 }
 
 /*
@@ -113,9 +163,7 @@ bool Dynarmic_nativeInitialize() {
         config.check_halt_on_memory_access = true;
         //    config.page_table_pointer_mask_bits = DYN_PAGE_BITS;
 
-        //    config.unsafe_optimizations = true;
-        //    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
-        //    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        LC32ApplyFastFP(config);
 
         sharedHandle.num_page_table_entries = Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES;
         size_t size = sharedHandle.num_page_table_entries * sizeof(void*);
@@ -141,6 +189,7 @@ bool Dynarmic_nativeInitialize() {
 
         sharedHandle.cb = callbacks;
         threadHandle.jit = new Dynarmic::A32::Jit(config);
+        threadHandle.jit->SetFpscr(LC32GuestInitialFpscr());
         threadHandle.cpsr = new DynarmicCpsr(threadHandle.jit);
         threadHandle.cb = callbacks;
         sharedHandle.fs = new LC32Filesystem();
@@ -437,6 +486,7 @@ int ValidateGuestMunmapRange(
         guestVmMutex);
     return ValidateGuestMunmapRangeLocked(address, size);
 }
+
 
 int Dynarmic_munmap(u64 address, u64 size) {
     std::unique_lock<std::recursive_mutex> lock(
@@ -972,8 +1022,15 @@ u32 Dynarmic_mmap(
 kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
         int flags, u32 source, boolean_t copy, vm_prot_t *protection) {
     // A memcpy cannot implement shared aliases (notably mirrored ring buffers).
-    // COW, unaligned extraction and executable aliases need separate support.
-    if(copy || (source & DYN_PAGE_MASK)) return KERN_NOT_SUPPORTED;
+    // Unaligned extraction and shared executable aliases need separate support.
+    // copy=TRUE is implemented below as a private snapshot.
+    // Like XNU without VM_FLAGS_RETURN_DATA_ADDR, an unaligned source is
+    // truncated to its page and the returned address stays page-aligned
+    // (objc passes its Thumb trampoline pointer, which has bit 0 set).
+    if(u64(size) > UINT32_MAX - (source & DYN_PAGE_MASK))
+        return KERN_INVALID_ARGUMENT;
+    size += source & DYN_PAGE_MASK;
+    source &= ~u32(DYN_PAGE_MASK);
     const u64 alignment = u64(mask) | DYN_PAGE_MASK;
     const bool anywhere = (flags & VM_FLAGS_ANYWHERE) != 0;
     const bool overwrite = (flags & VM_FLAGS_OVERWRITE) != 0;
@@ -991,6 +1048,49 @@ kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
     std::unique_lock<std::recursive_mutex> lock(guestVmMutex);
     khash_t(memory) *memory = sharedHandle.memory;
     if(!memory) return KERN_INVALID_ADDRESS;
+    if(copy) {
+        /*
+         * Private copy (objc's imp_implementationWithBlock remaps its
+         * executable trampoline page this way). A snapshot is equivalent to
+         * XNU's copy-on-write result for both mutable and immutable sources.
+         */
+        vm_prot_t copyProtection = VM_PROT_ALL;
+        for(u64 offset = 0; offset < length; offset += DYN_PAGE_SIZE) {
+            const khiter_t key = kh_get(memory, memory, u64(source) + offset);
+            if(key == kh_end(memory) || !kh_value(memory, key) ||
+                    !kh_value(memory, key)->addr) return KERN_INVALID_ADDRESS;
+            copyProtection &= kh_value(memory, key)->perms;
+        }
+        if(!anywhere && !overwrite) {
+            for(u64 page = destination; page < destination + length; page += DYN_PAGE_SIZE)
+                if(kh_get(memory, memory, page) != kh_end(memory)) return KERN_NO_SPACE;
+        }
+        std::vector<uint8_t> snapshot;
+        try { snapshot.resize(length); }
+        catch(const std::exception &) { return KERN_RESOURCE_SHORTAGE; }
+        if(!read_guest_memory_with_permissions(source, snapshot.data(),
+                snapshot.size(), PROT_NONE)) return KERN_PROTECTION_FAILURE;
+        const u32 mapped = Dynarmic_mmap(static_cast<u32>(destination), length,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | (anywhere ? 0 : MAP_FIXED),
+            -1, 0, alignment);
+        if(mapped == UINT32_MAX) return KERN_NO_SPACE;
+        const int finalProtection = copyProtection &
+            (PROT_READ | PROT_WRITE | PROT_EXEC);
+        if(!write_guest_memory_with_permissions(mapped, snapshot.data(),
+                snapshot.size(), PROT_NONE) ||
+                (finalProtection != (PROT_READ | PROT_WRITE) &&
+                 Dynarmic_mprotect(mapped, length, finalProtection) != 0)) {
+            Dynarmic_munmap(mapped, length);
+            return KERN_FAILURE;
+        }
+        *address = mapped;
+        *protection = copyProtection;
+        lock.unlock();
+        InvalidateAllGuestJits(mapped, static_cast<size_t>(length));
+        return KERN_SUCCESS;
+    }
+
     std::vector<struct memory_page> pages;
     try { pages.resize(length / DYN_PAGE_SIZE); }
     catch(const std::exception &) { return KERN_RESOURCE_SHORTAGE; }

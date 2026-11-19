@@ -1223,3 +1223,34 @@ int guest_kevent(int kqueueDescriptor, u32 guestChanges,
     }
     return result;
 }
+
+// LC32_PROFILE: describe a guest page's state for the slow-memory report.
+extern "C" uint64_t LC32GuestMappedBytesForProfile(void) {
+    std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
+    return sharedHandle.memory
+        ? uint64_t(kh_size(sharedHandle.memory)) * DYN_PAGE_SIZE : 0;
+}
+
+extern "C" void LC32DescribeGuestPageForProfile(
+        uint32_t address, char *buffer, size_t size) {
+    const u64 base = address & ~u64(DYN_PAGE_MASK);
+    const u64 index = base >> DYN_PAGE_BITS;
+    void *pte = nullptr;
+    if (sharedHandle.page_table != nullptr &&
+            index < sharedHandle.num_page_table_entries) {
+        pte = __atomic_load_n(&sharedHandle.page_table[index], __ATOMIC_ACQUIRE);
+    }
+    std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
+    const khiter_t k = kh_get(memory, sharedHandle.memory, base);
+    if (k == kh_end(sharedHandle.memory)) {
+        snprintf(buffer, size, "unmapped pte=%s", pte ? "set" : "null");
+        return;
+    }
+    const t_memory_page page = kh_value(sharedHandle.memory, k);
+    snprintf(buffer, size, "perms=%c%c%c%s%s pte=%s",
+        (page->perms & PROT_READ) ? 'r' : '-',
+        (page->perms & PROT_WRITE) ? 'w' : '-',
+        (page->perms & PROT_EXEC) ? 'x' : '-',
+        page->enforceDataPermissions ? " strict" : "",
+        page->addr ? "" : " noaddr", pte ? "set" : "null");
+}

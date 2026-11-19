@@ -1,9 +1,40 @@
+#include "lc32_profile.h"
+#include <atomic>
+#include "../../include/LC32GameProfile.h"
+extern "C" double LC32UIKitPhoneCanvasLongEdge(void); // UIKit.mm
 #include "dynarmic_internal.h"
 #include "dynarmic_syscalls.h"
 #include "darwin_file_syscalls.h"
 #include "crash_exception.h"
 #include <mach/mach_time.h>
+#include <mach/thread_switch.h>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <semaphore.h>
+#include <fcntl.h>
+#define PSEMNAMLEN_LC32 31
 
+extern "C" uint32_t LC32_OpenGLES_Dispatch(uint32_t opcode, uint32_t guestCall, uint32_t);
+static bool GuestSVCMayPark(int number) {
+    switch (number) {
+        case 334: // __semwait_signal (sleep, usleep, nanosleep)
+        case 305: case 301: // psynch_cvwait, psynch_mutexwait
+        case 309: case 310: // psynch_rw_rdlock / wrlock
+        case 363: case 369: case 374: // kevent, kevent64, kevent_qos (copied)
+        case 368: // workq_kernreturn (idle workqueue thread)
+        case -31: case -32: // mach_msg traps (host message buffer)
+        case -36: case -37: case -38: case -39: // semaphore waits
+        case -90: // mach_wait_until (-89 is mach_timebase_info, which writes)
+        case 1017: // LC32GuestCallbackExecutorWait
+            return true;
+        default:
+            return false;
+    }
+}
+extern "C" uint32_t LC32_OpenGLES_DispatchInline(uint32_t opcode, uint32_t guestCall, uint32_t stack);
+extern "C" bool LC32_OpenGLES_InlineDispatchAllowed(void);
 namespace {
 static kern_return_t WaitForGuestSemaphore(
         semaphore_t semaphore, const mach_timespec_t *timeout = nullptr) {
@@ -44,12 +75,181 @@ static kern_return_t WaitForGuestSemaphore(
     }
 }
 
+/*
+ * mach_wait_until_trap. The guest reads the host's mach_absolute_time and
+ * timebase unchanged (traps -3 and -89), so its absolute deadline is already
+ * a host deadline. Unreal Engine 3's appSleep() (BioShock) sleeps this way.
+ * A thread-state interruption only re-arms the same deadline.
+ */
+static kern_return_t WaitGuestUntil(uint64_t deadline) {
+    for (;;) {
+        bool threadStateInterrupted = false;
+        const kern_return_t result = debugger_aware_host_wait(
+            [&] { return mach_wait_until(deadline); },
+            static_cast<kern_return_t>(KERN_ABORTED), &threadStateInterrupted);
+        if (result != KERN_ABORTED || !threadStateInterrupted ||
+                nativeShutdownRequested.load(std::memory_order_acquire) ||
+                guestProcessExitRequested.load(std::memory_order_acquire) ||
+                debuggerAllStopRequested.load(std::memory_order_acquire) ||
+                GuestContextTransitionPending() ||
+                GuestCallbackExecutorDebuggerStepPending()) {
+            return result;
+        }
+    }
+}
+
+/*
+ * POSIX named semaphores (sem_open & co.). XNU hands back a per-process
+ * descriptor as the sem_t * value. The iOS sandbox does not reliably allow
+ * named host semaphores, and legacy callers only share them inside this
+ * process, so model them here with host Mach semaphores. FMOD's semaphore
+ * create retries sem_open forever on SEM_FAILED, so an ENOSYS here freezes
+ * the game (Top Gear Stunt School).
+ */
+struct GuestNamedSemaphore {
+    semaphore_t semaphore = MACH_PORT_NULL;
+    ~GuestNamedSemaphore() {
+        if (semaphore != MACH_PORT_NULL) {
+            semaphore_destroy(mach_task_self(), semaphore);
+        }
+    }
+};
+std::mutex guestNamedSemaphoreMutex;
+std::map<std::string, std::shared_ptr<GuestNamedSemaphore>>
+    guestNamedSemaphoreNames;
+std::map<u32, std::shared_ptr<GuestNamedSemaphore>>
+    guestNamedSemaphoreHandles;
+u32 guestNamedSemaphoreNextHandle = 0x5E000000;
+
+std::shared_ptr<GuestNamedSemaphore> LookupGuestNamedSemaphore(u32 handle) {
+    std::lock_guard<std::mutex> lock(guestNamedSemaphoreMutex);
+    const auto found = guestNamedSemaphoreHandles.find(handle);
+    return found == guestNamedSemaphoreHandles.end()
+        ? nullptr : found->second;
+}
+
+int GuestSemOpen(u32 guestName, int oflag, u32 value) {
+    char name[PATH_MAX];
+    const int copyError = LC32CopyGuestCString(guestName, name);
+    if (copyError != 0) {
+        return return_with_carry_direct(copyError, true);
+    }
+    if (name[0] == '\0') {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    if (strlen(name) > PSEMNAMLEN_LC32) {
+        return return_with_carry_direct(ENAMETOOLONG, true);
+    }
+    std::lock_guard<std::mutex> lock(guestNamedSemaphoreMutex);
+    std::shared_ptr<GuestNamedSemaphore> entry;
+    const auto found = guestNamedSemaphoreNames.find(name);
+    if (found != guestNamedSemaphoreNames.end()) {
+        if ((oflag & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+            return return_with_carry_direct(EEXIST, true);
+        }
+        entry = found->second;
+    } else {
+        if ((oflag & O_CREAT) == 0) {
+            return return_with_carry_direct(ENOENT, true);
+        }
+        if (value > SEM_VALUE_MAX) {
+            return return_with_carry_direct(EINVAL, true);
+        }
+        entry = std::make_shared<GuestNamedSemaphore>();
+        if (semaphore_create(mach_task_self(), &entry->semaphore,
+                SYNC_POLICY_FIFO, static_cast<int>(value)) !=
+                KERN_SUCCESS) {
+            entry->semaphore = MACH_PORT_NULL;
+            return return_with_carry_direct(ENOSPC, true);
+        }
+        guestNamedSemaphoreNames.emplace(name, entry);
+    }
+    u32 handle;
+    do {
+        handle = guestNamedSemaphoreNextHandle++;
+    } while (handle == 0 || handle == 0xffffffffu ||
+        guestNamedSemaphoreHandles.count(handle) != 0);
+    guestNamedSemaphoreHandles.emplace(handle, entry);
+    return return_with_carry_direct(static_cast<int>(handle), false);
+}
+
+int GuestSemClose(u32 handle) {
+    std::lock_guard<std::mutex> lock(guestNamedSemaphoreMutex);
+    if (guestNamedSemaphoreHandles.erase(handle) == 0) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    return return_with_carry_direct(0, false);
+}
+
+int GuestSemUnlink(u32 guestName) {
+    char name[PATH_MAX];
+    const int copyError = LC32CopyGuestCString(guestName, name);
+    if (copyError != 0) {
+        return return_with_carry_direct(copyError, true);
+    }
+    std::lock_guard<std::mutex> lock(guestNamedSemaphoreMutex);
+    if (guestNamedSemaphoreNames.erase(name) == 0) {
+        return return_with_carry_direct(ENOENT, true);
+    }
+    return return_with_carry_direct(0, false);
+}
+
+int GuestSemPost(u32 handle) {
+    const auto entry = LookupGuestNamedSemaphore(handle);
+    if (!entry) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    semaphore_signal(entry->semaphore);
+    return return_with_carry_direct(0, false);
+}
+
+int GuestSemTryWait(u32 handle) {
+    const auto entry = LookupGuestNamedSemaphore(handle);
+    if (!entry) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    const mach_timespec_t zero{0, 0};
+    if (semaphore_timedwait(entry->semaphore, zero) == KERN_SUCCESS) {
+        return return_with_carry_direct(0, false);
+    }
+    return return_with_carry_direct(EAGAIN, true);
+}
+
+/* Defined after WaitForGuestSemaphore below. */
+int GuestSemWait(u32 handle);
+
 struct GuestCrashExceptionPayload {
     std::string report;
     std::string fallbackReason;
     uint32_t fallbackNamespace;
     uint64_t fallbackCode;
 };
+}
+
+namespace {
+int GuestSemWait(u32 handle) {
+    const auto entry = LookupGuestNamedSemaphore(handle);
+    if (!entry) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    const semaphore_t semaphore = entry->semaphore;
+    if (GuestThreadCanYieldBeforeBlocking()) {
+        /* Never block the shared cooperative JIT; report EINTR so the
+         * caller retries after another guest thread ran. */
+        const mach_timespec_t zero{0, 0};
+        if (semaphore_timedwait(semaphore, zero) == KERN_SUCCESS) {
+            return return_with_carry_direct(0, false);
+        }
+        if (GuestThreadYieldBeforeBlocking()) {
+            return return_with_carry_direct(EINTR, true);
+        }
+    }
+    const kern_return_t result = WaitForGuestSemaphore(semaphore);
+    if (result == KERN_SUCCESS) {
+        return return_with_carry_direct(0, false);
+    }
+    return return_with_carry_direct(EINTR, true);
+}
 }
 
 static void AppendCrashReportText(
@@ -219,7 +419,91 @@ public:
                 PROT_EXEC)) {
             return std::nullopt;
         }
-        return result;
+        return SubstituteGuestCode(vaddr, result);
+    }
+
+    /*
+     * Instruction fixes for races that real 2012 hardware happened to win.
+     * The JIT sees the replacement word; guest memory keeps the original, so
+     * the game's own reads of its code are unchanged. Each fix applies only
+     * when the word and its neighbours match the shipped binary exactly.
+     */
+    struct GuestCodeFix {
+        u32 address;
+        u32 before, original, after;
+        u32 replacement;
+        const char *description;
+        bool (*enabled)() = nullptr; // optional extra condition
+    };
+    /* 9mm on the 16:9 fixed canvas rendering above 2x (LC32GameProfile.h). */
+    static bool NineMMWidescreenCanvasAboveRetina() {
+        return LC32UIKitPhoneCanvasLongEdge() == 568.0 &&
+            LC32GameProfileCanvasScale() > 2.0;
+    }
+    u32 SubstituteGuestCode(u32 vaddr, u32 word) {
+        static const GuestCodeFix fixes[] = {
+            /*
+             * Modern Combat 4 1.2.1: 0x58eb00 attaches a streamed resource
+             * (Havok-style header with a self-relative pointer). When the
+             * header's refcount is already positive it relocates the pointer
+             * and swaps references without its lock. The loader thread and
+             * the game thread both reach it on Continue; the game thread
+             * sees the relocated pointer with the old flag and adds the base
+             * again, then crashes on the doubled pointer. "ble" at 0x58eb26
+             * becomes "b": every caller takes the locked path (0x58eb72),
+             * which repeats the same steps under the mutex.
+             */
+            {0x1158eb24, 0x68810f1c, 0xdd242900, 0x21dcf641, 0xe0242900,
+             "Modern Combat 4 resource attach always takes its lock"},
+            /*
+             * Modern Combat 4 1.2.1: 0xbab14 loops over a mission object's
+             * list of entity IDs, looks each one up with 0x578e8 and reads
+             * the entity's type at +8 without checking for NULL (the other
+             * caller, 0xbabb8, does check). After "restart from checkpoint"
+             * an ID can name an entity that is not there and the game reads
+             * address 8. Skip a missing entity like a non-matching one:
+             *   bab2c movs r5, r0        (was mov r5, r0)
+             *   bab2e beq  0xbab4c       (next ID)
+             *   bab30 ldr  r0, [r5, #8]
+             *   bab32 lsrs r0, r0, #1    ((type & ~1) == 8  <=>
+             *   bab34 cmp  r0, #4         (type >> 1) == 4)
+             */
+            {0x110bab2c, 0xfedef79c, 0x68a84605, 0x0001f020, 0xd00d0005,
+             "Modern Combat 4 mission entity check skips missing entities"},
+            {0x110bab30, 0x68a84605, 0x0001f020, 0xd1092808, 0x084068a8,
+             "Modern Combat 4 mission entity check skips missing entities"},
+            {0x110bab34, 0x0001f020, 0xd1092808, 0xf79c4628, 0xd1092804,
+             "Modern Combat 4 mission entity check skips missing entities"},
+            /*
+             * 9mm 1.0.3: 0x105094 asks "is the screen exactly 1136x640
+             * pixels?" (points x UIScreen.scale) and only then loads the
+             * 16:9 "_iPhone5.swf" menus/HUD; anything else gets the 3:2
+             * layouts, which gameswf stretches over the 16:9 canvas. The
+             * movies scale to any viewport, so on the 568x320 canvas at 3x
+             * (1704x960) answer yes: "movs r0, #1; bx lr" at its entry.
+             */
+            {0x11105094, 0xbf00bdb0, 0xaf01b590, 0x8b02ed2d, 0x47702001,
+             "9mm uses its 16:9 layouts on the 3x widescreen canvas",
+             NineMMWidescreenCanvasAboveRetina},
+        };
+        constexpr size_t fixCount = sizeof(fixes) / sizeof(fixes[0]);
+        static std::atomic<bool> logged[fixCount];
+        for (size_t index = 0; index < fixCount; ++index) {
+            const GuestCodeFix &fix = fixes[index];
+            if (vaddr != fix.address || word != fix.original) continue;
+            u32 before = 0, after = 0;
+            if (!read_guest_memory_with_permissions(vaddr - 4, &before,
+                    sizeof(before), PROT_EXEC) ||
+                !read_guest_memory_with_permissions(vaddr + 4, &after,
+                    sizeof(after), PROT_EXEC) ||
+                before != fix.before || after != fix.after) continue;
+            if (fix.enabled && !fix.enabled()) continue;
+            if (!logged[index].exchange(true))
+                fprintf(stderr, "LC32: code fix at 0x%08x: %s\n", vaddr,
+                    fix.description);
+            return fix.replacement;
+        }
+        return word;
     }
     u16 MemoryReadThumbCode(u32 vaddr) {
         u16 code = 0;
@@ -260,7 +544,47 @@ public:
 #endif
     }
 
+    /*
+     * Guest atomics (LDREX/STREX) always reach these callbacks: Dynarmic's
+     * exclusive monitor reads through MemoryRead* and commits through
+     * MemoryWriteExclusive*. The generic path takes the process-wide
+     * guestVmMutex and a page lookup for each one, so every guest thread's
+     * atomics serialized on one lock (~500k per second in Modern Combat 4).
+     * While the JIT is running, an aligned access to a page published in
+     * the JIT page table is exactly what the JIT itself would access
+     * directly: use the host pointer and a real atomic instead.
+     */
+    template <typename T>
+    T *DirectGuestPointer(u32 vaddr) {
+        if ((vaddr & (sizeof(T) - 1)) != 0 || page_table == nullptr ||
+                !cpu->IsExecuting()) {
+            return nullptr;
+        }
+        const u64 index = vaddr >> DYN_PAGE_BITS;
+        if (index >= num_page_table_entries) {
+            return nullptr;
+        }
+        char *page = static_cast<char *>(
+            __atomic_load_n(&page_table[index], __ATOMIC_ACQUIRE));
+        return page != nullptr
+            ? reinterpret_cast<T *>(page + (vaddr & DYN_PAGE_MASK))
+            : nullptr;
+    }
+    template <typename T>
+    bool DirectExclusiveWrite(u32 vaddr, T value, T expected, bool &committed) {
+        T *pointer = DirectGuestPointer<T>(vaddr);
+        if (pointer == nullptr) {
+            return false;
+        }
+        committed = __atomic_compare_exchange_n(pointer, &expected, value,
+            false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        return true;
+    }
+
     u8 MemoryRead8(u32 vaddr) override {
+        if (u8 *direct = DirectGuestPointer<u8>(vaddr))
+            return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 1, 0, cpu->IsExecuting(), __builtin_return_address(0));
         u8 value = 0;
         if (read_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
@@ -299,6 +623,9 @@ public:
         }
     }
     u16 MemoryRead16(u32 vaddr) override {
+        if (u16 *direct = DirectGuestPointer<u16>(vaddr))
+            return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 2, 0, cpu->IsExecuting(), __builtin_return_address(0));
         return MemoryRead16(vaddr, true);
     }
     u32 MemoryRead32(u32 vaddr, bool trace) {
@@ -326,9 +653,15 @@ public:
         }
     }
     u32 MemoryRead32(u32 vaddr) override {
+        if (u32 *direct = DirectGuestPointer<u32>(vaddr))
+            return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 4, 0, cpu->IsExecuting(), __builtin_return_address(0));
         return MemoryRead32(vaddr, true);
     }
     u64 MemoryRead64(u32 vaddr) override {
+        if (u64 *direct = DirectGuestPointer<u64>(vaddr))
+            return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 8, 0, cpu->IsExecuting(), __builtin_return_address(0));
         u64 value = 0;
         if (read_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
@@ -345,6 +678,7 @@ public:
     }
 
     void MemoryWrite8(u32 vaddr, u8 value) override {
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 1, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
                 PROT_WRITE)) {
@@ -357,6 +691,7 @@ public:
         }
     }
     void MemoryWrite16(u32 vaddr, u16 value) override {
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 2, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
                 PROT_WRITE)) {
@@ -369,6 +704,7 @@ public:
         }
     }
     void MemoryWrite32(u32 vaddr, u32 value) override {
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 4, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
                 PROT_WRITE)) {
@@ -381,6 +717,7 @@ public:
         }
     }
     void MemoryWrite64(u32 vaddr, u64 value) override {
+        if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 8, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
                 PROT_WRITE)) {
@@ -394,6 +731,10 @@ public:
     }
 
     bool MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) override {
+        if (LC32ProfileActive) LC32ProfileAddExclusiveWrite();
+        bool committed = false;
+        if (DirectExclusiveWrite<u8>(vaddr, value, expected, committed))
+            return committed;
         const ExclusiveGuestWriteResult result =
             compare_exchange_guest_memory_with_permissions(
                 vaddr, value, expected);
@@ -405,6 +746,10 @@ public:
             ExclusiveGuestWriteResult::Committed;
     }
     bool MemoryWriteExclusive16(u32 vaddr, u16 value, u16 expected) override {
+        if (LC32ProfileActive) LC32ProfileAddExclusiveWrite();
+        bool committed = false;
+        if (DirectExclusiveWrite<u16>(vaddr, value, expected, committed))
+            return committed;
         const ExclusiveGuestWriteResult result =
             compare_exchange_guest_memory_with_permissions(
                 vaddr, value, expected);
@@ -416,6 +761,10 @@ public:
             ExclusiveGuestWriteResult::Committed;
     }
     bool MemoryWriteExclusive32(u32 vaddr, u32 value, u32 expected) override {
+        if (LC32ProfileActive) LC32ProfileAddExclusiveWrite();
+        bool committed = false;
+        if (DirectExclusiveWrite<u32>(vaddr, value, expected, committed))
+            return committed;
         const ExclusiveGuestWriteResult result =
             compare_exchange_guest_memory_with_permissions(
                 vaddr, value, expected);
@@ -427,6 +776,10 @@ public:
             ExclusiveGuestWriteResult::Committed;
     }
     bool MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) override {
+        if (LC32ProfileActive) LC32ProfileAddExclusiveWrite();
+        bool committed = false;
+        if (DirectExclusiveWrite<u64>(vaddr, value, expected, committed))
+            return committed;
         const ExclusiveGuestWriteResult result =
             compare_exchange_guest_memory_with_permissions(
                 vaddr, value, expected);
@@ -913,6 +1266,41 @@ public:
     }
 
     void CallSVC(u32 swi) override {
+        // Blocking waits hold no raw guest pointers (they copy, or use guest
+        // addresses only as keys): let unmapped guest memory be reclaimed
+        // meanwhile (see GuestVmEpochPark).
+        if (GuestSVCMayPark((int)cpu->Regs()[12])) {
+            GuestVmEpochPark park(CurrentGuestVmEpochParticipantForThread());
+            CallSVCProfiled(swi);
+            return;
+        }
+        CallSVCProfiled(swi);
+    }
+
+    void CallSVCProfiled(u32 swi) {
+        if (!LC32ProfileActive) {
+            CallSVCImpl(swi);
+            return;
+        }
+        const int number = (int)cpu->Regs()[12];
+        const bool insideRun = cpu->IsExecuting();
+        // Host calls run outside the JIT (inside, they only halt it).
+        const void *hostKey = nullptr;
+        int hostSelector = 0;
+        if (!insideRun && (number == 1002 || number == 1006)) {
+            const int base = number == 1002 ? 0 : 2;
+            hostKey = (const void *)((u64)cpu->Regs()[base] |
+                ((u64)cpu->Regs()[base + 1] << 32));
+            hostSelector = number == 1006;
+        }
+        const uint64_t start = mach_absolute_time();
+        CallSVCImpl(swi);
+        const uint64_t ticks = mach_absolute_time() - start;
+        LC32ProfileAddSVC(number, insideRun, ticks);
+        if (hostKey) LC32ProfileAddHostCall(hostKey, hostSelector, ticks);
+        if (insideRun) LC32ProfileNoteFpscr(cpu->Fpscr());
+    }
+    void CallSVCImpl(u32 swi) {
         int NR = cpu->Regs()[12];
         if (swi == 0 && cpu->Regs()[5] == POST_CALLBACK_SYSCALL_NUMBER && cpu->Regs()[7] == 0) { // postCallback
             int number = cpu->Regs()[4];
@@ -1258,6 +1646,21 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 GuestThreadRequestRotation();
                 break;
             case -61:
+                if (NativeGuestThreadsEnabled()) {
+                    /*
+                     * Every guest pthread is a real host thread here. Legacy
+                     * OSSpinLock/os_unfair_lock back off with
+                     * thread_switch(…, DEPRESS/WAIT, ms); returning at once
+                     * turned each contended lock into a full-speed spin on a
+                     * second core. Keep the kernel's depress/wait semantics.
+                     * The handoff hint names a guest-visible thread, so it is
+                     * dropped; the kernel then just yields for option_time.
+                     */
+                    cpu->Regs()[0] = thread_switch(MACH_PORT_NULL,
+                        static_cast<int>(cpu->Regs()[1]),
+                        static_cast<mach_msg_timeout_t>(cpu->Regs()[2]));
+                    break;
+                }
                 /*
                  * The host emulator thread is not the logical guest thread.
                  * Treat thread_switch as a cooperative scheduling point.
@@ -1265,8 +1668,13 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 cpu->Regs()[0] = KERN_SUCCESS;
                 GuestThreadRequestRotation();
                 break;
-            case -89:
+            case -89: // mach_timebase_info_trap
                 cpu->Regs()[0] = guest_mach_timebase_info(cpu->Regs()[0]);
+                break;
+            case -90: // mach_wait_until_trap (64-bit deadline in r0:r1)
+                cpu->Regs()[0] = WaitGuestUntil(
+                    cpu->Regs()[0] |
+                    (static_cast<uint64_t>(cpu->Regs()[1]) << 32));
                 break;
             case -92:
                 cpu->Regs()[0] = mk_timer_destroy(cpu->Regs()[0]);
@@ -1794,6 +2202,26 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
             case SYS_getattrlist:
                 cpu->Regs()[0] = guest_getattrlist(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2], cpu->Regs()[3], cpu->Regs()[4]);
                 break;
+            case SYS_sem_open:
+                cpu->Regs()[0] = GuestSemOpen(cpu->Regs()[0],
+                    static_cast<int>(cpu->Regs()[1]), cpu->Regs()[3]);
+                break;
+            case SYS_sem_close:
+                cpu->Regs()[0] = GuestSemClose(cpu->Regs()[0]);
+                break;
+            case SYS_sem_unlink:
+                cpu->Regs()[0] = GuestSemUnlink(cpu->Regs()[0]);
+                break;
+            case SYS_sem_post:
+                cpu->Regs()[0] = GuestSemPost(cpu->Regs()[0]);
+                break;
+            case SYS_sem_trywait:
+                cpu->Regs()[0] = GuestSemTryWait(cpu->Regs()[0]);
+                break;
+            case SYS_sem_wait:
+            case SYS_sem_wait_nocancel:
+                cpu->Regs()[0] = GuestSemWait(cpu->Regs()[0]);
+                break;
             case SYS_shm_open:
                 cpu->Regs()[0] = guest_shm_open(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2]);
                 break;
@@ -2197,6 +2625,20 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
             }
             case 1002: { // LC32InvokeHostCRet32
                 if(cpu->IsExecuting()) {
+                    /*
+                     * GL calls never run guest code, so make them right
+                     * here instead of halting the JIT and re-entering it
+                     * for each one (thousands per frame).
+                     */
+                    const u64 target = (u64)cpu->Regs()[0] |
+                        ((u64)cpu->Regs()[1] << 32);
+                    if (target == (u64)&LC32_OpenGLES_Dispatch &&
+                            LC32_OpenGLES_InlineDispatchAllowed()) {
+                        cpu->Regs()[0] = LC32_OpenGLES_DispatchInline(
+                            cpu->Regs()[2], cpu->Regs()[3],
+                            cpu->Regs()[Reg::SP]);
+                        break;
+                    }
                     // Get out of the callback first, since host may call other guest functions
                     cpu->HaltExecution(LC32HaltReasonSVC);
                     return;

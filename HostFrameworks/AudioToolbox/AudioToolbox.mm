@@ -1372,8 +1372,35 @@ OSStatus DispatchObservedAudioSessionProperty(
         case kAudioSessionProperty_OtherAudioIsPlaying: {
             SEL selector = sel_registerName("isOtherAudioPlaying");
             if(![session respondsToSelector:selector]) break;
-            const u32 value = reinterpret_cast<BOOL (*)(id, SEL)>(
-                objc_msgSend)(session, selector) ? 1 : 0;
+            const bool otherAudio = reinterpret_cast<BOOL (*)(id, SEL)>(
+                objc_msgSend)(session, selector);
+            /* Legacy games ask this to defer to the user's iPod music.
+             * Today the flag is also raised by apps that keep themselves
+             * alive with silent background audio (JIT/sideload helpers),
+             * which left Top Gear Stunt School's soundtrack off for good.
+             * Answer yes only while the system Music player is playing. */
+            bool musicPlaying = false;
+            if(otherAudio) {
+                Class musicClass = NSClassFromString(
+                    @"MPMusicPlayerController");
+                SEL systemSel = sel_registerName("systemMusicPlayer");
+                if([musicClass respondsToSelector:systemSel]) {
+                    id music = reinterpret_cast<id (*)(id, SEL)>(
+                        objc_msgSend)(musicClass, systemSel);
+                    musicPlaying = music &&
+                        reinterpret_cast<NSInteger (*)(id, SEL)>(
+                            objc_msgSend)(music,
+                            sel_registerName("playbackState")) ==
+                        1 /* MPMusicPlaybackStatePlaying */;
+                }
+            }
+            const u32 value = otherAudio && musicPlaying ? 1 : 0;
+            static std::atomic<int> logged{0};
+            if(logged.fetch_add(1) < 8) {
+                fprintf(stderr, "LC32 audio: guest OtherAudioIsPlaying=%u "
+                    "(host other=%d music=%d)\n", value, (int)otherAudio,
+                    (int)musicPlaying);
+            }
             return WriteAudioSessionValue(call, &value, sizeof(value));
         }
         case kAudioSessionProperty_CurrentHardwareOutputVolume: {

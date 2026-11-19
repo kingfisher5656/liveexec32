@@ -161,6 +161,60 @@ void RetireMemoryBacking(
     ReclaimRetiredMemoryBackingsLocked();
 }
 
+extern "C" void LC32RetiredGuestMemoryForProfile(
+        uint64_t *count, uint64_t *bytes) {
+    std::lock_guard<std::mutex> lock(guestVmEpochMutex);
+    uint64_t total = 0;
+    for (const RetiredMemoryBacking &retired : retiredMemoryBackings) {
+        if (retired.backing != nullptr) total += retired.backing->size;
+    }
+    *count = retiredMemoryBackings.size();
+    *bytes = total;
+    if (retiredMemoryBackings.empty()) return;
+    uint64_t oldest = UINT64_MAX;
+    for (const RetiredMemoryBacking &retired : retiredMemoryBackings)
+        oldest = std::min(oldest, retired.retirementEpoch);
+    for (const GuestVmEpochParticipant *participant : guestVmEpochParticipants) {
+        if (participant != nullptr && participant->activeDepth != 0 &&
+                participant->epoch < oldest) {
+            fprintf(stderr, "LC32PROF     held back by %s participant "
+                "(depth %zu, %llu epochs behind)\n",
+                participant == &mainGuestVmParticipant ? "main" : "a",
+                participant->activeDepth,
+                (unsigned long long)(guestVmEpoch - participant->epoch));
+        }
+    }
+}
+
+GuestVmEpochPark::GuestVmEpochPark(
+        GuestVmEpochParticipant *participant)
+    : participant(participant) {
+    if (participant == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(guestVmEpochMutex);
+    if (!participant->registered || participant->activeDepth == 0) {
+        this->participant = nullptr;
+        return;
+    }
+    savedDepth = participant->activeDepth;
+    participant->activeDepth = 0;
+    ReclaimRetiredMemoryBackingsLocked();
+}
+
+GuestVmEpochPark::~GuestVmEpochPark() {
+    if (participant == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(guestVmEpochMutex);
+    if (!participant->registered) {
+        return;
+    }
+    assert(participant->activeDepth == 0);
+    participant->activeDepth = savedDepth;
+    participant->epoch = guestVmEpoch;
+}
+
 GuestVmEpochGuard::GuestVmEpochGuard(
         GuestVmEpochParticipant *participant)
     : participant(participant) {

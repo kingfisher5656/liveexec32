@@ -1,6 +1,21 @@
 #import <Foundation/Foundation.h>
 
 #include "crash_exception.h"
+#include <atomic>
+#include <stdio.h>
+#include <unistd.h>
+
+/* Set once UIKit starts terminating the host app (for example when the user
+ * swipes away a LiveContainer card that iOS kept running in the background).
+ * iOS ends a process right after applicationWillTerminate:, so legacy games
+ * never had to keep their worker threads safe past their own teardown. */
+static std::atomic<bool> LC32HostTerminating{false};
+
+extern "C" void LC32NoteHostTerminating(void) {
+    if(!LC32HostTerminating.exchange(true)) {
+        fprintf(stderr, "LC32: host application is terminating\n");
+    }
+}
 
 extern "C" __attribute__((cold, noreturn))
 void abort_with_reason(
@@ -23,6 +38,24 @@ void LC32ThrowGuestCrashException(
         const char *report, size_t reportLength,
         uint32_t fallbackNamespace, uint64_t fallbackCode,
         const char *fallbackReason) {
+    if(LC32HostTerminating.load()) {
+        /* A guest thread tripped over the game's own shutdown teardown.
+         * Keep the report in the log but end the way iOS would have,
+         * without leaving a LiveContainer crash report for the next launch. */
+        fprintf(stderr, "LC32: guest crashed while the app was terminating; "
+            "exiting without a crash report\n");
+        if(report != nullptr && reportLength != 0) {
+            fwrite(report, 1, reportLength, stderr);
+            fputc('\n', stderr);
+        }
+        fflush(stderr);
+        _exit(0);
+    }
+    if(getenv("LC32_CRASH_STDERR") && report != nullptr && reportLength) {
+        fwrite(report, 1, reportLength, stderr);
+        fputc('\n', stderr);
+        fflush(stderr);
+    }
     NSException *exception = nil;
     @autoreleasepool {
         @try {

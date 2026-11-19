@@ -666,6 +666,62 @@ CGDataProviderRef CGDataProviderCreateWithData(void *info,
         LC32_CG_U32(size), LC32_CG_U32((uintptr_t)releaseData));
 }
 
+/* Sequential providers are drained eagerly into a host-backed CFData.
+ * Running guest stream callbacks lazily from native CoreGraphics would need
+ * a guest re-entry path; the data they wrap (fonts, images) is bounded and
+ * callers such as EA's im::CGDataProviderCreateWithInputStream (Dead Space)
+ * consume it immediately. CoreGraphics only reads from the stream's current
+ * position, so no rewind is issued first. */
+enum { LC32SequentialProviderMaximumBytes = 256u << 20 };
+
+CGDataProviderRef CGDataProviderCreateSequential(void *info,
+        const CGDataProviderSequentialCallbacks *callbacks) {
+    if(!callbacks || callbacks->version != 0 || !callbacks->getBytes)
+        return NULL;
+
+    size_t capacity = 64u << 10, length = 0;
+    uint8_t *bytes = malloc(capacity);
+    bool ok = bytes != NULL;
+    while(ok) {
+        if(length == capacity) {
+            if(capacity >= LC32SequentialProviderMaximumBytes) {
+                ok = false;
+                break;
+            }
+            size_t next = capacity * 2;
+            if(next > LC32SequentialProviderMaximumBytes)
+                next = LC32SequentialProviderMaximumBytes;
+            uint8_t *grown = realloc(bytes, next);
+            if(!grown) {
+                ok = false;
+                break;
+            }
+            bytes = grown;
+            capacity = next;
+        }
+        const size_t room = capacity - length;
+        size_t got = callbacks->getBytes(info, bytes + length, room);
+        if(!got) break;
+        if(got > room) got = room;
+        length += got;
+    }
+
+    CGDataProviderRef provider = NULL;
+    if(ok) {
+        CFDataRef data = CFDataCreate(kCFAllocatorDefault, bytes,
+            (CFIndex)length);
+        if(data) {
+            provider = CGDataProviderCreateWithCFData(data);
+            CFRelease(data);
+        }
+    }
+    free(bytes);
+    /* The stream is not touched again, so its owner can be told now
+     * rather than when the provider is finally released. */
+    if(callbacks->releaseInfo) callbacks->releaseInfo(info);
+    return provider;
+}
+
 CGImageRef CGImageCreate(size_t width, size_t height,
         size_t bitsPerComponent, size_t bitsPerPixel, size_t bytesPerRow,
         CGColorSpaceRef space, CGBitmapInfo bitmapInfo,

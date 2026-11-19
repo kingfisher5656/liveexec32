@@ -19,9 +19,11 @@ struct MainQueueSource {
     std::mutex sourcesMutex;
     CFRunLoopSourceRef portSource = nullptr;
     CFRunLoopSourceRef continuationSource = nullptr;
+    CFRunLoopObserverRef priorityObserver = nullptr;
     // Accessed only by the physical main thread, including nested run loops.
     bool draining = false;
     bool pending = false;
+    bool drainedLastIteration = false;
 
     MainQueueSource(mach_port_t port, u32 callback)
         : port(port), callback(callback) {}
@@ -94,6 +96,42 @@ void DrainMainQueue(void *info) {
     // not pass the native Mach message's address into the guest address space.
     u32 unusedMessage = 0;
     LC32InvokeGuestC(state->callback, false, 1, &unusedMessage);
+    state->drainedLastIteration = true;
+}
+
+/*
+ * iOS's CFRunLoop gives the main dispatch queue's port priority: an iteration
+ * that did not service it polls it first, so main-queue work and other
+ * sources (notably CADisplayLink frames) alternate. The guest's port is an
+ * ordinary source1 here, which let several frames run between drains. Nuts!
+ * posts one loading step per frame and frees its loading screen after the
+ * last step, so a backlog ran a step against freed memory. Reproduce CF's
+ * poll from a before-sources observer.
+ */
+void PollMainQueuePort(CFRunLoopObserverRef, CFRunLoopActivity, void *info) {
+    auto *state = static_cast<MainQueueSource *>(info);
+    if(state->drainedLastIteration) {
+        state->drainedLastIteration = false;
+        return;
+    }
+    if(state->draining || !state->enabled.load(std::memory_order_acquire) ||
+       GuestIsStopping())
+        return;
+    union {
+        mach_msg_header_t header;
+        uint8_t bytes[256];
+    } message = {};
+    const kern_return_t received = mach_msg(&message.header,
+        MACH_RCV_MSG | MACH_RCV_TIMEOUT | MACH_RCV_LARGE, 0,
+        sizeof(message), state->port, 0, MACH_PORT_NULL);
+    if(received == MACH_RCV_TOO_LARGE) {
+        // Leave an unexpected message for the port source to receive.
+        DrainMainQueue(state);
+        return;
+    }
+    if(received != MACH_MSG_SUCCESS) return;
+    mach_msg_destroy(&message.header);
+    DrainMainQueue(state);
 }
 
 mach_port_t MainQueuePort(void *info) {
@@ -109,12 +147,15 @@ void InvalidateSources(MainQueueSource *state) {
     state->enabled.store(false, std::memory_order_release);
     CFRunLoopSourceRef portSource;
     CFRunLoopSourceRef continuationSource;
+    CFRunLoopObserverRef priorityObserver;
     {
         std::lock_guard<std::mutex> lock(state->sourcesMutex);
         portSource = state->portSource;
         continuationSource = state->continuationSource;
+        priorityObserver = state->priorityObserver;
         state->portSource = nullptr;
         state->continuationSource = nullptr;
+        state->priorityObserver = nullptr;
     }
     if(portSource) {
         CFRunLoopSourceInvalidate(portSource);
@@ -123,6 +164,10 @@ void InvalidateSources(MainQueueSource *state) {
     if(continuationSource) {
         CFRunLoopSourceInvalidate(continuationSource);
         CFRelease(continuationSource);
+    }
+    if(priorityObserver) {
+        CFRunLoopObserverInvalidate(priorityObserver);
+        CFRelease(priorityObserver);
     }
 }
 
@@ -175,7 +220,15 @@ void LC32InstallGuestMainQueueSource(void) {
     continuationContext.perform = DrainMainQueue;
     state->continuationSource = CFRunLoopSourceCreate(
         kCFAllocatorDefault, 0, &continuationContext);
-    if(!state->portSource || !state->continuationSource) {
+    CFRunLoopObserverContext observerContext = {};
+    observerContext.info = state;
+    observerContext.retain = RetainSourceContext;
+    observerContext.release = ReleaseSourceContext;
+    state->priorityObserver = CFRunLoopObserverCreate(kCFAllocatorDefault,
+        kCFRunLoopBeforeSources, true, 0, PollMainQueuePort,
+        &observerContext);
+    if(!state->portSource || !state->continuationSource ||
+       !state->priorityObserver) {
         fprintf(stderr, "LC32: could not create guest main-queue run-loop sources\n");
         InvalidateSources(state);
         ReleaseSourceContext(state);
@@ -190,6 +243,8 @@ void LC32InstallGuestMainQueueSource(void) {
                                kCFRunLoopCommonModes);
             CFRunLoopAddSource(CFRunLoopGetMain(), state->continuationSource,
                                kCFRunLoopCommonModes);
+            CFRunLoopAddObserver(CFRunLoopGetMain(), state->priorityObserver,
+                                 kCFRunLoopCommonModes);
             // Service work queued before registration even if libdispatch's
             // initial queue transition preceded its run-loop-port setup.
             CFRunLoopSourceSignal(state->continuationSource);

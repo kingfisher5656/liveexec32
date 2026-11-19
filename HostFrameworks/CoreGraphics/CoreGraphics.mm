@@ -31,6 +31,27 @@ struct BitmapBacking {
     size_t height = 0;
     size_t guestByteCount = 0;
     std::unique_ptr<uint8_t[]> bytes;
+    /* Guest-visible mirror of a bitmap whose pixels the guest never supplied
+     * (a UIKit drawRect: backing store, or CGBitmapContextCreate(NULL, ...)).
+     * ownsGuestData: guestData came from guest malloc and is ours to free.
+     * externalBytes: host pixels owned by someone else (drawRect: contexts).
+     * scopeDepth >= 1: the mirror belongs to the host-to-guest callback at
+     * that depth on scopeThread and is written back when that call returns. */
+    bool ownsGuestData = false;
+    uint8_t *externalBytes = nullptr;
+    int scopeDepth = 0;
+    pthread_t scopeThread = nullptr;
+    /* The host context has no pixel memory (a modern drawRect: context is
+     * not a bitmap context). The guest draws into bytes, which are composited
+     * into offscreenRect (user space) of the context when the mirror
+     * retires. */
+    bool offscreen = false;
+    size_t width = 0;
+    CGRect offscreenRect = CGRectNull;
+
+    uint8_t *HostBytes() const {
+        return bytes ? bytes.get() : externalBytes;
+    }
 };
 
 struct DataProviderBacking {
@@ -72,6 +93,60 @@ void ReleaseDataProviderBacking(void *info, const void *, size_t) {
 
 std::mutex bitmapBackingsMutex;
 std::unordered_map<CGContextRef, BitmapBacking *> bitmapBackings;
+
+/* Host-to-guest Objective-C callback nesting on this thread; see
+ * LC32CoreGraphicsEnterGuestCallback. */
+thread_local int guestCallbackDepth = 0;
+std::atomic<int> scopedMirrorCount{0};
+
+u32 AllocateGuestBitmapBytes(size_t byteCount) {
+    if(!byteCount || byteCount > kMaximumBitmapBytes ||
+            !Dynarmic_guest_thread_is_registered()) return 0;
+    static std::atomic<u32> guestMalloc{0};
+    u32 function = guestMalloc.load(std::memory_order_acquire);
+    if(!function) {
+        function = guest_dlsym("malloc");
+        if(!function) return 0;
+        guestMalloc.store(function, std::memory_order_release);
+    }
+    u32 arguments[] = {static_cast<u32>(byteCount)};
+    const u32 address = static_cast<u32>(
+        LC32InvokeGuestC(function, false, 1, arguments));
+    if(address && static_cast<uint64_t>(address) + byteCount >
+            static_cast<uint64_t>(UINT32_MAX) + 1) {
+        guest_free(address);
+        return 0;
+    }
+    return address;
+}
+
+/* Scoped drawRect: mirrors are requested every frame with the same size; keep
+ * one freed buffer per thread instead of a multi-megabyte guest malloc/free
+ * pair per frame. */
+thread_local u32 cachedMirrorData = 0;
+thread_local size_t cachedMirrorBytes = 0;
+
+u32 TakeGuestMirrorBytes(size_t byteCount) {
+    if(cachedMirrorData && cachedMirrorBytes == byteCount) {
+        const u32 address = cachedMirrorData;
+        cachedMirrorData = 0;
+        cachedMirrorBytes = 0;
+        return address;
+    }
+    return AllocateGuestBitmapBytes(byteCount);
+}
+
+void ReturnGuestMirrorBytes(u32 address, size_t byteCount) {
+    if(!address || !Dynarmic_guest_thread_is_registered()) return;
+    if(cachedMirrorData) guest_free(cachedMirrorData);
+    cachedMirrorData = address;
+    cachedMirrorBytes = byteCount;
+}
+
+bool TraceBitmapMirrors() {
+    static const bool enabled = getenv("LC32_CG_MIRROR_LOG") != nullptr;
+    return enabled;
+}
 
 using CGContextGetFillColorSpaceFunction =
     CGColorSpaceRef (*)(CGContextRef);
@@ -333,24 +408,28 @@ void SyncBitmapBacking(CGContextRef context,
  * host copy before Core Graphics composites over it, or every glyph lands on
  * all the previous ones and SyncBitmapBacking pushes the pile back. */
 void PullBitmapBacking(BitmapBacking *backing) {
+    uint8_t *hostBytes = backing ? backing->HostBytes() : nullptr;
     if(!backing || !backing->guestData || !backing->guestByteCount ||
-            !backing->bytes) return;
+            !hostBytes) return;
     if(backing->guestBytesPerRow == backing->hostBytesPerRow) {
         (void)Dynarmic_mem_1read(backing->guestData, backing->guestByteCount,
-            reinterpret_cast<char *>(backing->bytes.get()));
+            reinterpret_cast<char *>(hostBytes));
         return;
     }
     for(size_t row = 0; row < backing->height; ++row) {
         const u32 guestRow = backing->guestData +
             static_cast<u32>(row * backing->guestBytesPerRow);
         (void)Dynarmic_mem_1read(guestRow, backing->guestBytesPerRow,
-            reinterpret_cast<char *>(backing->bytes.get() +
+            reinterpret_cast<char *>(hostBytes +
                 row * backing->hostBytesPerRow));
     }
 }
 
 bool OpcodeWritesBitmap(LC32CoreGraphicsOpcode opcode) {
     switch(opcode) {
+        /* Not a write, but it reads pixels the guest may have stored
+         * directly into its buffer since the last synchronization. */
+        case LC32CoreGraphicsOpBitmapContextCreateImage:
         case LC32CoreGraphicsOpBitmapContextGetData:
         case LC32CoreGraphicsOpContextClearRect:
         case LC32CoreGraphicsOpContextDrawLinearGradient:
@@ -401,6 +480,170 @@ void ReleaseBitmapBacking(void *releaseInfo, void *) {
         if(iterator != bitmapBackings.end() && iterator->second == backing)
             bitmapBackings.erase(iterator);
     }
+    if(backing->ownsGuestData && backing->guestData) {
+        /* The mirror was allocated for CGBitmapContextGetData on a context
+         * created without guest pixels. Off a guest thread it is leaked
+         * rather than freed from the wrong allocator context. */
+        if(Dynarmic_guest_thread_is_registered())
+            guest_free(backing->guestData);
+    }
+    delete backing;
+}
+
+void RegisterHostMirror(CGContextRef context, BitmapBacking *backing) {
+    backing->context = CGContextRetain(context);
+    backing->scopeDepth = guestCallbackDepth;
+    backing->scopeThread = pthread_self();
+    {
+        std::lock_guard<std::mutex> lock(bitmapBackingsMutex);
+        bitmapBackings[context] = backing;
+    }
+    scopedMirrorCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" CGFloat LC32UIKitGuestMainScreenScale(void);
+
+/* iOS 3/4 drew UIView content into a CPU bitmap (unpadded 32-bit BGRx rows of
+ * the layer's device size), and games wrote it directly. Recreate that for a
+ * drawRect: context that has no pixels: the clip box at the screen scale
+ * the guest sees (the host context may be at a higher native scale; games
+ * such as Wild Frontier hard-code their row stride from -[UIScreen scale]),
+ * opaque little-endian xRGB. */
+u32 MirrorOffscreen(CGContextRef context) {
+    if(guestCallbackDepth <= 0) return 0;
+    const CGRect clip = CGContextGetClipBoundingBox(context);
+    if(CGRectIsNull(clip) || CGRectIsInfinite(clip) || CGRectIsEmpty(clip))
+        return 0;
+    CGFloat scale = LC32UIKitGuestMainScreenScale();
+    if(!(scale >= 1) || !std::isfinite(scale)) scale = 1;
+    const size_t width = static_cast<size_t>(
+        std::lround(clip.size.width * scale));
+    const size_t height = static_cast<size_t>(
+        std::lround(clip.size.height * scale));
+    if(TraceBitmapMirrors()) {
+        std::fprintf(stderr,
+            "LC32 CG mirror: offscreen clip=(%.1f,%.1f %.1fx%.1f) scale=%.1f pixels=%zux%zu\n",
+            clip.origin.x, clip.origin.y, clip.size.width, clip.size.height,
+            scale, width, height);
+    }
+    if(!width || !height || width > 16384 || height > 16384) return 0;
+    const size_t bytesPerRow = width * 4;
+    if(bytesPerRow > kMaximumBitmapBytes / height) return 0;
+    const size_t byteCount = bytesPerRow * height;
+    const u32 guestData = TakeGuestMirrorBytes(byteCount);
+    if(!guestData) return 0;
+    auto *backing = new BitmapBacking();
+    backing->bytes = std::make_unique<uint8_t[]>(byteCount);
+    memset(backing->bytes.get(), 0, byteCount);
+    (void)Dynarmic_mem_1write(guestData, byteCount,
+        reinterpret_cast<char *>(backing->bytes.get()));
+    backing->guestData = guestData;
+    backing->guestBytesPerRow = bytesPerRow;
+    backing->hostBytesPerRow = bytesPerRow;
+    backing->width = width;
+    backing->height = height;
+    backing->guestByteCount = byteCount;
+    backing->ownsGuestData = true;
+    backing->offscreen = true;
+    backing->offscreenRect = clip;
+    RegisterHostMirror(context, backing);
+    return guestData;
+}
+
+void CompositeOffscreen(BitmapBacking *backing) {
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    /* drawRect: contexts record a display list and decode the image later,
+     * so the image owns the pixels. */
+    uint8_t *pixels = backing->bytes.release();
+    CGDataProviderRef provider = CGDataProviderCreateWithData(nullptr,
+        pixels, backing->guestByteCount,
+        [](void *, const void *data, size_t) {
+            delete[] static_cast<const uint8_t *>(data);
+        });
+    if(!provider) delete[] pixels;
+    CGImageRef image = space && provider ? CGImageCreate(backing->width,
+        backing->height, 8, 32, backing->hostBytesPerRow, space,
+        kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst, provider,
+        nullptr, false, kCGRenderingIntentDefault) : nullptr;
+    if(image) {
+        /* UIKit's drawRect: space is flipped (y down); draw the first row at
+         * the top. */
+        const CGRect rect = backing->offscreenRect;
+        CGContextSaveGState(backing->context);
+        CGContextTranslateCTM(backing->context, 0,
+            CGRectGetMinY(rect) + CGRectGetMaxY(rect));
+        CGContextScaleCTM(backing->context, 1, -1);
+        CGContextSetBlendMode(backing->context, kCGBlendModeCopy);
+        CGContextSetInterpolationQuality(backing->context,
+            kCGInterpolationNone);
+        CGContextDrawImage(backing->context, rect, image);
+        CGContextRestoreGState(backing->context);
+        CGImageRelease(image);
+    }
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(space);
+}
+
+/* Give the guest a pointer it can write for a context whose pixels live only
+ * in host memory. Old games (Wild Frontier) call
+ * CGBitmapContextGetData(UIGraphicsGetCurrentContext()) inside drawRect: and
+ * blit their framebuffer into it directly. */
+u32 MirrorHostBitmap(CGContextRef context) {
+    CGContextFlush(context);
+    auto *hostBytes = static_cast<uint8_t *>(CGBitmapContextGetData(context));
+    const size_t bytesPerRow = CGBitmapContextGetBytesPerRow(context);
+    const size_t height = CGBitmapContextGetHeight(context);
+    if(TraceBitmapMirrors()) {
+        std::fprintf(stderr,
+            "LC32 CG mirror: request context=%p data=%p %zux%zu bpr=%zu bpc=%zu bpp=%zu info=0x%x depth=%d\n",
+            context, hostBytes, CGBitmapContextGetWidth(context), height,
+            bytesPerRow, CGBitmapContextGetBitsPerComponent(context),
+            CGBitmapContextGetBitsPerPixel(context),
+            static_cast<unsigned>(CGBitmapContextGetBitmapInfo(context)),
+            guestCallbackDepth);
+    }
+    if(!hostBytes) return MirrorOffscreen(context);
+    if(!bytesPerRow || !height ||
+            bytesPerRow > kMaximumBitmapBytes / height) return 0;
+    const size_t byteCount = bytesPerRow * height;
+    const bool scoped = guestCallbackDepth > 0;
+    const u32 guestData = scoped ? TakeGuestMirrorBytes(byteCount)
+        : AllocateGuestBitmapBytes(byteCount);
+    if(!guestData) return 0;
+    if(Dynarmic_mem_1write(guestData, byteCount,
+            reinterpret_cast<char *>(hostBytes)) != 0) {
+        guest_free(guestData);
+        return 0;
+    }
+    auto *backing = new BitmapBacking();
+    backing->guestData = guestData;
+    backing->guestBytesPerRow = bytesPerRow;
+    backing->hostBytesPerRow = bytesPerRow;
+    backing->width = CGBitmapContextGetWidth(context);
+    backing->height = height;
+    backing->guestByteCount = byteCount;
+    backing->ownsGuestData = true;
+    backing->externalBytes = hostBytes;
+    RegisterHostMirror(context, backing);
+    return guestData;
+}
+
+/* Write a host-context mirror back into the host pixels and drop it. */
+void RetireHostMirror(BitmapBacking *backing) {
+    PullBitmapBacking(backing);
+    if(backing->offscreen) CompositeOffscreen(backing);
+    {
+        std::lock_guard<std::mutex> lock(bitmapBackingsMutex);
+        const auto iterator = bitmapBackings.find(backing->context);
+        if(iterator != bitmapBackings.end() && iterator->second == backing)
+            bitmapBackings.erase(iterator);
+    }
+    scopedMirrorCount.fetch_sub(1, std::memory_order_relaxed);
+    if(backing->scopeDepth > 0)
+        ReturnGuestMirrorBytes(backing->guestData, backing->guestByteCount);
+    else if(Dynarmic_guest_thread_is_registered())
+        guest_free(backing->guestData);
+    CGContextRelease(backing->context);
     delete backing;
 }
 
@@ -414,6 +657,35 @@ void LC32CoreGraphicsSyncBitmapBacking(CGContextRef context) {
 
 void LC32CoreGraphicsPrepareBitmapBacking(CGContextRef context) {
     if(context) PullBitmapBacking(FindBitmapBacking(context));
+}
+
+int LC32CoreGraphicsEnterGuestCallback(void) {
+    return ++guestCallbackDepth;
+}
+
+void LC32CoreGraphicsLeaveGuestCallback(int depth) {
+    guestCallbackDepth = depth - 1;
+    if(!scopedMirrorCount.load(std::memory_order_relaxed)) return;
+    const pthread_t thread = pthread_self();
+    std::vector<BitmapBacking *> finished;
+    {
+        std::lock_guard<std::mutex> lock(bitmapBackingsMutex);
+        for(const auto &entry : bitmapBackings) {
+            BitmapBacking *backing = entry.second;
+            if((backing->externalBytes || backing->offscreen) &&
+                    backing->scopeDepth >= depth &&
+                    pthread_equal(backing->scopeThread, thread))
+                finished.push_back(backing);
+        }
+    }
+    for(BitmapBacking *backing : finished) RetireHostMirror(backing);
+}
+
+void LC32CoreGraphicsReleaseHostedMirror(CGContextRef context) {
+    if(!context || !scopedMirrorCount.load(std::memory_order_relaxed)) return;
+    BitmapBacking *backing = FindBitmapBacking(context);
+    if(backing && (backing->externalBytes || backing->offscreen))
+        RetireHostMirror(backing);
 }
 
 u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
@@ -468,7 +740,31 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             if(height && hostBytesPerRow > kMaximumBitmapBytes / height)
                 return 0;
             const size_t hostByteCount = hostBytesPerRow * height;
-            if(guestData) {
+            if(!guestData) {
+                /* No guest pixels: let Core Graphics validate the format and
+                 * pick the row size, then own the pixels here so that
+                 * CGBitmapContextGetData can later expose them to the guest
+                 * (the guest mirror is created lazily, and freed with the
+                 * context by ReleaseBitmapBacking). */
+                CGContextRef probe = CGBitmapContextCreate(nullptr, width,
+                    height, SlotU32(call, 3), bytesPerRow, colorSpace,
+                    SlotU32(call, 6));
+                if(!probe) return 0;
+                hostBytesPerRow = CGBitmapContextGetBytesPerRow(probe);
+                CGContextRelease(probe);
+                if(!height || !hostBytesPerRow ||
+                        hostBytesPerRow > kMaximumBitmapBytes / height)
+                    return 0;
+                backing = new BitmapBacking();
+                backing->guestBytesPerRow = hostBytesPerRow;
+                backing->hostBytesPerRow = hostBytesPerRow;
+                backing->height = height;
+                backing->guestByteCount = hostBytesPerRow * height;
+                backing->bytes = std::make_unique<uint8_t[]>(
+                    backing->guestByteCount);
+                memset(backing->bytes.get(), 0, backing->guestByteCount);
+                hostData = backing->bytes.get();
+            } else if(guestData) {
                 backing = new BitmapBacking();
                 backing->guestData = guestData;
                 backing->guestBytesPerRow = bytesPerRow;
@@ -1126,6 +1422,11 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             if(!RequireCoreGraphicsSlots(call, 1)) return 0;
             CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
             if(!context) return 0;
+            BitmapBacking *backing = FindBitmapBacking(context);
+            if(backing && backing->offscreen)
+                return static_cast<u32>(opcode ==
+                    LC32CoreGraphicsOpBitmapContextGetWidth
+                    ? backing->width : backing->height);
             return static_cast<u32>(opcode == LC32CoreGraphicsOpBitmapContextGetWidth
                 ? CGBitmapContextGetWidth(context) : CGBitmapContextGetHeight(context));
         }
@@ -1143,8 +1444,19 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
             BitmapBacking *backing = context
                 ? FindBitmapBacking(context) : nullptr;
-            if(context && backing) SyncBitmapBacking(context, backing);
-            return backing ? backing->guestData : 0;
+            if(!context) return 0;
+            if(!backing) return MirrorHostBitmap(context);
+            if(!backing->guestData && backing->bytes) {
+                /* CGBitmapContextCreate(NULL, ...): the host owns the pixels
+                 * until the guest first asks for them. */
+                const u32 guestData =
+                    AllocateGuestBitmapBytes(backing->guestByteCount);
+                if(!guestData) return 0;
+                backing->guestData = guestData;
+                backing->ownsGuestData = true;
+            }
+            SyncBitmapBacking(context, backing);
+            return backing->guestData;
         }
         case LC32CoreGraphicsOpContextSetFont: {
             if(!RequireCoreGraphicsSlots(call, 2)) return 0;

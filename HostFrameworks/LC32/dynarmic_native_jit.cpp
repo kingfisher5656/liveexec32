@@ -427,9 +427,20 @@ static bool BuildNativeGuestJitParts(
     config.wall_clock_cntpct = true;
     config.check_halt_on_memory_access = true;
     config.define_unpredictable_behaviour = true;
-    // A separate cache is required for every JIT. Keep the experiment's
-    // per-pthread footprint well below Dynarmic's 128 MiB default.
-    config.code_cache_size = 16 * 1024 * 1024;
+    LC32ApplyFastFP(config);
+    // A separate cache is required for every JIT. Keep the per-pthread
+    // footprint well below Dynarmic's 128 MiB default. 16 MiB thrashed on
+    // Modern Combat 4's game thread: the hot code did not fit, so the cache
+    // filled and was cleared every few seconds of play on device, each clear
+    // a visible hitch while everything was recompiled. 32 MiB held it with no
+    // clears during play. Untouched cache pages cost no memory.
+    // LC32_JIT_CACHE_MB (4-128; e.g. from LiveExec32.env) overrides it.
+    config.code_cache_size = 32 * 1024 * 1024;
+    if (const char *mb = getenv("LC32_JIT_CACHE_MB")) {
+        const long value = strtol(mb, nullptr, 10);
+        if (value >= 4 && value <= 128)
+            config.code_cache_size = static_cast<size_t>(value) * 1024 * 1024;
+    }
 
     DynarmicCallbacks32SetPageTable(
         parts.callbacks,
@@ -488,7 +499,9 @@ static NativeGuestJit *CreateNativeGuestJit(
     runtime->jit->Regs() = initial.regs;
     runtime->jit->ExtRegs() = initial.extRegs;
     runtime->jit->SetCpsr(initial.cpsr);
-    runtime->jit->SetFpscr(initial.fpscr);
+    // Fresh threads arrive with a zeroed context.
+    runtime->jit->SetFpscr(initial.fpscr != 0
+        ? initial.fpscr : LC32GuestInitialFpscr());
     DynarmicCallbacks32CP15(runtime->callbacks)->uro = initial.uro;
     runtime->jit->ClearExclusiveState();
     RegisterGuestVmEpochParticipant(

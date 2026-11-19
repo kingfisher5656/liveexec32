@@ -267,6 +267,30 @@ static inline BOOL LC32BundleDeclaresStableLandscapeSide(NSBundle *bundle) {
                 @"UIInterfaceOrientationLandscapeRight"];
 }
 
+/* Modern Combat 4 lists Portrait beside both landscape sides but launches
+ * LandscapeRight and only ever draws landscape (its rootless GL window turns
+ * its own picture). Its UI picks a 1136x640 layout only on a 568-point
+ * screen; anywhere else it scales 960x640 overlays by 640/height and draws
+ * full-screen fades into one corner. */
+static inline BOOL LC32BundleLaunchesLandscapeOnBothSides(NSBundle *bundle) {
+    NSDictionary *info = [bundle infoDictionary];
+    NSString *initial = [info objectForKey:@"UIInterfaceOrientation"];
+    if(![initial isEqualToString:@"UIInterfaceOrientationLandscapeLeft"] &&
+            ![initial isEqualToString:
+                @"UIInterfaceOrientationLandscapeRight"]) {
+        return NO;
+    }
+    NSArray *orientations = [info objectForKey:
+        @"UISupportedInterfaceOrientations~iphone"];
+    if(![orientations isKindOfClass:NSArray.class]) {
+        orientations = [info objectForKey:
+            @"UISupportedInterfaceOrientations"];
+    }
+    return [orientations isKindOfClass:NSArray.class] &&
+        [orientations containsObject:@"UIInterfaceOrientationLandscapeLeft"] &&
+        [orientations containsObject:@"UIInterfaceOrientationLandscapeRight"];
+}
+
 static inline BOOL LC32BundleUsesFixedLandscapeIPadCanvas(
         NSBundle *bundle, LC32LegacyIPadCanvasKind canvasKind) {
     return canvasKind == LC32LegacyIPadCanvasInferred &&
@@ -291,12 +315,17 @@ static inline BOOL LC32BundleUsesFixedLandscapePhoneCanvasForHost(
     }
     NSDictionary *info = [bundle infoDictionary];
     /* A bundle with no launch art at all (Alien Space Retro) was letterboxed
-     * the same way: only 568-point art opted an application out. */
+     * the same way: only 568-point art opted an application out.
+     * Universal bundles that leave the landscape side open (Air Mail, Unity)
+     * size themselves from the screen; phone-only ones that do so (Top Gear
+     * Stunt School: both landscape sides, 640x960 art only) still hard-code
+     * a 480x320 layout and draw mostly off a full-size modern scene. */
     return (LC32BundleContainsPhoneLaunchArt(bundle, info) ||
             !LC32BundleContainsIPadLaunchArt(bundle, info)) &&
         !LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
         LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
-        LC32BundleDeclaresStableLandscapeSide(bundle);
+        (LC32BundleDeclaresStableLandscapeSide(bundle) ||
+            !families.supportsPad);
 }
 
 /* iOS showed pre-iOS-8 phone applications with 568-point launch art, but no
@@ -309,14 +338,25 @@ static inline BOOL LC32BundleUsesFixedLandscapeTallPhoneCanvasForHost(
         NSBundle *bundle, uint32_t sdkVersion, BOOL phoneHost) {
     const LC32SupportedDeviceFamilies families =
         LC32BundleSupportedDeviceFamilies(bundle);
-    if(!phoneHost || !families.supportsPhone || !families.supportsPad ||
-            sdkVersion >= 0x00080000) {
+    if(!phoneHost || !families.supportsPhone || sdkVersion >= 0x00080000) {
         return NO;
     }
     NSDictionary *info = [bundle infoDictionary];
-    return LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
-        LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
-        LC32BundleDeclaresStableLandscapeSide(bundle);
+    if(!LC32BundleContainsTallPhoneLaunchArt(bundle, info) ||
+            !LC32BundleDeclaresStableLandscapeSide(bundle)) {
+        return NO;
+    }
+    if(families.supportsPad) {
+        return LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) ||
+            LC32BundleLaunchesLandscapeOnBothSides(bundle);
+    }
+    /* Phone-only bundles that launch landscape but also list portrait
+     * (Tapsonic: all four sides) pick their -568h nibs only for a 568-point
+     * screen and otherwise lay out 480x320 in a corner of a modern scene.
+     * Landscape-only phone bundles stay with the runtime check in
+     * LC32BundleMayRetainLegacyLandscapePhoneCanvas. */
+    return !LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
+        LC32BundleLaunchesLandscapeOnBothSides(bundle);
 }
 
 /* The portrait counterpart: a pre-iPhone-5 phone application that declares no

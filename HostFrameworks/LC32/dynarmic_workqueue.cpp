@@ -273,7 +273,7 @@ bool HandleGuestWorkqueueTransition() {
     guestWorkqueuePendingUpcall.valid = false;
     jit->Regs().fill(0);
     jit->ExtRegs().fill(0);
-    jit->SetFpscr(0);
+    jit->SetFpscr(LC32GuestInitialFpscr());
     jit->SetCpsr((guest_bsdthread_wqthread_start & 1) != 0
         ? 0x00000030
         : 0x000001d0);

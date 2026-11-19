@@ -165,6 +165,29 @@ private:
     GuestVmEpochParticipant *participant;
 };
 
+/*
+ * A thread inside a bridged host call or a plain sleep is not running guest
+ * code, so it must not hold back the reclamation of unmapped guest memory.
+ * Without this the guest main thread, which sits in UIApplicationMain for
+ * the whole session, kept every guest munmap/vm_deallocate since launch from
+ * ever being returned to the host (MC4: ~220 MB/min, jetsam at 4 GB).
+ * Guest code re-entered from inside the call (callbacks) starts a fresh
+ * epoch; on return the thread resumes with the current epoch.
+ */
+class GuestVmEpochPark {
+public:
+    explicit GuestVmEpochPark(GuestVmEpochParticipant *participant);
+    ~GuestVmEpochPark();
+    GuestVmEpochPark(const GuestVmEpochPark &) = delete;
+    GuestVmEpochPark &operator=(const GuestVmEpochPark &) = delete;
+
+private:
+    GuestVmEpochParticipant *participant;
+    size_t savedDepth = 0;
+};
+
+extern "C" GuestVmEpochParticipant *CurrentGuestVmEpochParticipantForThread();
+
 struct GuestStopRequest {
     int signal = SIGTRAP;
     bool pending = false;
@@ -385,6 +408,7 @@ auto InvokeNativeGuestHostCall(Function &&function)
             NativeGuestHostCallExit(state);
         }
     } exitScope{NativeGuestHostCallEnter()};
+    GuestVmEpochPark park(CurrentGuestVmEpochParticipantForThread());
     return function();
 }
 

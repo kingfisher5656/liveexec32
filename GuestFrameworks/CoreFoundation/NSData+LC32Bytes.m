@@ -151,6 +151,12 @@ uint64_t LC32SynchronizeMutableDataGuestBytes(NSMutableData *data) {
 + (instancetype)dataWithBytes:(const void *)bytes length:(NSUInteger)length {
     if(length > LC32MaximumDataGuestBufferBytes || (length && !bytes))
         return nil;
+    /* [NSMutableData dataWithBytes:length:] (and guest subclasses) must not
+     * get an immutable CFData: Nuts! appends to one, and native CF then
+     * overruns its inline storage on the host heap. -initWithBytes:length:
+     * builds the right class-cluster object through initWithData:. */
+    if(self != [NSData class])
+        return [[[self alloc] initWithBytes:bytes length:length] autorelease];
     return [(id)CFDataCreate(kCFAllocatorDefault, bytes, (CFIndex)length)
         autorelease];
 }
