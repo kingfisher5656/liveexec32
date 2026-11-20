@@ -47,30 +47,11 @@ gmake
 
 ### IPA build
 The IPA build is only meant to be used in LiveContainer, since it provides existing app/container management and convenient JIT enabler options.
-<table>
-  <tr>
-    <td> Stable </td>
-    <td align="center">
-      Not yet available
-    </td>
-    <td align="center">
-      Not yet available
-    </td>
-  </tr>
-  <tr>
-    <td> Nightly </td>
-    <td>
-      <a href="https://altdirect.app/?url=https://github.com/LiveContainer/LiveExec32/releases/download/nightly/source.json&r=livecontainer" target="_blank">
-        <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/AltSource_Blue.png" alt="Add AltSource" width="200" />
-      </a>
-    </td>
-    <td>
-      <a href="https://github.com/LiveContainer/LiveExec32/releases/download/nightly/com.kdt.liveexec32_0.0.1.ipa" target="_blank">
-        <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/Download_Blue.png" alt="Download .ipa" width="200" />
-      </a>
-    </td>
-  </tr>
-</table>
+<a href="https://github.com/kingfisher5656/LiveExec32/releases/latest" target="_blank">
+  <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/Download_Blue.png" alt="Download latest .ipa" width="200" />
+</a>
+
+Download the `.ipa` from the [latest release](https://github.com/kingfisher5656/LiveExec32/releases/latest) of this fork.
 
 ### Jailbreak tweak
 The jailbreak tweak lets you sideload decrypted 32-bit apps directly to the system and launch just like any other apps.
