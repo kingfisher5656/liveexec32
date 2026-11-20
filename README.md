@@ -47,6 +47,7 @@ gmake
 
 ### IPA build
 The IPA build is only meant to be used in LiveContainer, since it provides existing app/container management and convenient JIT enabler options.
+
 <a href="https://github.com/kingfisher5656/LiveExec32/releases/latest" target="_blank">
   <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/Download_Blue.png" alt="Download latest .ipa" width="200" />
 </a>
