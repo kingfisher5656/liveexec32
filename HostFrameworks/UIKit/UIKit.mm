@@ -4309,6 +4309,16 @@ extern "C" bool LC32FullScreenRootlessHostingActive(void) {
     return LC32FullScreenRootlessHosting.load(std::memory_order_acquire);
 }
 
+/* LegacyRotation.mm: its startup gate waits for the scene to reach one of the
+ * guest's declared orientations. A portrait-hosted landscape game (Starfront,
+ * 9mm, Grabatron, Air Mail) or a fixed portrait phone canvas keeps the scene
+ * portrait on purpose, so a portrait scene is already settled for them. */
+extern "C" bool LC32UIKitKeepsLegacyScenePortrait(void) {
+    return LC32FullScreenRootlessHosting.load(std::memory_order_acquire) ||
+        LC32PortraitHostedLandscape == LC32PortraitHostState::Hosted ||
+        LC32GuestUsesFixedPortraitPhoneCanvas();
+}
+
 /* LegacyMoviePlayer.mm: fit the game window again after a movie closed. */
 extern "C" void LC32RefitFullScreenRootlessWindowAfterMovie(UIWindow *window) {
     LC32RefitFullScreenRootlessWindowLater(window, "movie");

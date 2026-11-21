@@ -32,6 +32,7 @@ enum class InitialBacking { Unseen, Provisional, Ready };
 
 struct LC32RotationBuildVersion { uint32_t platform, version; };
 extern "C" bool LC32FullScreenRootlessHostingActive(void);
+extern "C" bool LC32UIKitKeepsLegacyScenePortrait(void);
 extern "C" void LC32RefitPortraitPhoneCanvasWindowLater(UIWindow *window);
 extern "C" bool dyld_program_sdk_at_least(LC32RotationBuildVersion version);
 
@@ -255,7 +256,12 @@ UIInterfaceOrientationMask DeclaredOrientations() {
 }
 
 bool SupportedScene(UIWindowScene *scene) {
-    return (OrientationBit(scene.interfaceOrientation) & DeclaredOrientations()) != 0;
+    const UIInterfaceOrientation orientation = scene.interfaceOrientation;
+    if(OrientationBit(orientation) & DeclaredOrientations()) return true;
+    // UIKit.mm deliberately keeps some landscape phone games in a portrait
+    // scene; that portrait scene is their settled launch geometry.
+    return UIInterfaceOrientationIsPortrait(orientation) &&
+        LC32UIKitKeepsLegacyScenePortrait();
 }
 
 void PresentInitialBacking(UIWindow *window, CALayer *backing) {
@@ -534,7 +540,32 @@ extern "C" bool LC32NativeLegacyRotationStartupSceneReady(void) {
     // deliver its initial landscape update after the first idle boundary.
     // Do not initialize the renderer from plist order or consume its one-time
     // device notification until the host has supplied a supported orientation.
-    return SupportedScene(window.windowScene);
+    if(SupportedScene(window.windowScene)) return true;
+    // Never hold guest startup indefinitely: a refused geometry request or a
+    // compatibility policy that keeps another orientation would otherwise
+    // leave the renderer without its startup turn. The scene settles well
+    // within this in normal launches.
+    constexpr CFTimeInterval maximumWait = 2.0;
+    static CFTimeInterval firstWait;
+    const CFTimeInterval now = CACurrentMediaTime();
+    if(!firstWait) {
+        firstWait = now;
+        // Wake the main run loop once the wait expires, so the idle startup
+        // observer runs again even if nothing else is scheduled.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                (int64_t)((maximumWait + 0.1) * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ CFRunLoopWakeUp(CFRunLoopGetMain()); });
+    }
+    if(now - firstWait < maximumWait) return false;
+    static bool logged;
+    if(!logged) {
+        logged = true;
+        fprintf(stderr, "LC32: legacy startup continues in scene orientation %ld "
+            "(declared mask 0x%lx) after %.1fs\n",
+            (long)window.windowScene.interfaceOrientation,
+            (unsigned long)DeclaredOrientations(), now - firstWait);
+    }
+    return true;
 }
 
 // A guest can do synchronous loading in its first display-link callback. If
