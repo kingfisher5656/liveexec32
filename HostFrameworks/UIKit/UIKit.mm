@@ -802,6 +802,11 @@ struct LC32LegacyCanvasPolicy {
     bool usesFixedPortraitPhoneCanvas;
     /* Long edge of the fixed phone canvas: 480, or 568 for tall-art apps. */
     CGFloat phoneCanvasLongEdge;
+    /* The host may composite a fixed phone canvas: always on an iPhone, and
+     * on an iPad for phone-only guests, which iOS ran in a phone-sized
+     * compatibility screen there (Tapsonic). Universal guests keep their
+     * native iPad layout. */
+    bool phoneCanvasHost;
 };
 
 const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
@@ -812,6 +817,7 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
         false,
         false,
         480,
+        false,
     };
     const char *guestExecutable = getenv("LC32_GUEST_EXECUTABLE");
     /* UIKit can create internal windows while the shim dylib is loading.
@@ -828,8 +834,13 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
             bundle, LC32GetGuestExecutableSDKVersion());
         result.usesFixedLandscapeIPadCanvas =
             LC32BundleUsesFixedLandscapeIPadCanvas(bundle, result.kind);
-        const bool phoneHost = UIDevice.currentDevice.userInterfaceIdiom ==
-            UIUserInterfaceIdiomPhone;
+        const LC32SupportedDeviceFamilies families =
+            LC32BundleSupportedDeviceFamilies(bundle);
+        const bool phoneHost =
+            UIDevice.currentDevice.userInterfaceIdiom ==
+                UIUserInterfaceIdiomPhone ||
+            (families.supportsPhone && !families.supportsPad);
+        result.phoneCanvasHost = phoneHost;
         result.usesFixedLandscapePhoneCanvas =
             LC32BundleUsesFixedLandscapePhoneCanvasForHost(
                 bundle, LC32GetGuestExecutableSDKVersion(), phoneHost);
@@ -873,12 +884,12 @@ bool LC32GuestUsesFixedLandscapePhoneCanvas(void) {
 }
 
 /* Only with native legacy rotation (device: LiveContainer spoofs the guest's
- * SDK) on a phone; the older full compatibility path keeps its own screen. */
+ * SDK) on a phone canvas host; the older full compatibility path keeps its own screen. */
 bool LC32GuestUsesFixedPortraitPhoneCanvas(void) {
     return LC32GuestLegacyCanvasPolicy().usesFixedPortraitPhoneCanvas &&
         !LC32UIKitLegacyCompatibilityEnabled() &&
         LC32NativeLegacyRotationEnabled() &&
-        UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
+        LC32GuestLegacyCanvasPolicy().phoneCanvasHost;
 }
 
 bool LC32GuestMayRetainLegacyLandscapePhoneCanvas(void) {
@@ -4716,7 +4727,7 @@ extern "C" u32 LC32UIKitNativeFixedPhoneCanvasEnabled(void) {
 #if LC32_UIKIT_COMPATIBILITY
     return !LC32UIKitLegacyCompatibilityEnabled() &&
         LC32NativeLegacyRotationEnabled() &&
-        UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone &&
+        LC32GuestLegacyCanvasPolicy().phoneCanvasHost &&
         LC32GuestUsesFixedLandscapePhoneCanvas();
 #else
     return 0;

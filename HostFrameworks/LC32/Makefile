@@ -82,7 +82,8 @@ LiveExec32Shared_FILES = \
 	../UIKit/LegacyAutoLayout.mm ../UIKit/LegacyFonts.mm ../UIKit/LegacyAlerts.mm \
 	../UIKit/LegacyRotation.mm ../UIKit/LegacyNibLoading.mm ../UIKit/LegacyNibClasses.mm ../UIKit/GuestSelectorHooks.mm \
 	../UIKit/GuestScreenMetrics.mm ../UIKit/GuestStatusBar.mm ../UIKit/ClassicPresentation.mm \
-	../UIKit/LegacyMoviePlayer.mm ../UIKit/LegacyFrameRate.mm
+	../UIKit/LegacyMoviePlayer.mm ../UIKit/LegacyFrameRate.mm \
+	../UIKit/LegacyIPadRootLayer.mm
 LiveExec32Shared_CFLAGS = \
 	-I. -I$(DYNARMIC_ROOT)/src -I../../include -DDYNARMIC_MASTER \
 	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS) \
@@ -95,6 +96,7 @@ crash_exception.mm_CFLAGS = -fobjc-arc
 ../UIKit/GuestStatusBar.mm_CFLAGS = -fobjc-arc
 ../UIKit/ClassicPresentation.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyMoviePlayer.mm_CFLAGS = -fobjc-arc
+../UIKit/LegacyIPadRootLayer.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyFrameRate.mm_CFLAGS = -fobjc-arc
 LiveExec32Shared_OBJ_FILES = $(DYNARMIC_STATIC_LIBS)
 LiveExec32Shared_LDFLAGS = -L../../External/mini-gdbstub/build -Wl,-weak-lMobileGestalt
