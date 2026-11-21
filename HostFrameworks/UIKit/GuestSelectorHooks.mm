@@ -296,8 +296,21 @@ extern "C" void LC32NoteHostTerminating(void);
 extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void);
 extern "C" bool LC32UIKitGuestStatusBarOrientationIsCosmetic(UIWindow *);
 
-// Weak reference (this file is not ARC); see objc_storeWeak.
+// Weak reference. Production builds this file without ARC; the
+// compatibility-switch test builds it with ARC.
+#if __has_feature(objc_arc)
+static __weak id LC32GuestKeyWindow;
+static void LC32StoreGuestKeyWindow(id window) { LC32GuestKeyWindow = window; }
+static id LC32LoadGuestKeyWindow(void) { return LC32GuestKeyWindow; }
+#else
 static id LC32GuestKeyWindow;
+static void LC32StoreGuestKeyWindow(id window) {
+    objc_storeWeak(&LC32GuestKeyWindow, window);
+}
+static id LC32LoadGuestKeyWindow(void) {
+    return objc_loadWeak(&LC32GuestKeyWindow);
+}
+#endif
 // See LC32UIKitGuestStatusBarOrientationIsCosmetic: the side the guest set
 // without turning the scene (0 = none).
 static std::atomic<long> LC32GuestCosmeticStatusBarOrientation{0};
@@ -308,7 +321,7 @@ static std::atomic<long> LC32GuestCosmeticStatusBarOrientation{0};
 + (void)load {
     // Only the game's own calls reach these, never the hosting app's.
     auto madeKey = [](id window, const uint64_t *) {
-        objc_storeWeak(&LC32GuestKeyWindow, window);
+        LC32StoreGuestKeyWindow(window);
     };
     LC32RegisterHostSelectorHook(UIWindow.class,
         @selector(makeKeyAndVisible), {nullptr, madeKey});
@@ -375,7 +388,7 @@ static std::atomic<long> LC32GuestCosmeticStatusBarOrientation{0};
     using GetWindow = UIWindow *(*)(id, SEL);
     UIWindow *key =
         ((GetWindow)LC32NativeHostMethod(self, original))(self, original);
-    UIWindow *guestKey = objc_loadWeak(&LC32GuestKeyWindow);
+    UIWindow *guestKey = LC32LoadGuestKeyWindow();
     if(!guestKey || guestKey == key || guestKey.hidden || !guestKey.windowScene)
         return key;
     static BOOL logged;
@@ -409,7 +422,7 @@ static bool LC32GuestKeepStatusBarOrientationCosmetic(
     if(orientation < UIInterfaceOrientationPortrait ||
        orientation > UIInterfaceOrientationLandscapeLeft) return false;
     if(!LC32UIKitGuestStatusBarOrientationIsCosmetic(
-            (UIWindow *)objc_loadWeak(&LC32GuestKeyWindow))) return false;
+            (UIWindow *)LC32LoadGuestKeyWindow())) return false;
     if(LC32GuestCosmeticStatusBarOrientation.exchange(orientation) !=
             orientation) {
         fprintf(stderr, "LC32: guest status bar orientation %ld kept "

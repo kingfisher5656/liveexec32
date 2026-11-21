@@ -74,6 +74,7 @@ xcrun --sdk iphonesimulator clang -target arm64-apple-ios15.0-simulator \
     -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -lc++ \
     "$repo_root/test/uikit_legacy_rootless_rotation.m" \
     "$repo_root/test/uikit_classic_presentation_disabled.mm" \
+    "$repo_root/test/uikit_fork_policy_stubs.mm" \
     "$repo_root/HostFrameworks/UIKit/LegacyAutoLayout.mm" \
     "$repo_root/HostFrameworks/UIKit/LegacyRotation.mm" -o "$workdir/test"
 

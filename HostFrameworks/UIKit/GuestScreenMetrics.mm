@@ -276,6 +276,7 @@ LC32ClassicScreenGeometry LC32CaptureGuestScreenGeometry(UIScreen *screen) {
 
 static bool LC32GuestFullScreenWindowRect(UIWindow *window, CGRect native,
                                           CGRect *guest) {
+    (void)window;
     CGRect screenBounds;
     if(!LC32UIKitFixedLandscapePhoneScreen(&screenBounds, nullptr)) {
         return false;

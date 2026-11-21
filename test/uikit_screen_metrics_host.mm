@@ -14,6 +14,16 @@ bool LC32GetClassicScreenGeometry(UIScreen *screen, LC32ClassicScreenGeometry *g
     return true;
 }
 
+// Fork-only fixed phone canvas and landscape-launch policies stay inactive.
+extern "C" bool LC32UIKitFixedLandscapePhoneScreen(CGRect *, CGRect *) { return false; }
+extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void) { return false; }
+@implementation UIWindow
+- (instancetype)initWithFrame:(CGRect)frame {
+    if((self = [super init])) _frame = _bounds = frame;
+    return self;
+}
+@end
+
 extern "C" bool LC32NativeLegacyRotationEnabled(void) {
     const char *value = getenv("LC32_TEST_LEGACY");
     return value && !strcmp(value, "1");
