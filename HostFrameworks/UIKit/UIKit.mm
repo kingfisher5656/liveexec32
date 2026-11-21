@@ -4087,9 +4087,9 @@ void LC32AdoptLegacyRootViewControllers(void) {
 /* Before iOS 6 a plist with only UIInterfaceOrientation named the launch
  * side; the controller's shouldAutorotateToInterfaceOrientation: decided the
  * rest. Alien Space Retro accepts both landscape sides and flips its GL view
- * from willRotateToInterfaceOrientation:. Ask the controller only once the
- * phone is actually turned to the other side, after startup, then allow both
- * sides and let UIKit rotate (which delivers that callback). */
+ * from willRotateToInterfaceOrientation:. Ask the controller after startup,
+ * once the phone is held landscape (on either side), then allow both sides
+ * and let UIKit rotate (which delivers that callback). */
 void LC32WidenLegacyLandscapeSides(UIInterfaceOrientation side) {
     const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
     const UIInterfaceOrientationMask declared = policy.declaredOrientations;
@@ -4193,6 +4193,21 @@ void LC32WatchLegacyLandscapeSides(void) {
         usingBlock:^(NSNotification *) { check(); }];
     // Already held on the other side when startup finished.
     check();
+    /* Held on the launch side: allow the other side now, while scene and
+     * window agree, not in the middle of the first flip. There, the legacy
+     * window has already followed the device ahead of the still-pinned
+     * scene; the geometry request's interim scene update turns it back,
+     * and UIKit drops the scene's own turn during that animation. */
+    const UIDeviceOrientation device = UIDevice.currentDevice.orientation;
+    if(UIDeviceOrientationIsLandscape(device) &&
+            (policy.declaredOrientations & LC32MaskForInterfaceOrientation(
+                (UIInterfaceOrientation)device))) {
+        LC32WidenLegacyLandscapeSides(
+            (UIInterfaceOrientation)device ==
+                UIInterfaceOrientationLandscapeLeft
+            ? UIInterfaceOrientationLandscapeRight
+            : UIInterfaceOrientationLandscapeLeft);
+    }
 }
 
 void LC32FinishGuestOrientationStartupAfterLaunch(void) {

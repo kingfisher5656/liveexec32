@@ -16,6 +16,7 @@ enum class InitialBacking { Unseen, Provisional, Ready };
 @property(nonatomic, weak) UIViewController *initializedController;
 @property(nonatomic) InitialBacking initialBacking;
 @property(nonatomic) CFTimeInterval initialPresentationDeadline;
+@property(nonatomic) BOOL sideResyncPending;
 @end
 @implementation LC32LegacyRotationState
 @end
@@ -434,6 +435,58 @@ void UpdateWindow(UIWindow *window, UIInterfaceOrientation orientation,
     }
 }
 
+UIInterfaceOrientation WindowOrientation(UIWindow *window) {
+    return ((UIInterfaceOrientation (*)(id, SEL))objc_msgSend)(window,
+        sel_registerName("interfaceOrientation"));
+}
+
+bool WindowIsRotating(UIWindow *window) {
+    static SEL rotating = sel_registerName("isRotating");
+    return [window respondsToSelector:rotating] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(window, rotating);
+}
+
+// UIKit drops an orientation update that arrives while the window is still
+// animating an earlier turn. If the scene flipped to the other landscape side
+// meanwhile, a 180-degree turn changes no size and nothing updates the window
+// again: the legacy root stays turned for the old side under the new scene
+// transform, upside down (Alien Space Retro's first flip, where the device
+// turn and the scene's own side change race a re-sync to the old side).
+// Re-apply the scene's side once the running turn has finished.
+void ResyncLandscapeSideWhenSettled(UIWindow *window, int attempts) {
+    NSTimeInterval delay =
+        UIApplication.sharedApplication.statusBarOrientationAnimationDuration / 2;
+    if(!(delay > 0) || !isfinite(delay)) delay = 0.15;
+    __weak UIWindow *weakWindow = window;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            UIWindow *target = weakWindow;
+            if(!target) return;
+            const bool rotating = WindowIsRotating(target);
+            if(rotating && attempts > 1) {
+                ResyncLandscapeSideWhenSettled(target, attempts - 1);
+                return;
+            }
+            WindowState(target).sideResyncPending = NO;
+            // Never retry into a turn that is still running: it would be
+            // dropped again. A later dropped update schedules a new pass.
+            if(rotating) return;
+            const UIInterfaceOrientation scene = target.windowScene.interfaceOrientation;
+            const UIInterfaceOrientation current = WindowOrientation(target);
+            if(UIInterfaceOrientationIsLandscape(scene) &&
+                    UIInterfaceOrientationIsLandscape(current) && scene != current &&
+                    !LC32UIKitKeepsLegacyScenePortrait())
+                UpdateWindow(target, scene, false);
+        });
+}
+
+void ResyncLandscapeSideAfterRotation(UIWindow *window) {
+    LC32LegacyRotationState *state = WindowState(window);
+    if(state.sideResyncPending) return;
+    state.sideResyncPending = YES;
+    ResyncLandscapeSideWhenSettled(window, 20);
+}
+
 void UpdateWindows(UIInterfaceOrientation orientation, bool initialOnly) {
     NSMutableSet<UIWindow *> *windows = [NSMutableSet set];
     for(UIViewController *controller in Controllers().allObjects) {
@@ -755,8 +808,12 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
         !UsesLegacyRotationPolicy(object_getClass(backingController)));
     SEL refresh = sel_registerName("_updateTransformLayer");
     if(legacy) ((void (*)(id, SEL))objc_msgSend)(self, refresh);
+    const bool rotating = legacy && startupFinished && pthread_main_np() &&
+        UIInterfaceOrientationIsLandscape(orientation) && WindowIsRotating(self);
     [self lc32_updateToInterfaceOrientation:orientation duration:duration force:force];
     if(legacy) ((void (*)(id, SEL))objc_msgSend)(self, refresh);
+    if(rotating && WindowOrientation(self) != orientation)
+        ResyncLandscapeSideAfterRotation(self);
     // The scene host can present its new orientation while guest loading is
     // busy. Publish the matching backing in this native update, not at the
     // deferred guest-startup boundary or the next automatic CA commit.
