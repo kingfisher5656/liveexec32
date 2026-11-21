@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <LC32FloatStructs.h>
 
 /*
  * Raw NSValue storage is ABI-dependent.  In particular, SEL is four bytes in
@@ -90,50 +91,6 @@ typedef struct LC32ValueLayout {
     void (*hostToGuest)(const void *host, void *guest);
 } LC32ValueLayout;
 
-static void LC32ConvertFloats2(const void *guest, void *host) {
-    const float *src = guest;
-    double *dst = host;
-    dst[0] = src[0];
-    dst[1] = src[1];
-}
-
-static void LC32ConvertFloats4(const void *guest, void *host) {
-    const float *src = guest;
-    double *dst = host;
-    dst[0] = src[0];
-    dst[1] = src[1];
-    dst[2] = src[2];
-    dst[3] = src[3];
-}
-
-static void LC32NarrowFloats2(const void *host, void *guest) {
-    const double *src = host;
-    float *dst = guest;
-    dst[0] = (float)src[0];
-    dst[1] = (float)src[1];
-}
-
-static void LC32NarrowFloats4(const void *host, void *guest) {
-    const double *src = host;
-    float *dst = guest;
-    dst[0] = (float)src[0];
-    dst[1] = (float)src[1];
-    dst[2] = (float)src[2];
-    dst[3] = (float)src[3];
-}
-
-static void LC32ConvertFloats16(const void *guest, void *host) {
-    const float *src = guest;
-    double *dst = host;
-    for(unsigned i = 0; i < 16; i++) dst[i] = src[i];
-}
-
-static void LC32NarrowFloats16(const void *host, void *guest) {
-    const double *src = host;
-    float *dst = guest;
-    for(unsigned i = 0; i < 16; i++) dst[i] = (float)src[i];
-}
-
 static void LC32ConvertNSRange(const void *guest, void *host) {
     const uint32_t *src = guest;
     uint64_t *dst = host;
@@ -165,7 +122,24 @@ static void LC32CopyCMTimeRange(const void *source, void *destination) {
     memcpy(destination, source, sizeof(CMTimeRange));
 }
 
+// SceneKit uses float even on ARM64 iOS/Catalyst; MKCoordinateSpan is two
+// doubles on both ABIs. These boxes need no CGFloat widening.
+static void LC32Copy12(const void *source, void *destination) {
+    memcpy(destination, source, 12);
+}
+static void LC32Copy16(const void *source, void *destination) {
+    memcpy(destination, source, 16);
+}
+static void LC32Copy64(const void *source, void *destination) {
+    memcpy(destination, source, 64);
+}
+
 static const LC32ValueLayout LC32ValueLayouts[] = {
+    { "{SCNVector3=fff}", "{SCNVector3=fff}", 12, 12, LC32Copy12, LC32Copy12 },
+    { "{SCNVector4=ffff}", "{SCNVector4=ffff}", 16, 16, LC32Copy16, LC32Copy16 },
+    { "{SCNMatrix4=ffffffffffffffff}", "{SCNMatrix4=ffffffffffffffff}",
+        64, 64, LC32Copy64, LC32Copy64 },
+    { "{?=dd}", "{?=dd}", 16, 16, LC32Copy16, LC32Copy16 },
     {
         .guestEncoding = @encode(CMTime),
         .hostEncoding = @encode(CMTime),
@@ -187,40 +161,40 @@ static const LC32ValueLayout LC32ValueLayouts[] = {
         .hostEncoding = "{CGPoint=dd}",
         .guestSize = 8,
         .hostSize = 16,
-        .guestToHost = LC32ConvertFloats2,
-        .hostToGuest = LC32NarrowFloats2,
+        .guestToHost = LC32Host2Floats,
+        .hostToGuest = LC32Guest2Floats,
     },
     {
         .guestEncoding = "{CGSize=ff}",
         .hostEncoding = "{CGSize=dd}",
         .guestSize = 8,
         .hostSize = 16,
-        .guestToHost = LC32ConvertFloats2,
-        .hostToGuest = LC32NarrowFloats2,
+        .guestToHost = LC32Host2Floats,
+        .hostToGuest = LC32Guest2Floats,
     },
     {
         .guestEncoding = "{CGRect={CGPoint=ff}{CGSize=ff}}",
         .hostEncoding = "{CGRect={CGPoint=dd}{CGSize=dd}}",
         .guestSize = 16,
         .hostSize = 32,
-        .guestToHost = LC32ConvertFloats4,
-        .hostToGuest = LC32NarrowFloats4,
+        .guestToHost = LC32Host4Floats,
+        .hostToGuest = LC32Guest4Floats,
     },
     {
         .guestEncoding = "{UIEdgeInsets=ffff}",
         .hostEncoding = "{UIEdgeInsets=dddd}",
         .guestSize = 16,
         .hostSize = 32,
-        .guestToHost = LC32ConvertFloats4,
-        .hostToGuest = LC32NarrowFloats4,
+        .guestToHost = LC32Host4Floats,
+        .hostToGuest = LC32Guest4Floats,
     },
     {
         .guestEncoding = "{CATransform3D=ffffffffffffffff}",
         .hostEncoding = "{CATransform3D=dddddddddddddddd}",
         .guestSize = 64,
         .hostSize = 128,
-        .guestToHost = LC32ConvertFloats16,
-        .hostToGuest = LC32NarrowFloats16,
+        .guestToHost = LC32Host16Floats,
+        .hostToGuest = LC32Guest16Floats,
     },
     {
         .guestEncoding = "{_NSRange=II}",

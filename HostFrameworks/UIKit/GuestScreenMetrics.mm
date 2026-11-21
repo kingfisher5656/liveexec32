@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import "../LC32/host_selector_hooks.h"
 #import "LC32LegacyRotation.h"
+#import "LC32ClassicPresentation.h"
 #include "../../include/LC32UIKitCompatibilityConfig.h"
 #if LC32_UIKIT_COMPATIBILITY
 #include <cmath>
@@ -24,6 +25,25 @@
 extern "C" bool LC32UIKitFixedLandscapePhoneScreen(
     CGRect *bounds, CGRect *applicationFrame);
 extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void);
+
+namespace {
+bool hasApplicationModeSize;
+bool usesLegacyMetrics;
+
+CGFloat NativeScale(UIScreen *screen) {
+    const SEL selector = @selector(scale);
+    return ((CGFloat (*)(id, SEL))LC32NativeHostMethod(screen, selector))(screen, selector);
+}
+
+CGFloat LegacyScale(UIScreen *screen, CGFloat nativeScale) {
+    // New UIKit has removed the caller-sensitive application-scale API.
+    // Preserve the pre-iOS-8 main-display contract (before 3x displays), not
+    // a game-specific scale or resolution. External screens remain native.
+    constexpr CGFloat legacyMaximumScale = 2;
+    return usesLegacyMetrics && std::isfinite(nativeScale) && nativeScale > legacyMaximumScale &&
+        screen == UIScreen.mainScreen ? legacyMaximumScale : nativeScale;
+}
+}
 
 /* An SDK 8+ landscape-only guest launches while our scene is still in the
  * launcher's portrait (see LC32UIKitGuestScreenIsLandscapeOnly). Give it the
@@ -109,11 +129,14 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
 
 @implementation UIScreenMode (LC32GuestScreenMetrics)
 - (CGSize)lc32_guestScreenModeSize {
+    UIScreen *main = UIScreen.mainScreen;
+    LC32ClassicScreenGeometry saved;
+    if(self == main.currentMode && LC32GetClassicScreenGeometry(main, &saved)) return saved.modeSize;
     // The fixed phone canvas is also the guest's pixel mode: iOS 4 engines
     // (Star Battalion) set their GL viewport from currentMode.size, and a
     // full-scene mode zooms and crops the 640x960 drawable.
     CGRect canvas;
-    if(LC32UIKitFixedLandscapePhoneScreen(&canvas, nullptr) &&
+    if(usesLegacyMetrics && LC32UIKitFixedLandscapePhoneScreen(&canvas, nullptr) &&
             LC32ModeIsMainScreenCurrentMode(self)) {
         const CGFloat scale = [UIScreen.mainScreen lc32_guestScreenScale];
         const CGSize size = CGSizeMake(canvas.size.width * scale,
@@ -130,6 +153,20 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
 }
 
 - (CGSize)lc32_applicationScreenModeSize {
+    if(!usesLegacyMetrics) return LC32NativeModeSize(self);
+    if(!hasApplicationModeSize) {
+        CGSize size = LC32NativeModeSize(self);
+        UIScreen *screen = UIScreen.mainScreen;
+        if(self != screen.currentMode && ![screen.availableModes containsObject:self]) return size;
+        const CGFloat nativeScale = NativeScale(screen);
+        const CGFloat scale = LegacyScale(screen, nativeScale);
+        if(nativeScale > 0 && std::isfinite(nativeScale)) {
+            const CGFloat ratio = scale / nativeScale;
+            size.width *= ratio;
+            size.height *= ratio;
+        }
+        return size;
+    }
     // Level zero asks for the application's legacy scale without inspecting
     // the native caller's image. The external emulator is not the executable
     // (or a framework inside its bundle), so -size can otherwise expose 3x
@@ -144,10 +181,11 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
 
 @implementation UIScreen (LC32GuestScreenMetrics)
 - (CGFloat)lc32_guestScreenScale {
-    using ScaleGetter = CGFloat (*)(id, SEL);
-    const SEL scaleSelector = @selector(scale);
-    CGFloat scale = ((ScaleGetter)LC32NativeHostMethod(self, scaleSelector))(
-        self, scaleSelector);
+    LC32ClassicScreenGeometry saved;
+    if(LC32GetClassicScreenGeometry(self, &saved)) return saved.scale;
+    CGFloat scale = NativeScale(self);
+    if(usesLegacyMetrics && !hasApplicationModeSize)
+        scale = LegacyScale(self, scale);
     const SEL modeSelector = @selector(currentMode);
     using ModeGetter = UIScreenMode *(*)(id, SEL);
     UIScreenMode *mode = ((ModeGetter)LC32NativeHostMethod(self, modeSelector))(
@@ -159,7 +197,7 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
     // display and iPad policy, and a mode need not match a window's extent.
     using SizeGetter = CGSize (*)(id, SEL);
     const SEL sizeSelector = @selector(size);
-    if(LC32NativeLegacyRotationEnabled() && mode &&
+    if(usesLegacyMetrics && hasApplicationModeSize && mode &&
             class_getInstanceMethod(object_getClass(mode),
                 @selector(_sizeWithLevel:))) {
         const CGSize nativeSize = ((SizeGetter)LC32NativeHostMethod(
@@ -196,6 +234,8 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
 }
 
 - (CGRect)lc32_guestScreenBounds {
+    LC32ClassicScreenGeometry saved;
+    if(LC32GetClassicScreenGeometry(self, &saved)) return saved.bounds;
     CGRect bounds;
     if(LC32UIKitFixedLandscapePhoneScreen(&bounds, nullptr)) return bounds;
     using RectGetter = CGRect (*)(id, SEL);
@@ -205,6 +245,8 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
 }
 
 - (CGRect)lc32_guestScreenApplicationFrame {
+    LC32ClassicScreenGeometry saved;
+    if(LC32GetClassicScreenGeometry(self, &saved)) return saved.applicationFrame;
     CGRect frame;
     if(LC32UIKitFixedLandscapePhoneScreen(nullptr, &frame)) return frame;
     using RectGetter = CGRect (*)(id, SEL);
@@ -213,6 +255,15 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
     return LC32LandscapeLaunchExtent(self, frame, "applicationFrame");
 }
 @end
+
+LC32ClassicScreenGeometry LC32CaptureGuestScreenGeometry(UIScreen *screen) {
+    // Preserve the effective application metrics, including older UIKit's
+    // caller-sensitive mode API and our fixed phone canvas; do not
+    // reconstruct them from the native scale after the host has changed
+    // presentation.
+    return {[screen lc32_guestScreenBounds], [screen lc32_guestScreenApplicationFrame],
+        [screen.currentMode lc32_guestScreenModeSize], [screen lc32_guestScreenScale]};
+}
 
 /* Under a fixed phone canvas the guest's screen is 320x480 (or 320x568), but
  * its full-screen window keeps the native scene frame. On iOS 6 that window's
@@ -266,6 +317,7 @@ static bool LC32GuestFullScreenWindowRect(UIWindow *window, CGRect native,
 @end
 @implementation LC32GuestScreenMetricsHooks
 + (void)load {
+    usesLegacyMetrics = LC32NativeLegacyRotationEnabled();
     // Runtime lookups avoid initializing UIScreen during the runtime's dlopen.
     Class screen = objc_getClass("UIScreen");
     LC32RegisterHostSelectorHook(screen, @selector(bounds),
@@ -280,8 +332,8 @@ static bool LC32GuestFullScreenWindowRect(UIWindow *window, CGRect native,
         {@selector(lc32_guestWindowFrame), nullptr});
     LC32RegisterHostSelectorHook(objc_getClass("UIWindow"), @selector(bounds),
         {@selector(lc32_guestWindowBounds), nullptr});
-    if(!LC32NativeLegacyRotationEnabled()) return;
     Class mode = objc_getClass("UIScreenMode");
+    hasApplicationModeSize = class_getInstanceMethod(mode, @selector(_sizeWithLevel:)) != nullptr;
     LC32RegisterHostSelectorHook(mode, @selector(size),
         {@selector(lc32_guestScreenModeSize), nullptr});
 }

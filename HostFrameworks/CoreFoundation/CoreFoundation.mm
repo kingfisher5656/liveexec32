@@ -536,6 +536,8 @@ CFTypeID KnownTypeID(uint32_t typeValue) {
             return CFSocketGetTypeID();
         case LC32CoreFoundationTypeAllocator:
             return CFAllocatorGetTypeID();
+        case LC32CoreFoundationTypeUUID:
+            return CFUUIDGetTypeID();
     }
     return 0;
 }
@@ -3214,6 +3216,27 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
             CFDataIncreaseLength(data, SlotU32(call, 1));
             return 1;
         }
+        case LC32CoreFoundationOpDataCompareGuestBytes: {
+            if(!RequireSlots(call, 3)) return 0;
+            const uint64_t left = SlotU32(call, 0);
+            const uint64_t right = SlotU32(call, 1);
+            const uint32_t length = SlotU32(call, 2);
+            if(length > kMaximumDataBytes ||
+               (length && (!left || !right)) ||
+               left + length > (UINT64_C(1) << 32) ||
+               right + length > (UINT64_C(1) << 32)) return 0;
+            // Bounded native staging handles discontiguous guest mappings;
+            // neither ARM32 address is ever dereferenced by host memcmp.
+            char leftBytes[16384], rightBytes[16384];
+            for(uint32_t offset = 0; offset < length;) {
+                const uint32_t count = MIN(length - offset, sizeof(leftBytes));
+                if(Dynarmic_mem_1read(left + offset, count, leftBytes) ||
+                   Dynarmic_mem_1read(right + offset, count, rightBytes)) return 0;
+                if(memcmp(leftBytes, rightBytes, count)) return 2;
+                offset += count;
+            }
+            return 1;
+        }
         case LC32CoreFoundationOpDataReplaceBytes: {
             if(!RequireSlots(call, 5)) return 0;
             CFMutableDataRef data =
@@ -3905,6 +3928,64 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
             }
             return WriteGuestCreatedObject(
                 guestWriteStream, writeStream);
+        }
+        case LC32CoreFoundationOpRetain: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFTypeRef object = SlotHostObject<CFTypeRef>(call, 0);
+            return object ? LC32GuestObjectForOwnedHostObject(CFRetain(object)) : 0;
+        }
+        case LC32CoreFoundationOpRelease: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFTypeRef object = SlotHostObject<CFTypeRef>(call, 0);
+            if(object) CFRelease(object);
+            return 0;
+        }
+        case LC32CoreFoundationOpEqual: {
+            if(!RequireSlots(call, 2)) return 0;
+            CFTypeRef object = SlotHostObject<CFTypeRef>(call, 0);
+            CFTypeRef other = SlotHostObject<CFTypeRef>(call, 1);
+            return object && other && CFEqual(object, other);
+        }
+        case LC32CoreFoundationOpHash: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFTypeRef object = SlotHostObject<CFTypeRef>(call, 0);
+            return object ? static_cast<u32>(CFHash(object)) : 0;
+        }
+        case LC32CoreFoundationOpCopyDescription: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFTypeRef object = SlotHostObject<CFTypeRef>(call, 0);
+            return object ? GuestForCreatedObject(CFCopyDescription(object)) : 0;
+        }
+        case LC32CoreFoundationOpUUIDCreate:
+            return RequireSlots(call, 0)
+                ? GuestForCreatedObject(CFUUIDCreate(kCFAllocatorDefault)) : 0;
+        case LC32CoreFoundationOpUUIDCreateFromString: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFStringRef string = SlotHostObject<CFStringRef>(call, 0);
+            return string ? GuestForCreatedObject(CFUUIDCreateFromString(
+                kCFAllocatorDefault, string)) : 0;
+        }
+        case LC32CoreFoundationOpUUIDCreateFromBytes: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFUUIDBytes bytes = {};
+            static_assert(sizeof(bytes) == 16);
+            const u32 address = SlotU32(call, 0);
+            if(!GuestRangeIsValid(address, sizeof(bytes)) ||
+               Dynarmic_mem_1read(address, sizeof(bytes),
+                   reinterpret_cast<char *>(&bytes)) != 0) return 0;
+            return GuestForCreatedObject(CFUUIDCreateFromUUIDBytes(
+                kCFAllocatorDefault, bytes));
+        }
+        case LC32CoreFoundationOpUUIDGetBytes: {
+            if(!RequireSlots(call, 2)) return 0;
+            CFUUIDRef uuid = SlotHostObject<CFUUIDRef>(call, 0);
+            return uuid && WriteGuestValue(SlotU32(call, 1), CFUUIDGetUUIDBytes(uuid));
+        }
+        case LC32CoreFoundationOpUUIDCreateString: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFUUIDRef uuid = SlotHostObject<CFUUIDRef>(call, 0);
+            return uuid ? GuestForCreatedObject(CFUUIDCreateString(
+                kCFAllocatorDefault, uuid)) : 0;
         }
         case LC32CoreFoundationOpGetTypeID: {
             if(!RequireSlots(call, 1)) return 0;

@@ -560,6 +560,21 @@ static void LC32ScheduleGuestDeviceOrientationRecheck(void) {
 @end
 
 #if LC32_UIKIT_COMPATIBILITY
+#import "LC32LegacyRotation.h"
+
+@implementation CADisplayLink (LC32GuestInitialPresentation)
++ (void)load {
+    LC32RegisterHostSelectorHook(object_getClass(self), @selector(displayLinkWithTarget:selector:),
+        {@selector(lc32_guestDisplayLinkWithTarget:selector:), nullptr});
+}
++ (CADisplayLink *)lc32_guestDisplayLinkWithTarget:(id)target selector:(SEL)action {
+    target = LC32LegacyStartupDisplayLinkTarget(target, &action);
+    SEL original = @selector(displayLinkWithTarget:selector:);
+    using Factory = CADisplayLink *(*)(id, SEL, id, SEL);
+    return ((Factory)LC32NativeHostMethod(self, original))(self, original, target, action);
+}
+@end
+
 @interface LC32GuestViewMutationHooks : NSObject
 @end
 @implementation LC32GuestViewMutationHooks
