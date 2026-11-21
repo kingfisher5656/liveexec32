@@ -295,6 +295,9 @@ extern "C" void LC32NoteHostTerminating(void);
 
 extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void);
 extern "C" bool LC32UIKitGuestStatusBarOrientationIsCosmetic(UIWindow *);
+extern "C" bool LC32UIKitRootlessStatusBarOrientationFollowsGuest(UIWindow *);
+extern "C" bool LC32UIKitHostedStatusBarOrientationFollowsGuest(UIWindow *);
+extern "C" void LC32UIKitPortraitHostedSideChanged(UIInterfaceOrientation);
 
 // Weak reference. Production builds this file without ARC; the
 // compatibility-switch test builds it with ARC.
@@ -314,6 +317,9 @@ static id LC32LoadGuestKeyWindow(void) {
 // See LC32UIKitGuestStatusBarOrientationIsCosmetic: the side the guest set
 // without turning the scene (0 = none).
 static std::atomic<long> LC32GuestCosmeticStatusBarOrientation{0};
+// See LC32UIKitRootlessStatusBarOrientationFollowsGuest: the landscape side a
+// rootless canvas game last set (0 = none).
+static std::atomic<long> LC32GuestRootlessStatusBarOrientation{0};
 
 @interface LC32GuestKeyWindowHooks : NSObject
 @end
@@ -431,8 +437,52 @@ static bool LC32GuestKeepStatusBarOrientationCosmetic(
     return true;
 }
 
+// See LC32UIKitRootlessStatusBarOrientationFollowsGuest. The gate reads the
+// window's root controller, so evaluate it on the main thread only; game
+// threads (render loops) reuse the last main-thread answer.
+static std::atomic<bool> LC32GuestRootlessStatusBarGateOpen{false};
+static bool LC32GuestRootlessStatusBarGate(void) {
+    if(!pthread_main_np()) return LC32GuestRootlessStatusBarGateOpen.load();
+    const bool open = LC32UIKitRootlessStatusBarOrientationFollowsGuest(
+        (UIWindow *)LC32LoadGuestKeyWindow());
+    LC32GuestRootlessStatusBarGateOpen.store(open);
+    return open;
+}
+
+// Portrait-hosted, the same game turns its own sideways picture (9mm): make
+// the latest side it set the hosted side. Main thread only (the gate reads
+// the window's root); the getter retries there, e.g. after a movie root.
+static void LC32GuestSyncHostedStatusBarOrientation(void) {
+    if(!pthread_main_np()) return;
+    const long side = LC32GuestRootlessStatusBarOrientation.load();
+    const NSInteger hosted = LC32UIKitPortraitHostedStatusBarOrientation();
+    if(!side || !hosted || hosted == side ||
+            !LC32UIKitHostedStatusBarOrientationFollowsGuest(
+                (UIWindow *)LC32LoadGuestKeyWindow())) return;
+    LC32UIKitPortraitHostedSideChanged((UIInterfaceOrientation)side);
+    fprintf(stderr, "LC32: guest status bar orientation %ld "
+        "(portrait-hosted rootless window, hosted side follows)\n", side);
+}
+
+// Every landscape side the game sets is kept, also while the gate is closed
+// (a movie root), so the side reported once it opens is the latest one. The
+// native setter still runs; it only no longer decides what the game reads.
+static void LC32GuestNoteRootlessStatusBarOrientation(
+        UIInterfaceOrientation orientation) {
+    if(!UIInterfaceOrientationIsLandscape(orientation)) return;
+    const long previous =
+        LC32GuestRootlessStatusBarOrientation.exchange(orientation);
+    if(previous != orientation && LC32GuestRootlessStatusBarGate()) {
+        fprintf(stderr, "LC32: guest status bar orientation %ld "
+            "(rootless window, reported back to the game)\n",
+            (long)orientation);
+    }
+    LC32GuestSyncHostedStatusBarOrientation();
+}
+
 - (void)lc32_guestSetStatusBarOrientation:(UIInterfaceOrientation)orientation {
     if(LC32GuestKeepStatusBarOrientationCosmetic(orientation)) return;
+    LC32GuestNoteRootlessStatusBarOrientation(orientation);
     const SEL original = @selector(setStatusBarOrientation:);
     using SetOrientation = void (*)(id, SEL, UIInterfaceOrientation);
     ((SetOrientation)LC32NativeHostMethod(self, original))(
@@ -442,6 +492,7 @@ static bool LC32GuestKeepStatusBarOrientationCosmetic(
 - (void)lc32_guestSetStatusBarOrientation:(UIInterfaceOrientation)orientation
                                  animated:(BOOL)animated {
     if(LC32GuestKeepStatusBarOrientationCosmetic(orientation)) return;
+    LC32GuestNoteRootlessStatusBarOrientation(orientation);
     const SEL original = @selector(setStatusBarOrientation:animated:);
     using SetOrientation = void (*)(id, SEL, UIInterfaceOrientation, BOOL);
     ((SetOrientation)LC32NativeHostMethod(self, original))(
@@ -452,10 +503,14 @@ static bool LC32GuestKeepStatusBarOrientationCosmetic(
     // A landscape game shown sideways in a portrait scene converts its touches
     // with this; report its landscape side as iPhone OS did. UIKit's own reads
     // are unaffected.
+    LC32GuestSyncHostedStatusBarOrientation();
     const NSInteger hosted = LC32UIKitPortraitHostedStatusBarOrientation();
     if(hosted) return (UIInterfaceOrientation)hosted;
     const long cosmetic = LC32GuestCosmeticStatusBarOrientation.load();
     if(cosmetic) return (UIInterfaceOrientation)cosmetic;
+    const long rootlessSide = LC32GuestRootlessStatusBarOrientation.load();
+    if(rootlessSide && LC32GuestRootlessStatusBarGate())
+        return (UIInterfaceOrientation)rootlessSide;
     const SEL original = @selector(statusBarOrientation);
     using GetOrientation = UIInterfaceOrientation (*)(id, SEL);
     return ((GetOrientation)LC32NativeHostMethod(self, original))(self, original);

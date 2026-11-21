@@ -34,11 +34,19 @@ enum class InitialBacking { Unseen, Provisional, Ready };
 struct LC32RotationBuildVersion { uint32_t platform, version; };
 extern "C" bool LC32FullScreenRootlessHostingActive(void);
 extern "C" bool LC32UIKitKeepsLegacyScenePortrait(void);
+extern "C" void LC32UIKitPortraitHostedSideChanged(UIInterfaceOrientation side);
+extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void);
+extern "C" bool LC32UIKitWindowIsPortraitHosted(UIWindow *window);
 extern "C" void LC32RefitPortraitPhoneCanvasWindowLater(UIWindow *window);
 extern "C" bool dyld_program_sdk_at_least(LC32RotationBuildVersion version);
 
 namespace {
 const void *RegisteredClassKey = &RegisteredClassKey;
+// The side last announced by willRotate, so each turn is announced once.
+const void *AnnouncedOrientationKey = &AnnouncedOrientationKey;
+// A side whose didRotate was delivered by AnnounceHostedLandscapeTurn, so a
+// native didRotate UIKit might still send for that turn is not repeated.
+const void *SyntheticDidRotateKey = &SyntheticDidRotateKey;
 const void *WindowStateKey = &WindowStateKey;
 bool startupFinished;
 using NativeRotationQuery = BOOL (*)(id, SEL, UIInterfaceOrientation, BOOL, BOOL *);
@@ -487,6 +495,43 @@ void ResyncLandscapeSideAfterRotation(UIWindow *window) {
     ResyncLandscapeSideWhenSettled(window, 20);
 }
 
+bool AnnounceWillRotate(UIViewController *controller, UIInterfaceOrientation orientation,
+        NSTimeInterval duration);
+
+// A portrait-hosted landscape game (launched with the phone upright; see
+// LC32DecidePortraitHostedLandscape in UIKit.mm) keeps its scene portrait,
+// yet the device handler still turns its legacy window between the two
+// landscape sides. UIKit turns the root for that without the window-level
+// will/did callbacks, and no scene turn announces it either (the canvas
+// container's scene observer only sees a portrait scene). Alien Space Retro
+// flips its GL picture from willRotateToInterfaceOrientation:, so its menu
+// buttons turned while the picture kept the launch side. Tell the guest, and
+// let its status-bar side follow (UIKit.mm reports the hosted side to it).
+// The hosted window itself starts out portrait (the guest is only told its
+// launch side), so compare against the side the guest was last given.
+// The side is only recorded once the guest can be told; otherwise the next
+// device event retries (FollowDeviceWhileHosted).
+void AnnounceHostedLandscapeTurn(UIWindow *window, UIInterfaceOrientation to,
+        NSTimeInterval duration) {
+    if(!startupFinished || !LC32UIKitWindowIsPortraitHosted(window)) return;
+    const UIInterfaceOrientation from =
+        (UIInterfaceOrientation)LC32UIKitPortraitHostedStatusBarOrientation();
+    if(!UIInterfaceOrientationIsLandscape(from) || from == to) return;
+    UIViewController *root = NativeRoot(window);
+    UIViewController *content = root ? LC32NativeLegacyRotationContentController(root) : nil;
+    if(!content || !RegisteredClass(object_getClass(content)) ||
+            !LC32NativeLegacyRotationCanCallGuest()) return;
+    LC32UIKitPortraitHostedSideChanged(to);
+    fprintf(stderr, "LC32: portrait-hosted window turned %ld -> %ld; "
+        "announcing the landscape side to the guest\n", (long)from, (long)to);
+    // One controller for both callbacks, even if willRotate replaces the
+    // canvas content.
+    if(!AnnounceWillRotate(content, to, duration)) return;
+    [content didRotateFromInterfaceOrientation:from];
+    objc_setAssociatedObject(content, SyntheticDidRotateKey, @(to),
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 void UpdateWindows(UIInterfaceOrientation orientation, bool initialOnly) {
     NSMutableSet<UIWindow *> *windows = [NSMutableSet set];
     for(UIViewController *controller in Controllers().allObjects) {
@@ -495,6 +540,56 @@ void UpdateWindows(UIInterfaceOrientation orientation, bool initialOnly) {
         if(window) [windows addObject:window];
     }
     for(UIWindow *window in windows) UpdateWindow(window, orientation, initialOnly);
+}
+
+// UpdateWindows only reaches windows that currently show a guest
+// controller's view. Alien Space Retro takes its menu controller's view off
+// the window for each level, so a portrait-hosted game turned to the other
+// landscape side mid-level was never turned (and never told). The scene
+// stays portrait while hosted, so nothing else turns it either: turn the
+// hosted window to the device's side here when the guest accepts that side.
+// lc32_updateToInterfaceOrientation then announces it to the guest.
+void FollowDeviceWhileHosted(UIInterfaceOrientation orientation) {
+    if(!startupFinished || !pthread_main_np() ||
+            !UIInterfaceOrientationIsLandscape(orientation)) return;
+    const UIInterfaceOrientation hosted =
+        (UIInterfaceOrientation)LC32UIKitPortraitHostedStatusBarOrientation();
+    if(!UIInterfaceOrientationIsLandscape(hosted) || hosted == orientation) return;
+    static SEL update = sel_registerName("_updateToInterfaceOrientation:duration:force:");
+    static SEL shouldAutorotate = sel_registerName(
+        "_shouldAutorotateToInterfaceOrientation:checkForDismissal:isRotationDisabled:");
+    for(UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if(![scene isKindOfClass:UIWindowScene.class] ||
+                UIInterfaceOrientationIsLandscape(
+                    ((UIWindowScene *)scene).interfaceOrientation)) continue;
+        for(UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if(!LC32UIKitWindowIsPortraitHosted(window)) continue;
+            UIViewController *root = NativeRoot(window);
+            UIViewController *content =
+                root ? LC32NativeLegacyRotationContentController(root) : nil;
+            if(!content || !RegisteredClass(object_getClass(content)) ||
+                    NativePresented(root) || ![window respondsToSelector:update]) continue;
+            if(WindowOrientation(window) == orientation) {
+                // Already turned (by UpdateWindows, or while the guest could
+                // not be called): at most the announcement is missing.
+                AnnounceHostedLandscapeTurn(window, orientation, 0);
+                continue;
+            }
+            // UpdateWindows already asked a guest whose view is on the
+            // window; its shouldAutorotate can have renderer side effects.
+            UIView *view = NativeView(content);
+            if(view && NativeWindow(view) == window) continue;
+            if(nativeRotationQuery) {
+                BOOL disabled = NO;
+                if(!nativeRotationQuery(window, shouldAutorotate, orientation, YES,
+                        &disabled) || disabled) continue;
+            }
+            if(UsesLegacyRotationPolicy(object_getClass(content)) &&
+                    !QueryRotation(window, content, orientation)) continue;
+            ((void (*)(id, SEL, UIInterfaceOrientation, NSTimeInterval, BOOL))objc_msgSend)(
+                window, update, orientation, 0, NO);
+        }
+    }
 }
 
 void InitializeDeviceOrientation() {
@@ -562,19 +657,36 @@ extern "C" void LC32PrepareNativeLegacyRotationClass(Class cls) {
             method_getTypeEncoding(class_getInstanceMethod(UIViewController.class, preferred)));
 }
 
-// The side last announced by willRotate, so each turn is announced once.
-static const void *AnnouncedOrientationKey = &AnnouncedOrientationKey;
+namespace {
+bool AnnounceWillRotate(UIViewController *controller, UIInterfaceOrientation orientation,
+        NSTimeInterval duration) {
+    if(!controller || !RegisteredClass(object_getClass(controller)) || !startupFinished ||
+            !LC32NativeLegacyRotationCanCallGuest()) return false;
+    NSNumber *announced = objc_getAssociatedObject(controller, AnnouncedOrientationKey);
+    if(announced && announced.integerValue == orientation) return false;
+    objc_setAssociatedObject(controller, AnnouncedOrientationKey, @(orientation),
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(controller, SyntheticDidRotateKey, nil,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [controller willRotateToInterfaceOrientation:orientation duration:duration];
+    return true;
+}
+
+// UIKit's own didRotate for a turn AnnounceHostedLandscapeTurn already
+// completed (its willRotate was deduplicated above).
+bool DidRotateAlreadyDelivered(UIViewController *controller) {
+    NSNumber *synthetic = objc_getAssociatedObject(controller, SyntheticDidRotateKey);
+    NSNumber *announced = objc_getAssociatedObject(controller, AnnouncedOrientationKey);
+    if(!synthetic || ![synthetic isEqual:announced]) return false;
+    objc_setAssociatedObject(controller, SyntheticDidRotateKey, nil,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return true;
+}
+} // namespace
 
 extern "C" void LC32NativeLegacyRotationWillRotate(UIViewController *root,
         UIInterfaceOrientation orientation, NSTimeInterval duration) {
-    UIViewController *controller = LC32NativeLegacyRotationContentController(root);
-    if(!controller || !RegisteredClass(object_getClass(controller)) || !startupFinished ||
-            !LC32NativeLegacyRotationCanCallGuest()) return;
-    NSNumber *announced = objc_getAssociatedObject(controller, AnnouncedOrientationKey);
-    if(announced && announced.integerValue == orientation) return;
-    objc_setAssociatedObject(controller, AnnouncedOrientationKey, @(orientation),
-        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [controller willRotateToInterfaceOrientation:orientation duration:duration];
+    AnnounceWillRotate(LC32NativeLegacyRotationContentController(root), orientation, duration);
 }
 
 extern "C" void LC32NativeLegacyRotationDidRotate(UIViewController *root,
@@ -728,7 +840,8 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
         oldSize:(CGSize)size {
     [self lc32_rotationWindow:window didRotateFromInterfaceOrientation:orientation oldSize:size];
     UIViewController *controller = LC32NativeLegacyRotationContentController(self);
-    if(RegisteredClass(object_getClass(controller)) && startupFinished && LC32NativeLegacyRotationCanCallGuest())
+    if(RegisteredClass(object_getClass(controller)) && startupFinished &&
+            LC32NativeLegacyRotationCanCallGuest() && !DidRotateAlreadyDelivered(controller))
         [controller didRotateFromInterfaceOrientation:orientation];
 }
 @end
@@ -810,10 +923,18 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
     if(legacy) ((void (*)(id, SEL))objc_msgSend)(self, refresh);
     const bool rotating = legacy && startupFinished && pthread_main_np() &&
         UIInterfaceOrientationIsLandscape(orientation) && WindowIsRotating(self);
+    const UIInterfaceOrientation before = legacy ? WindowOrientation(self)
+        : UIInterfaceOrientationUnknown;
     [self lc32_updateToInterfaceOrientation:orientation duration:duration force:force];
     if(legacy) ((void (*)(id, SEL))objc_msgSend)(self, refresh);
     if(rotating && WindowOrientation(self) != orientation)
         ResyncLandscapeSideAfterRotation(self);
+    if(legacy && startupFinished && pthread_main_np()) {
+        const UIInterfaceOrientation after = WindowOrientation(self);
+        if(UIInterfaceOrientationIsLandscape(after) && after != before &&
+                !UIInterfaceOrientationIsLandscape(self.windowScene.interfaceOrientation))
+            AnnounceHostedLandscapeTurn(self, after, duration);
+    }
     // The scene host can present its new orientation while guest loading is
     // busy. Publish the matching backing in this native update, not at the
     // deferred guest-startup boundary or the next automatic CA commit.
@@ -948,7 +1069,9 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 extern "C" void LC32NativeLegacyRotationFollowDevice(void) {
     // The enums use the same values (the landscape *names* are opposite).
     UIInterfaceOrientation orientation = (UIInterfaceOrientation)UIDevice.currentDevice.orientation;
-    if(OrientationBit(orientation)) UpdateWindows(orientation, false);
+    if(!OrientationBit(orientation)) return;
+    UpdateWindows(orientation, false);
+    FollowDeviceWhileHosted(orientation);
 }
 #else
 extern "C" bool LC32NativeLegacyRotationEnabled(void) { return false; }
