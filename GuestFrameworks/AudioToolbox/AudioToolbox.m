@@ -349,7 +349,6 @@ typedef struct LC32SilentAudioUnit {
 typedef struct {
     LC32SilentAudioUnit *unit;
     AudioStreamBasicDescription format;
-    AURenderCallbackStruct callback;
     AudioBufferList *bufferList;
     uint8_t *audioData;
     size_t audioBufferStride;
@@ -357,7 +356,6 @@ typedef struct {
     UInt32 numberFrames;
     LC32SilentAudioRenderNotify *renderNotifySnapshot;
     size_t renderNotifySnapshotCapacity;
-    LC32SilentAudioUnit *sourceMixer;
     AURenderCallbackStruct mixerCallbackSnapshot[
         LC32SilentAudioMaximumMixerBuses];
     AudioUnitParameterValue mixerLinearGainSnapshot[
@@ -512,15 +510,25 @@ static void LC32SilentAudioDestroyPump(LC32SilentAudioPump *pump) {
     free(pump);
 }
 
-/* Take one callback-list snapshot for the entire render cycle. Callbacks may
- * add or remove notifications reentrantly; retaining this snapshot through
- * both phases gives every pre-render notification its matching post-render
- * notification without invoking guest code while holding the unit mutex. */
-static size_t LC32SilentAudioSnapshotRenderNotifies(
-        LC32SilentAudioPump *pump) {
+/* Take one callback/source/notify snapshot for the entire render cycle.
+ * Callbacks may add or remove notifications or update the render callback
+ * reentrantly; retaining this snapshot through both phases gives every
+ * pre-render notification its matching post-render notification and keeps any
+ * connected mixer alive without invoking guest code while holding the mutex. */
+static size_t LC32SilentAudioSnapshotRenderState(
+        LC32SilentAudioPump *pump,
+        AURenderCallbackStruct *outCallback,
+        LC32SilentAudioUnit **outSourceMixer) {
+    if(outCallback) memset(outCallback, 0, sizeof(*outCallback));
+    if(outSourceMixer) *outSourceMixer = NULL;
     if(!pump || !pump->unit) return 0;
 
     pthread_mutex_lock(&pump->unit->mutex);
+    if(outCallback) *outCallback = pump->unit->renderCallback;
+    if(outSourceMixer && pump->unit->connectedMixer) {
+        LC32SilentAudioRetain(pump->unit->connectedMixer);
+        *outSourceMixer = pump->unit->connectedMixer;
+    }
     const size_t count = pump->unit->renderNotifyCount;
     if(count > pump->renderNotifySnapshotCapacity) {
         if(count > SIZE_MAX / sizeof(*pump->renderNotifySnapshot)) {
@@ -571,11 +579,13 @@ static void LC32SilentAudioInvokeRenderNotifies(
  * driven with the native bus number and buffer layout. */
 static OSStatus LC32SilentAudioRenderMixer(
         LC32SilentAudioPump *pump,
+        LC32SilentAudioUnit *mixer,
         AudioUnitRenderActionFlags *actionFlags,
         const AudioTimeStamp *timeStamp) {
-    LC32SilentAudioUnit *mixer = pump ? pump->sourceMixer : NULL;
-    if(!mixer || !actionFlags || !timeStamp)
+    if(!pump || !mixer || !actionFlags || !timeStamp)
         return kAudio_ParamError;
+    if(!pump->mixerInputData || !pump->mixerInputDataBytes)
+        return kAudioUnitErr_Uninitialized;
 
     pthread_mutex_lock(&mixer->mutex);
     if(mixer->magic != LC32SilentAudioUnitMagic ||
@@ -706,14 +716,11 @@ static LC32SilentAudioPump *LC32SilentAudioCreatePump(
     }
 
     LC32SilentAudioUnit *sourceMixer = unit->connectedMixer;
-    if(!unit->renderCallback.inputProc && !sourceMixer) return NULL;
 
     LC32SilentAudioPump *pump = calloc(1, sizeof(*pump));
     if(!pump) return NULL;
     pump->unit = unit;
     pump->format = unit->format;
-    pump->callback = unit->renderCallback;
-    pump->sourceMixer = sourceMixer;
     pump->numberFrames = LC32SilentAudioRenderFrames(&pump->format);
     pump->numberBuffers =
         (pump->format.mFormatFlags & kAudioFormatFlagIsNonInterleaved)
@@ -790,8 +797,10 @@ static void *LC32SilentAudioPumpMain(void *context) {
         AudioTimeStamp timeStamp = {0};
         timeStamp.mSampleTime = sampleTime;
         timeStamp.mFlags = kAudioTimeStampSampleTimeValid;
-        const size_t notifyCount =
-            LC32SilentAudioSnapshotRenderNotifies(pump);
+        AURenderCallbackStruct callback = {0};
+        LC32SilentAudioUnit *sourceMixer = NULL;
+        const size_t notifyCount = LC32SilentAudioSnapshotRenderState(
+            pump, &callback, &sourceMixer);
         LC32SilentAudioInvokeRenderNotifies(
             pump->renderNotifySnapshot, notifyCount, &actionFlags,
             kAudioUnitRenderAction_PreRender, &timeStamp, 0,
@@ -799,13 +808,19 @@ static void *LC32SilentAudioPumpMain(void *context) {
         actionFlags &= ~(kAudioUnitRenderAction_PreRender |
             kAudioUnitRenderAction_PostRender |
             kAudioUnitRenderAction_PostRenderError);
-        const OSStatus renderStatus = pump->sourceMixer
-            ? LC32SilentAudioRenderMixer(
-                pump, &actionFlags, &timeStamp)
-            : pump->callback.inputProc(
-                pump->callback.inputProcRefCon,
+        OSStatus renderStatus = noErr;
+        if(sourceMixer) {
+            renderStatus = LC32SilentAudioRenderMixer(
+                pump, sourceMixer, &actionFlags, &timeStamp);
+            LC32SilentAudioRelease(sourceMixer);
+        } else if(callback.inputProc) {
+            renderStatus = callback.inputProc(
+                callback.inputProcRefCon,
                 &actionFlags, &timeStamp, 0, pump->numberFrames,
                 pump->bufferList);
+        } else {
+            actionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        }
         if(renderStatus == noErr) {
             LC32SilentAudioApplyOutputVolume(pump, &actionFlags);
         }
@@ -1078,13 +1093,14 @@ static OSStatus LC32AudioUnitSetProperty(AudioUnit inUnit, AudioUnitPropertyID i
             LC32SilentAudioRelease(oldMixer);
             return noErr;
         }
+        /* RemoteIO accepts SetRenderCallback on Global or Input bus 0 both
+         * before and after AudioUnitInitialize (CRI ADX initializes RemoteIO
+         * before installing its render callback). */
         if(inID == kAudioUnitProperty_SetRenderCallback &&
-           inScope == kAudioUnitScope_Global && inElement == 0 &&
+           (inScope == kAudioUnitScope_Global ||
+            inScope == kAudioUnitScope_Input) &&
+           inElement == 0 &&
            inDataSize == sizeof(silent->renderCallback)) {
-            if(silent->initialized || silent->renderThreadJoinable) {
-                pthread_mutex_unlock(&silent->mutex);
-                return kAudioUnitErr_Initialized;
-            }
             memcpy(&silent->renderCallback, inData,
                 sizeof(silent->renderCallback));
             LC32SilentAudioUnit *oldMixer =
@@ -1520,8 +1536,6 @@ OSStatus AudioUnitInitialize(AudioUnit inUnit) {
         return noErr;
     }
     if(silent->kind != LC32SilentAudioUnitKindRemoteIO ||
-       (!silent->renderCallback.inputProc &&
-        !silent->connectedMixer) ||
        !LC32SilentAudioFormatIsValid(&silent->format)) {
         pthread_mutex_unlock(&silent->mutex);
         return kAudioUnitErr_InvalidPropertyValue;

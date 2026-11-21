@@ -752,13 +752,39 @@ void LC32InstallLegacyMoviePlayerPlayingNotification() {
  * main-menu movie, which carries the menu buttons, to its EAGLView, so the
  * menu showed over black. Host such a player in the nearest controller up
  * the responder chain, and keep the movie under the app's own subviews.
+ *
+ * Current MediaPlayer's _MPMoviePlayerProxyView also forwards its own frame
+ * (including a non-zero origin) to its child AVPlayerView, which shifts the
+ * video inside the proxy view whenever an app positions moviePlayer.view at a
+ * non-zero origin (e.g. Ace Combat Xi sets frame (-80, 80, 480, 320) before
+ * rotating it 90 degrees into a 320x480 window). Keep AVPlayerView aligned to
+ * the proxy view's bounds.
  */
+Class LC32MovieProxyClass;
 IMP LC32OriginalMovieProxyUpdateContainment;
+IMP LC32OriginalMovieProxyLayoutSubviews;
 
 bool LC32ViewIsControllerRootView(UIView *view) {
     UIResponder *next = view.nextResponder;
     return [next isKindOfClass:UIViewController.class] &&
         [(UIViewController *)next viewIfLoaded] == view;
+}
+
+void LC32FitMovieProxyPlaybackView(UIView *self, id player) {
+    if(!player && [self respondsToSelector:@selector(controller)]) {
+        player = ((id (*)(id, SEL))objc_msgSend)(self, @selector(controller));
+    }
+    UIViewController *playback =
+        [player respondsToSelector:@selector(playerViewController)]
+        ? ((UIViewController *(*)(id, SEL))objc_msgSend)(
+            player, @selector(playerViewController)) : nil;
+    UIView *playbackView = playback.viewIfLoaded;
+    if(playbackView && playbackView.superview == self) {
+        if(!CGRectEqualToRect(playbackView.frame, self.bounds))
+            playbackView.frame = self.bounds;
+        if(self.subviews.firstObject != playbackView)
+            [self sendSubviewToBack:playbackView];
+    }
 }
 
 void LC32LegacyMovieProxyUpdateContainment(UIView *self, SEL cmd,
@@ -785,23 +811,37 @@ void LC32LegacyMovieProxyUpdateContainment(UIView *self, SEL cmd,
     }
     ((void (*)(id, SEL, id, id))LC32OriginalMovieProxyUpdateContainment)(
         self, cmd, window, superview);
-    UIViewController *playback =
-        [player respondsToSelector:@selector(playerViewController)]
-        ? ((UIViewController *(*)(id, SEL))objc_msgSend)(
-            player, @selector(playerViewController)) : nil;
-    UIView *playbackView = playback.viewIfLoaded;
-    if(playbackView && playbackView.superview == self &&
-            self.subviews.firstObject != playbackView)
-        [self sendSubviewToBack:playbackView];
+    LC32FitMovieProxyPlaybackView(self, player);
+}
+
+void LC32LegacyMovieProxyLayoutSubviews(UIView *self, SEL cmd) {
+    if(LC32OriginalMovieProxyLayoutSubviews) {
+        ((void (*)(id, SEL))LC32OriginalMovieProxyLayoutSubviews)(self, cmd);
+    } else if(LC32MovieProxyClass) {
+        struct objc_super sup = {self, class_getSuperclass(LC32MovieProxyClass)};
+        ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, cmd);
+    }
+    LC32FitMovieProxyPlaybackView(self, nil);
 }
 
 void LC32InstallLegacyMovieProxyHook() {
+    Class proxyClass = NSClassFromString(@"_MPMoviePlayerProxyView");
     Method update = class_getInstanceMethod(
-        NSClassFromString(@"_MPMoviePlayerProxyView"),
+        proxyClass,
         NSSelectorFromString(@"_updateContainmentInWindow:superview:"));
-    if(!update || LC32OriginalMovieProxyUpdateContainment) return;
+    if(!proxyClass || !update || LC32OriginalMovieProxyUpdateContainment) return;
+    LC32MovieProxyClass = proxyClass;
     LC32OriginalMovieProxyUpdateContainment = method_setImplementation(
         update, (IMP)LC32LegacyMovieProxyUpdateContainment);
+    Method layout = class_getInstanceMethod(proxyClass, @selector(layoutSubviews));
+    if(layout) {
+        if(!class_addMethod(proxyClass, @selector(layoutSubviews),
+                (IMP)LC32LegacyMovieProxyLayoutSubviews,
+                method_getTypeEncoding(layout))) {
+            LC32OriginalMovieProxyLayoutSubviews = method_setImplementation(
+                layout, (IMP)LC32LegacyMovieProxyLayoutSubviews);
+        }
+    }
 }
 
 void LC32InstallLegacyMoviePlayerStopHooks() {

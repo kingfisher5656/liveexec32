@@ -329,5 +329,62 @@ int main(void) {
         AudioUnitUninitialize(unit));
     passed &= report_status("audio-unit-output-dispose",
         AudioComponentInstanceDispose(unit));
+
+    /* CRI ADX (e.g. Ace Combat Xi) initializes RemoteIO before installing its
+     * render callback. Verify post-initialize SetRenderCallback on both Global
+     * and Input scopes. */
+    AudioUnit lateUnit = NULL;
+    passed &= report_status("audio-unit-output-late-new",
+        AudioComponentInstanceNew(component, &lateUnit));
+    if(lateUnit) {
+        OutputState lateState = {
+            .unit = lateUnit,
+            .callbackValid = 1,
+            .reentrantStopAttempted = 1,
+        };
+        AURenderCallbackStruct lateCallback = {
+            .inputProc = render_callback,
+            .inputProcRefCon = &lateState,
+        };
+        passed &= report_status("audio-unit-output-late-format",
+            AudioUnitSetProperty(lateUnit, kAudioUnitProperty_StreamFormat,
+                kAudioUnitScope_Input, 0, &format, sizeof(format)));
+        passed &= report_status("audio-unit-output-late-initialize",
+            AudioUnitInitialize(lateUnit));
+        passed &= report_status("audio-unit-output-late-callback-global",
+            AudioUnitSetProperty(lateUnit, kAudioUnitProperty_SetRenderCallback,
+                kAudioUnitScope_Global, 0, &lateCallback, sizeof(lateCallback)));
+        passed &= report_status("audio-unit-output-late-start-global",
+            AudioOutputUnitStart(lateUnit));
+        usleep(200000);
+        passed &= report_status("audio-unit-output-late-stop-global",
+            AudioOutputUnitStop(lateUnit));
+        const uint32_t lateGlobalCount = lateState.callbackCount;
+        const int lateGlobalRendered = lateState.callbackValid &&
+            lateGlobalCount >= 1;
+        passed &= lateGlobalRendered;
+        printf("audio-unit-output-late-global-rendered: %s (callbacks=%u)\n",
+            lateGlobalRendered ? "PASS" : "FAIL", (unsigned)lateGlobalCount);
+
+        passed &= report_status("audio-unit-output-late-callback-input",
+            AudioUnitSetProperty(lateUnit, kAudioUnitProperty_SetRenderCallback,
+                kAudioUnitScope_Input, 0, &lateCallback, sizeof(lateCallback)));
+        passed &= report_status("audio-unit-output-late-start-input",
+            AudioOutputUnitStart(lateUnit));
+        usleep(200000);
+        passed &= report_status("audio-unit-output-late-stop-input",
+            AudioOutputUnitStop(lateUnit));
+        const uint32_t lateInputCount = lateState.callbackCount;
+        const int lateInputRendered = lateState.callbackValid &&
+            lateInputCount > lateGlobalCount;
+        passed &= lateInputRendered;
+        printf("audio-unit-output-late-input-rendered: %s (callbacks=%u)\n",
+            lateInputRendered ? "PASS" : "FAIL", (unsigned)lateInputCount);
+
+        passed &= report_status("audio-unit-output-late-uninitialize",
+            AudioUnitUninitialize(lateUnit));
+        passed &= report_status("audio-unit-output-late-dispose",
+            AudioComponentInstanceDispose(lateUnit));
+    }
     return !passed;
 }

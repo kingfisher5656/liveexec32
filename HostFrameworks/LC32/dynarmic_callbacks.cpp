@@ -485,6 +485,22 @@ public:
             {0x11105094, 0xbf00bdb0, 0xaf01b590, 0x8b02ed2d, 0x47702001,
              "9mm uses its 16:9 layouts on the 3x widescreen canvas",
              NineMMWidescreenCanvasAboveRetina},
+            /*
+             * Ace Combat Xi 1.1.3 (ARM, not slid): -[EAGLView MemoryClean]
+             * (0x5d37c), called once from applicationDidFinishLaunching:,
+             * purges memory the 2010 way: it allocates and zeroes
+             * (hw.memsize - 2*wired - active - inactive) / 256000 blocks of
+             * 256000 bytes, then frees them all. It reads hw.memsize into 4
+             * bytes and treats host_statistics counts as 4 KiB pages, so on
+             * a modern phone (6 GiB, 16 KiB pages) the count is thousands:
+             * on an iPhone 14 Pro the loop ran ~60 s with no frame drawn and
+             * pushed the app to 3.2 GB. The purge buys nothing here. Store
+             * r11 (zeroed at 0x5d3ac) as the block limit instead of the
+             * quotient: "str r3, [r5, r12]" -> "str r11, [r5, r12]", so the
+             * loop takes its minimum two blocks and frees them.
+             */
+            {0x0005d464, 0xe1a03723, 0xe785300c, 0xe59f30c0, 0xe785b00c,
+             "Ace Combat Xi skips its startup memory purge"},
         };
         constexpr size_t fixCount = sizeof(fixes) / sizeof(fixes[0]);
         static std::atomic<bool> logged[fixCount];
