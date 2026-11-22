@@ -29,6 +29,11 @@ struct LC32GameProfile {
      * 320x568 canvas under native legacy rotation (see
      * LC32BundleUsesNativeTallLandscapePhoneCanvas). */
     bool tallPhoneCanvas;
+    /* The landscape-only root controller's view is the GL view itself and the
+     * engine draws a landscape picture without turning it, relying on UIKit
+     * to turn and resize that root (as iOS 6+ does for every such root; see
+     * LC32LegacyPhoneCanvasGeometryMode). Gives it the landscape canvas. */
+    bool landscapeGLRoot;
 };
 
 inline const LC32GameProfile *LC32CurrentGameProfile() {
@@ -39,6 +44,10 @@ inline const LC32GameProfile *LC32CurrentGameProfile() {
         /* DJMAX Ray: lays out for 568 points only on a screen exactly 568
          * tall; elsewhere it draws a 480x320 picture into a corner. */
         { "com.neowizInternet.game.djmaxray", nullptr, 0, 0, true },
+        /* RAGE HD (SDK 4.2): EAGLView root of a landscape-only controller,
+         * drawn with a 480x320 projection; the portrait canvas showed its
+         * menu sideways and squeezed. */
+        { "com.idsoftware.ragehd", nullptr, 0, 0, false, true },
     };
     static const LC32GameProfile none = {};
     static std::atomic<const LC32GameProfile *> cached{nullptr};
@@ -108,4 +117,13 @@ inline bool LC32GameProfileTallPhoneCanvas() {
         return forced[0] == '1';
     const LC32GameProfile *profile = LC32CurrentGameProfile();
     return profile && profile->tallPhoneCanvas;
+}
+
+/* LC32_LANDSCAPE_GL_ROOT=1 tries the landscape canvas for a pre-iOS-6 GL
+ * root on another game; =0 turns it off. */
+inline bool LC32GameProfileLandscapeGLRoot() {
+    if(const char *forced = getenv("LC32_LANDSCAPE_GL_ROOT"))
+        return forced[0] == '1';
+    const LC32GameProfile *profile = LC32CurrentGameProfile();
+    return profile && profile->landscapeGLRoot;
 }

@@ -3516,6 +3516,20 @@ LC32LegacyIPadGeometryMode LC32LegacyPhoneCanvasGeometryMode(
         LC32NativeViewIfLoaded(controller, &contentView) && contentView;
     objc_setAssociatedObject(controller, &LC32PhoneCanvasGeometryGuessKey,
         loaded ? nil : @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if(loaded && LC32GameProfileLandscapeGLRoot()) {
+        /* iOS 4 turned and resized a landscape-only root controller's view
+         * even when it was the GL view itself (as iOS 6+ does below). RAGE
+         * HD draws a 480x320 picture unturned and relies on that; most
+         * older GL roots rotate in their projection instead, so this is a
+         * per-game opt-in rather than a rule for every pre-iOS-6 root. */
+        static Class eaglLayerClass = NSClassFromString(@"CAEAGLLayer");
+        if([LC32NativeViewLayer(contentView) isKindOfClass:eaglLayerClass] &&
+                !(LC32GuestInterfacePolicy().declaredOrientations &
+                  (UIInterfaceOrientationMaskPortrait |
+                   UIInterfaceOrientationMaskPortraitUpsideDown))) {
+            return LC32LegacyIPadGeometryModePreservePhoneLandscapeCanvas;
+        }
+    }
     if(loaded) {
         const CGRect bounds = LC32NativeViewBounds(contentView);
         const CGFloat shortEdge = MIN(
@@ -3683,6 +3697,101 @@ static void LC32CoverLegacyWindowWithRootView(UIWindow *window,
         CGRectGetMidX(windowBounds), CGRectGetMidY(windowBounds)));
 }
 
+/* The canvas container's black view covers the whole window, so the guest
+ * window's own background (white from RAGE HD's MainWindow.nib) never shows
+ * until a full-screen presentation takes the container off screen: then it
+ * fills the letterbox around the 480x320 presented view (RAGE HD's intro
+ * movie controller). On iPhone OS the presentation covered the whole screen.
+ * Refits run during presentations, so a later guest change is undone too.
+ * A container cleared for sibling renderers (see above) lets the window
+ * colour show inside the canvas, so that layout keeps the guest's colour. */
+static void LC32BlackenPhoneCanvasWindowBackdrop(
+        UIWindow *window, LC32LegacyIPadContainerController *container) {
+    using Getter = UIColor *(*)(id, SEL);
+    using Setter = void (*)(id, SEL, UIColor *);
+    static Getter getter = reinterpret_cast<Getter>(
+        class_getMethodImplementation(UIWindow.class,
+                                      @selector(backgroundColor)));
+    static Setter setter = reinterpret_cast<Setter>(
+        class_getMethodImplementation(UIWindow.class,
+                                      @selector(setBackgroundColor:)));
+    UIColor *black = UIColor.blackColor;
+    if(!window || !container.isViewLoaded ||
+            ![container.view.backgroundColor isEqual:black] ||
+            [getter(window, @selector(backgroundColor)) isEqual:black])
+        return;
+    setter(window, @selector(setBackgroundColor:), black);
+}
+
+/* UIKit's legacy presentation path (UIWindowController, guest SDK < 8) turns
+ * a full-screen presented view a quarter and centres it from its own idea of
+ * the window. When the scene is already landscape as the presentation starts
+ * (the phone held sideways at launch), that centre comes out mirrored,
+ * (673,437) instead of (201,437) in an 874x402 scene, and RAGE HD's intro
+ * movie played entirely off screen. Centre such views on the scene's centre
+ * converted into the window, which is (201,437) for both launch sides (the
+ * screen space and LC32LegacyViewportInView give (-35,201) here). Native
+ * getters keep this refit path out of guest code. */
+static void LC32CenterPresentedViewsOnPhoneCanvas(UIWindow *window) {
+    LC32LegacyIPadContainerController *container =
+        LC32LegacyContainerForWindow(window);
+    UIWindowScene *scene = window.windowScene;
+    if(!container || !scene ||
+            !LC32GeometryModePreservesPhoneCanvas(container.geometryMode))
+        return;
+    const CGRect sceneBounds = scene.coordinateSpace.bounds;
+    if(!(sceneBounds.size.width > 0) || !(sceneBounds.size.height > 0)) return;
+    const CGPoint target = [window convertPoint:CGPointMake(
+            CGRectGetMidX(sceneBounds), CGRectGetMidY(sceneBounds))
+        fromCoordinateSpace:scene.coordinateSpace];
+    if(!isfinite(target.x) || !isfinite(target.y)) return;
+
+    using ObjectGetter = id (*)(id, SEL);
+    using FlagGetter = BOOL (*)(id, SEL);
+    using StyleGetter = UIModalPresentationStyle (*)(id, SEL);
+    static ObjectGetter nextResponder = reinterpret_cast<ObjectGetter>(
+        class_getMethodImplementation(UIView.class, @selector(nextResponder)));
+    static ObjectGetter presenting = reinterpret_cast<ObjectGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(presentingViewController)));
+    static FlagGetter beingPresented = reinterpret_cast<FlagGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(isBeingPresented)));
+    static FlagGetter beingDismissed = reinterpret_cast<FlagGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(isBeingDismissed)));
+    static StyleGetter presentationStyle = reinterpret_cast<StyleGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(modalPresentationStyle)));
+    const CGAffineTransform quarterTurns[] = {
+        CGAffineTransformMake(0, 1, -1, 0, 0, 0),
+        CGAffineTransformMake(0, -1, 1, 0, 0, 0),
+    };
+    UIView *containerView = container.isViewLoaded ? container.view : nil;
+    for(UIView *child in LC32NativeViewSubviews(window)) {
+        if(child == containerView) continue;
+        const CGAffineTransform transform = LC32NativeViewTransform(child);
+        if(!LC32TransformNearlyEquals(transform, quarterTurns[0]) &&
+                !LC32TransformNearlyEquals(transform, quarterTurns[1]))
+            continue;
+        id next = nextResponder(child, @selector(nextResponder));
+        if(!next || !LC32ClassIsUIViewController(object_getClass(next)) ||
+                !presenting(next, @selector(presentingViewController)) ||
+                beingPresented(next, @selector(isBeingPresented)) ||
+                beingDismissed(next, @selector(isBeingDismissed)) ||
+                presentationStyle(next, @selector(modalPresentationStyle)) !=
+                    UIModalPresentationFullScreen)
+            continue;
+        const CGPoint center = LC32NativeViewCenter(child);
+        if(fabs(center.x - target.x) < 0.5 && fabs(center.y - target.y) < 0.5)
+            continue;
+        LC32NativeSetViewCenter(child, target);
+        fprintf(stderr, "LC32: presented %s centred on the phone canvas "
+            "(%.0f,%.0f -> %.0f,%.0f)\n", object_getClassName(next),
+            center.x, center.y, target.x, target.y);
+    }
+}
+
 void LC32ScaleLegacyIPadWindow(UIWindow *window) {
     /* UIKit owns keyboard, alert, and text-effects windows in the same
      * process. Virtualize only a UIWindow paired with a guest object. */
@@ -3742,6 +3851,8 @@ void LC32ScaleLegacyIPadWindow(UIWindow *window) {
             window, container.view);
         [container fitGuestContentForViewport:viewport
             hostOrientation:orientation];
+        LC32BlackenPhoneCanvasWindowBackdrop(window, container);
+        LC32CenterPresentedViewsOnPhoneCanvas(window);
         return;
     }
     if(container && container.geometryMode ==
@@ -3760,6 +3871,8 @@ void LC32ScaleLegacyIPadWindow(UIWindow *window) {
             window, container.view);
         [container fitGuestContentForViewport:viewport
             hostOrientation:orientation];
+        LC32BlackenPhoneCanvasWindowBackdrop(window, container);
+        LC32CenterPresentedViewsOnPhoneCanvas(window);
         return;
     }
     if(!LC32GuestNeedsLegacyIPadCanvas()) return;
@@ -6773,6 +6886,14 @@ static void LC32TransitionViewDidComplete(id self, SEL cmd, id transitionView,
     }
     if([toView isKindOfClass:UIView.class])
         LC32FitPresentedViewInRootlessIPadWindow(toView);
+    if([toView isKindOfClass:UIView.class]) {
+        /* The presented controller still reports isBeingPresented here;
+         * check again once the presentation has finished. */
+        UIWindow *window = LC32NativeViewWindow(toView);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LC32CenterPresentedViewsOnPhoneCanvas(window);
+        });
+    }
     if([toView isKindOfClass:UIView.class]) {
         if(LC32ViewIsInTurnedFullScreenRootlessWindow(toView) &&
                 LC32RestoreMoviePresenterAfterTransition(toView)) {

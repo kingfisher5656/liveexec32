@@ -5055,7 +5055,14 @@ ssize_t guest_readlink(u32 guest_pathname, u32 guest_buf, size_t bufsiz) {
 }
 
 int guest_munmap(u32 guest_addr, size_t len) {
-    int result = Dynarmic_munmap(guest_addr, len);
+    /*
+     * XNU's munmap only requires a page-aligned address: the length goes to
+     * mach_vm_deallocate, which rounds it up to whole pages. Games unmap
+     * whole-file mappings with the file's byte size (RAGE HD's FileUnmap
+     * calls exit(-1) when that fails), matching guest_mmap's rounding.
+     * Unaligned addresses and a zero length stay EINVAL.
+     */
+    int result = Dynarmic_munmap(guest_addr, ALIGN_DYN_SIZE(len));
     if(result == -1) {
         threadHandle.cpsr->setCarry(true);
         return errno;
