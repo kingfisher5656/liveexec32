@@ -699,6 +699,9 @@ struct LC32HostWeakMappingEntry {
     LC32NativeWeakSlot weakHostObject;
     bool weakCompatible;
     bool invocationRetainCompatible;
+    /* Diagnostics only: the native class name at publication. LiveExec32
+     * never disposes classes, so the runtime's string outlives the entry. */
+    const char *hostClassName;
     /* Only ordinary/logical guest decrements acquire this private gate.
      * Native weak RR and guest weak-retain callbacks never take it. */
     std::mutex nativeProxyReleaseMutex;
@@ -712,7 +715,8 @@ struct LC32HostWeakMappingEntry {
           retirementProvenance(
               LC32HostMappingRetirementProvenance::None),
           weakHostObject(nil), weakCompatible(false),
-          invocationRetainCompatible(true) {
+          invocationRetainCompatible(true),
+          hostClassName(class_getName(object_getClass(hostObject))) {
         /* NSAutoreleasePool uses its object as a one-shot pool token. A
          * balanced retain/release around -init or -drain can pop that token
          * early on modern Foundation, so its guest owner remains the call
@@ -863,6 +867,7 @@ static u64 LC32PublishHostMapping(
     u64 publishedGeneration = generation;
     bool rejectedStableReplacement = false;
     u64 rejectedHostAddress = 0;
+    const char *rejectedHostClassName = nullptr;
     LC32HostMappingLifetime rejectedLifetime =
         LC32HostMappingLifetime::Provisional;
     {
@@ -909,6 +914,7 @@ static u64 LC32PublishHostMapping(
             rejectedStableReplacement = true;
             rejectedHostAddress =
                 iterator->second->expectedHostAddress;
+            rejectedHostClassName = iterator->second->hostClassName;
             rejectedLifetime = iterator->second->lifetime;
             publishedGeneration = 0;
             unused = std::move(entry);
@@ -925,12 +931,14 @@ static u64 LC32PublishHostMapping(
     if(rejectedStableReplacement) {
         fprintf(stderr,
             "LC32: refusing to replace %s host mapping for guest 0x%x "
-            "(old host 0x%llx, new host 0x%llx)\n",
+            "(old host 0x%llx %s, new host 0x%llx %s)\n",
             rejectedLifetime == LC32HostMappingLifetime::Pinned
                 ? "pinned" : "permanent",
             guestObject,
             (unsigned long long)rejectedHostAddress,
-            (unsigned long long)(u64)hostObject);
+            rejectedHostClassName ?: "?",
+            (unsigned long long)(u64)hostObject,
+            class_getName(object_getClass(hostObject)));
     }
     LC32DeferHostWeakEntryRelease(std::move(unused));
     LC32DeferHostWeakEntryRelease(std::move(replaced));
@@ -1599,6 +1607,8 @@ static bool LC32DetachRetiringGuestKey(u32 guestObject) {
     return true;
 }
 
+static void LC32ForgetDirectlyDeallocatedGuest(u32 guestObject);
+
 extern "C" u32 LC32UpdateHostMapping(
         u32 guestObject, LC32HostMappingOperation operation,
         u64 hostObject) {
@@ -1625,6 +1635,7 @@ extern "C" u32 LC32UpdateHostMapping(
             return LC32FinishGuestMappingTeardown(
                 guestObject, static_cast<u32>(hostObject), true);
         case LC32HostMappingGuestRootDealloc:
+            LC32ForgetDirectlyDeallocatedGuest(guestObject);
             return LC32DetachRetiringGuestKey(guestObject);
         case LC32HostMappingReleaseNativeProxy:
             return LC32ReleaseNativeProxyOwnership(
@@ -5058,6 +5069,7 @@ static u64 LC32InvokeGuestSelectorRaw(id self, SEL _cmd,
 }
 
 static u8 *LC32GuestMirrorRetiringState(id hostObject);
+static bool LC32GuestMirrorIsRetiring(id hostObject);
 
 static bool LC32SelectorIsInitFamily(SEL selector) {
     const char *name = selector ? sel_getName(selector) : nullptr;
@@ -5368,6 +5380,9 @@ extern "C" u64 LC32InvokeGuestSelectorScalarFrame(
     const u32 guestSelector = registered
         ? guest_sel_registerName(sel_getName(selector))
         : LC32LookupGuestSelectorMapping(selector);
+    /* A mirror whose guest object was destroyed by a direct -dealloc keeps
+     * receiving native callbacks; answer them like a nil receiver. */
+    if(!guestSelf && LC32GuestMirrorIsRetiring(self)) return 0;
     if(!guestSelf || !guestSelector) {
         [NSException raise:NSInternalInconsistencyException
             format:@"LC32: missing guest scalar callback target for %s", sel_getName(selector)];
@@ -5718,24 +5733,32 @@ static void LC32WriteGuestScalarIvar(
     }
 }
 
+/* A retired mirror (its guest object was destroyed by a direct -dealloc)
+ * has no guest receiver; its synthesized ivar accessors act on nil. */
 void LC32SetGuestScalarIvar(id self, SEL _cmd, u64 value) {
     LC32GuestIvarBinding binding;
     if(!LC32GuestIvarBindingForReceiver(self, _cmd, &binding)) return;
-    LC32WriteGuestScalarIvar([self guest_self], binding, value);
+    const u32 guestSelf = [self guest_self];
+    if(!guestSelf) return;
+    LC32WriteGuestScalarIvar(guestSelf, binding, value);
 }
 
 void LC32SetGuestNSObjectIvar(id self, SEL _cmd, id value) {
     LC32GuestIvarBinding binding;
     if(!LC32GuestIvarBindingForReceiver(self, _cmd, &binding)) return;
+    const u32 guestSelf = [self guest_self];
+    if(!guestSelf) return;
     guest_object_setInstanceVariableWithStrongDefault(
-        [self guest_self], binding.name.c_str(), (u32)(u64)[value guest_self]);
+        guestSelf, binding.name.c_str(), (u32)(u64)[value guest_self]);
 }
 
 id LC32GetGuestNSObjectIvar(id self, SEL _cmd) {
     LC32GuestIvarBinding binding;
     if(!LC32GuestIvarBindingForReceiver(self, _cmd, &binding)) return nil;
+    const u32 guestSelf = [self guest_self];
+    if(!guestSelf) return nil;
     u32 guestValue = 0;
-    guest_object_getInstanceVariable([self guest_self], binding.name.c_str(),
+    guest_object_getInstanceVariable(guestSelf, binding.name.c_str(),
                                      &guestValue);
     if(!guestValue) return nil;
     /* Resolve the guest object to its native peer (creating one if needed). */
@@ -5745,7 +5768,9 @@ id LC32GetGuestNSObjectIvar(id self, SEL _cmd) {
 u64 LC32GetGuestScalarIvar(id self, SEL _cmd) {
     LC32GuestIvarBinding binding;
     if(!LC32GuestIvarBindingForReceiver(self, _cmd, &binding)) return 0;
-    return LC32ReadGuestScalarIvar([self guest_self], binding);
+    const u32 guestSelf = [self guest_self];
+    if(!guestSelf) return 0;
+    return LC32ReadGuestScalarIvar(guestSelf, binding);
 }
 
 // Native KVC uses FP registers for these accessors, unlike the integer IMPs.
@@ -6758,6 +6783,152 @@ static void LC32ClearGuestSelfIfEqual(id hostObject,
         LC32ClearGuestSelfIfEqualWhileSynchronized(
             hostObject, expectedGuestObject);
     }
+}
+
+/* Guest code may send -dealloc directly instead of releasing its last
+ * reference: RAGE HD's -[CobaltAppDelegate MovieFinished] does this to its
+ * presented movie controller, which iOS 4 tolerated. Root -dealloc then runs
+ * while the pair is still Live, because no release reached zero and began a
+ * coordinated teardown. The ARM32 allocation is freed as soon as this returns,
+ * so forget the pair first. Otherwise the native lifetime pin later releases
+ * whatever object reuses that address, and publishing a new peer there is
+ * refused as a pinned replacement (an abort in setHost_self:).
+ *
+ * The native peer is detached, never released: it keeps the references the
+ * guest had paired with it, as a dangling owner would leave a native object.
+ * A synthesized mirror is also marked retiring so that it neither resolves
+ * nor recreates a guest receiver, and releases natively from now on. */
+static void LC32ForgetDirectlyDeallocatedGuest(u32 guestObject) {
+    if(!guestObject) return;
+
+    const auto isLiveDetachable =
+            [guestObject](const std::shared_ptr<LC32HostWeakMappingEntry> &
+                              candidate) {
+        LC32HostWeakRegistry &registry = LC32HostWeakMappings();
+        auto iterator = registry.entries.find(guestObject);
+        return iterator != registry.entries.end() &&
+            (!candidate || (iterator->second.get() == candidate.get() &&
+                            iterator->second->generation ==
+                                candidate->generation)) &&
+            iterator->second->state == LC32HostWeakMappingState::Live &&
+            iterator->second->lifetime !=
+                LC32HostMappingLifetime::Permanent &&
+            iterator->second->weakCompatible &&
+            iterator->second->invocationRetainCompatible;
+    };
+
+    std::shared_ptr<LC32HostWeakMappingEntry> entry;
+    {
+        LC32HostWeakRegistry &registry = LC32HostWeakMappings();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        if(!isLiveDetachable(nullptr)) return;
+        entry = registry.entries.find(guestObject)->second;
+    }
+
+    /* Never touch a raw native address before an atomic weak promotion. A
+     * failed promotion means native teardown already owns this pair. */
+    LC32HostInvocationReceiverGuard nativeGuard;
+    id __unsafe_unretained hostObject = LC32LoadWeakRetainedHostObject(
+        &entry->weakHostObject, (id)(uintptr_t)entry->expectedHostAddress);
+    if(!hostObject) {
+        LC32DeferHostWeakEntryRelease(std::move(entry));
+        return;
+    }
+    (void)nativeGuard.adoptRetained(hostObject);
+    if((u64)hostObject != entry->expectedHostAddress) {
+        LC32DeferHostWeakEntryRelease(std::move(entry));
+        return;
+    }
+
+    /* A synthesized mirror is retired first, under the mutex which serializes
+     * its release handoff. A racing release either completed its count check
+     * and rollback before this, or observes the flag and releases natively;
+     * it never clears the flag afterwards. While retiring, guest_self only
+     * resolves the existing reverse mapping and never creates a new proxy. */
+    const bool mirror = LC32GuestMirrorRetiringState(hostObject) != nullptr;
+    bool retiredMirror = false;
+    if(mirror) {
+        std::lock_guard<std::mutex> lock(LC32GuestMirrorReleaseMutex());
+        bool stillLive;
+        {
+            LC32HostWeakRegistry &registry = LC32HostWeakMappings();
+            std::lock_guard<std::mutex> registryLock(registry.mutex);
+            stillLive = isLiveDetachable(entry);
+        }
+        if(stillLive && !LC32GuestMirrorIsRetiring(hostObject)) {
+            LC32SetGuestMirrorRetiring(hostObject, true);
+            retiredMirror = true;
+        }
+    }
+    if(mirror && !retiredMirror) {
+        LC32DeferHostWeakEntryRelease(std::move(entry));
+        return;
+    }
+
+    std::shared_ptr<LC32HostWeakMappingEntry> removed;
+    const char *className = entry->hostClassName;
+    bool detachedPin = false;
+    /* Same host monitor -> registry lock order as publication and teardown. */
+    @synchronized(hostObject) {
+        {
+            LC32HostWeakRegistry &registry = LC32HostWeakMappings();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            if(isLiveDetachable(entry)) {
+                auto iterator = registry.entries.find(guestObject);
+                iterator->second->state =
+                    LC32HostWeakMappingState::Superseded;
+                LC32UnindexHostMappingLocked(registry, iterator->second);
+                removed = std::move(iterator->second);
+                registry.entries.erase(iterator);
+            }
+        }
+        if(removed) {
+            LC32GuestLifetimePin *pin = objc_getAssociatedObject(
+                hostObject, LC32GuestLifetimePinKey);
+            if(pin && pin->guestObject == guestObject &&
+               pin->weakRegistryGeneration == removed->generation) {
+                /* Disarm first: dropping the association must not release
+                 * the guest allocation which is being disposed. */
+                pin->guestObject = 0;
+                pin->weakRegistryGeneration = 0;
+                pin->tracedHostObject = 0;
+                pin->tracedClassName = nullptr;
+                objc_setAssociatedObject(hostObject,
+                    LC32GuestLifetimePinKey, nil,
+                    OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                detachedPin = true;
+            }
+            LC32ClearGuestSelfIfEqualWhileSynchronized(
+                hostObject, guestObject);
+        }
+    }
+    if(retiredMirror && !removed) {
+        std::lock_guard<std::mutex> lock(LC32GuestMirrorReleaseMutex());
+        LC32SetGuestMirrorRetiring(hostObject, false);
+    }
+    if(removed) {
+        /* An ordinary native-proxy release validates the mapping and makes
+         * its guest decrement under this gate. Wait for one already past
+         * validation before the guest allocation is freed; later ones fail
+         * validation. Never wait while holding the peer monitor: the gate
+         * holder takes the guest SideTable lock, whose holder may need the
+         * monitor in a native -retainWeakReference. */
+        std::lock_guard<std::mutex> releaseGate(
+            removed->nativeProxyReleaseMutex);
+    }
+
+    if(removed) {
+        fprintf(stderr,
+            "LC32: guest 0x%x was sent -dealloc while still owned; "
+            "detached its %s peer 0x%llx%s\n",
+            guestObject, className ?: "?",
+            (unsigned long long)removed->expectedHostAddress,
+            detachedPin ? " and lifetime pin" : "");
+    }
+    LC32DeferHostWeakEntryRelease(std::move(removed));
+    LC32DeferHostWeakEntryRelease(std::move(entry));
+    /* nativeGuard drops the promotion last; a retired mirror releases
+     * natively and never calls back into the disposed guest object. */
 }
 
 class LC32TransferredRootReference {
