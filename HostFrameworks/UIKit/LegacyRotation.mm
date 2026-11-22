@@ -27,6 +27,10 @@ enum class InitialBacking { Unseen, Provisional, Ready };
     duration:(NSTimeInterval)duration force:(BOOL)force isRotating:(BOOL)rotating;
 @end
 
+@interface NSObject (LC32LegacyRotationGuestClass)
+- (BOOL)isGuestClass;
+@end
+
 @interface UIDevice (LC32LegacyInitialOrientation)
 - (void)setOrientation:(UIDeviceOrientation)orientation animated:(BOOL)animated;
 @end
@@ -885,9 +889,56 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 + (void)lc32_nativeLegacyDeviceOrientationChanged:(NSNotification *)notification;
 @end
 
+namespace {
+// DJMAX Ray's RootWindow overrides -addSubview: with an empty method (it
+// adds its own views through super). -setRootViewController: installs the
+// root's view through that override, so the view never arrives, and UIKit
+// only makes a root its rotation client (_delegateViewController) when the
+// view did arrive. The game then adds the view itself, but nothing adopts the
+// controller afterwards any more: the window never turns it, and the game
+// stays a portrait 320x568 view in a landscape scene. Install the view with
+// UIKit's own -addSubview: and finish the adoption, as the guest expected.
+// Only for a newly assigned root: a root that presents a full-screen
+// controller has had its view taken off the window by UIKit on purpose.
+void AdoptRootSwallowedByGuestWindow(UIWindow *window, UIViewController *root) {
+    static bool adopting; // main thread only; addSubview: runs view callbacks
+    if(adopting || !root || !pthread_main_np() || NativeRoot(window) != root ||
+            NativePresented(root)) return;
+    Class cls = object_getClass(window);
+    static const IMP native = class_getMethodImplementation(UIWindow.class,
+        @selector(addSubview:));
+    const IMP own = class_getMethodImplementation(cls, @selector(addSubview:));
+    if(own == native || ![(id)cls isGuestClass]) return;
+    UIView *view = NativeView(root);
+    if(!view) return;
+    if(!NativeSuperview(view)) {
+        adopting = true;
+        ((void (*)(id, SEL, UIView *))native)(window, @selector(addSubview:), view);
+        adopting = false;
+        if(NativeRoot(window) != root) return;
+        static bool logged;
+        if(!logged) {
+            logged = true;
+            fprintf(stderr, "LC32: installed %s's root view past the guest "
+                "-addSubview: of %s\n", object_getClassName(root),
+                object_getClassName(window));
+        }
+    }
+    if(NativeSuperview(view) != window) return;
+    static const SEL getDelegate = sel_registerName("_delegateViewController");
+    static const SEL setDelegate = sel_registerName("_setDelegateViewController:");
+    if(![window respondsToSelector:getDelegate] ||
+            ![window respondsToSelector:setDelegate] ||
+            ((id (*)(id, SEL))objc_msgSend)(window, getDelegate)) return;
+    ((void (*)(id, SEL, id))objc_msgSend)(window, setDelegate, root);
+}
+} // namespace
+
 @implementation UIWindow (LC32NativeLegacyRotation)
 - (void)lc32_rotationSetRootViewController:(UIViewController *)controller {
+    UIViewController *previousRoot = NativeRoot(self);
     [self lc32_rotationSetRootViewController:controller];
+    if(previousRoot != controller) AdoptRootSwallowedByGuestWindow(self, controller);
     if(startupFinished || !pthread_main_np()) return;
     UIViewController *content = BackingContentController(controller);
     if(!content || !UsesModernRotationPolicy(object_getClass(content))) return;

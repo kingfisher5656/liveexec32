@@ -25,13 +25,20 @@ struct LC32GameProfile {
     double canvasScale;
     /* Present-rate cap when LC32_MAX_FPS is unset (default 60). */
     double maxFramesPerSecond;
+    /* Give a phone-only landscape bundle with 568-point launch art the fixed
+     * 320x568 canvas under native legacy rotation (see
+     * LC32BundleUsesNativeTallLandscapePhoneCanvas). */
+    bool tallPhoneCanvas;
 };
 
 inline const LC32GameProfile *LC32CurrentGameProfile() {
     static const LC32GameProfile profiles[] = {
         /* 9mm (Gameloft Glitch): uncapped render thread, variable timestep;
          * ran at scale 3 on device before the fixed canvas existed. */
-        { "com.gameloft.9mm", " IMGSGX543", 3.0, 120.0 },
+        { "com.gameloft.9mm", " IMGSGX543", 3.0, 120.0, false },
+        /* DJMAX Ray: lays out for 568 points only on a screen exactly 568
+         * tall; elsewhere it draws a 480x320 picture into a corner. */
+        { "com.neowizInternet.game.djmaxray", nullptr, 0, 0, true },
     };
     static const LC32GameProfile none = {};
     static std::atomic<const LC32GameProfile *> cached{nullptr};
@@ -92,4 +99,13 @@ inline double LC32GameProfileMaxFramesPerSecond(double fallback) {
     const LC32GameProfile *profile = LC32CurrentGameProfile();
     return profile && profile->maxFramesPerSecond > 0
         ? profile->maxFramesPerSecond : fallback;
+}
+
+/* LC32_TALL_PHONE_CANVAS=1 tries the 320x568 canvas on another eligible
+ * game; =0 turns it off. */
+inline bool LC32GameProfileTallPhoneCanvas() {
+    if(const char *forced = getenv("LC32_TALL_PHONE_CANVAS"))
+        return forced[0] == '1';
+    const LC32GameProfile *profile = LC32CurrentGameProfile();
+    return profile && profile->tallPhoneCanvas;
 }

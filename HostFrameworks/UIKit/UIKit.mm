@@ -6,6 +6,7 @@
 #include "crash_exception.h"
 #include "LiveExec32Shared.h"
 #include "LC32LegacyCanvas.h"
+#include "LC32GameProfile.h"
 #include "LC32LegacyRotation.h"
 #include "LC32NativeViewGeometry.h"
 #include "LC32ClassicPresentation.h"
@@ -848,8 +849,12 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
             LC32BundleMayRetainLegacyLandscapePhoneCanvas(
                 bundle, LC32GetGuestExecutableSDKVersion());
         if(!result.usesFixedLandscapePhoneCanvas &&
-                LC32BundleUsesFixedLandscapeTallPhoneCanvasForHost(
-                    bundle, LC32GetGuestExecutableSDKVersion(), phoneHost)) {
+                (LC32BundleUsesFixedLandscapeTallPhoneCanvasForHost(
+                    bundle, LC32GetGuestExecutableSDKVersion(), phoneHost) ||
+                 (LC32NativeLegacyRotationEnabled() &&
+                  LC32GameProfileTallPhoneCanvas() &&
+                  LC32BundleUsesNativeTallLandscapePhoneCanvas(bundle,
+                      LC32GetGuestExecutableSDKVersion(), phoneHost)))) {
             result.usesFixedLandscapePhoneCanvas = true;
             result.phoneCanvasLongEdge = 568;
         }

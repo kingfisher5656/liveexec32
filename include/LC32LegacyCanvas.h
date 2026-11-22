@@ -359,6 +359,29 @@ static inline BOOL LC32BundleUsesFixedLandscapeTallPhoneCanvasForHost(
         LC32BundleLaunchesLandscapeOnBothSides(bundle);
 }
 
+/* The landscape-only phone bundles left to that runtime check, when UIKit
+ * itself runs the pre-iOS-8 rotation (on the device, where LiveContainer
+ * reports the guest's SDK). Nothing letterboxes them there: the guest sees
+ * the physical screen (393x852). Most size themselves from it (Dead Space,
+ * whose widescreen UI patch relies on that), but DJMAX Ray takes its
+ * 568-point layout only when the screen is exactly 568 tall and otherwise
+ * draws a 480x320 picture into a corner. iOS gave such an application a
+ * 320x568 window; the caller applies this only to games opted in through
+ * LC32GameProfile.h. */
+static inline BOOL LC32BundleUsesNativeTallLandscapePhoneCanvas(
+        NSBundle *bundle, uint32_t sdkVersion, BOOL phoneHost) {
+    const LC32SupportedDeviceFamilies families =
+        LC32BundleSupportedDeviceFamilies(bundle);
+    if(!phoneHost || !families.supportsPhone || families.supportsPad ||
+            sdkVersion >= 0x00080000) {
+        return NO;
+    }
+    NSDictionary *info = [bundle infoDictionary];
+    return LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
+        LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
+        LC32BundleDeclaresStableLandscapeSide(bundle);
+}
+
 /* The portrait counterpart: a pre-iPhone-5 phone application that declares no
  * landscape-only policy also ran on a fixed 320x480 screen, which iOS
  * letterboxed on taller iPhones. Several (Zenonia 1/3) draw a landscape game
