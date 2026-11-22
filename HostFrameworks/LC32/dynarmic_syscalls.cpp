@@ -5072,6 +5072,14 @@ int guest_mprotect(u32 guest_addr, size_t len, int prot) {
     return result;
 }
 
+int guest_msync(u32 guest_addr, size_t len, int flags) {
+    if(Dynarmic_msync(guest_addr, len, flags) == -1) {
+        threadHandle.cpsr->setCarry(true);
+        return errno;
+    }
+    return 0;
+}
+
 /* The armv7 flock layout is 24 bytes.  Spell it out rather than passing the
  * guest object through as struct flock: that happens to have the same layout
  * today, while the adjacent timespec grows from 8 to 16 bytes on arm64. */

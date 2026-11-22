@@ -475,6 +475,25 @@ public:
             {0x110bab34, 0x0001f020, 0xd1092808, 0xf79c4628, 0xd1092804,
              "Modern Combat 4 mission entity check skips missing entities"},
             /*
+             * Gangstar Rio 1.4.11: the world streamer (0xee1d4) copies
+             * streamed vertex data into one big VBO. In its "mapped" mode
+             * (flag at +0x2c4) it maps the VBO with glMapBufferOES, drops
+             * its lock at once (lock count 1 -> glUnmapBufferOES) and keeps
+             * writing through the stale pointer for as long as updates come
+             * less than 250 ms apart. Old iOS drivers left buffer storage
+             * mapped after unmap; our map is a guest copy that unmap uploads
+             * and frees, so the next copy (memcpy at 0xee34a) hits freed
+             * pages right after the main menu. Take the game's own non-mapped
+             * path instead: 0x3d2cc4 updates the buffer's CPU copy and
+             * uploads the range at once. Both flag tests branch always:
+             *   ee216 beq 0xee25e -> b 0xee25e   (no map)
+             *   ee336 cbz r0, 0xee35e -> b 0xee35e (sub-data copy)
+             */
+            {0x110ee214, 0x02c4f896, 0xd0222800, 0x781cf506, 0xe0222800,
+             "Gangstar Rio world streaming skips its stale mapped pointer"},
+            {0x110ee334, 0xf896d021, 0xb19002c4, 0x9c069d05, 0xe01202c4,
+             "Gangstar Rio world streaming skips its stale mapped pointer"},
+            /*
              * 9mm 1.0.3: 0x105094 asks "is the screen exactly 1136x640
              * pixels?" (points x UIScreen.scale) and only then loads the
              * 16:9 "_iPhone5.swf" menus/HUD; anything else gets the 3:2
@@ -504,6 +523,15 @@ public:
         };
         constexpr size_t fixCount = sizeof(fixes) / sizeof(fixes[0]);
         static std::atomic<bool> logged[fixCount];
+        /* Diagnostics: LC32_CODE_FIXES=0 runs every game's code as shipped. */
+        static const bool fixesEnabled = [] {
+            const char *value = getenv("LC32_CODE_FIXES");
+            const bool enabled = !value || strcmp(value, "0") != 0;
+            if (!enabled)
+                fprintf(stderr, "LC32: code fixes disabled (LC32_CODE_FIXES=0)\n");
+            return enabled;
+        }();
+        if (!fixesEnabled) return word;
         for (size_t index = 0; index < fixCount; ++index) {
             const GuestCodeFix &fix = fixes[index];
             if (vaddr != fix.address || word != fix.original) continue;
@@ -1958,6 +1986,12 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 break;
             case SYS_madvise:
                 cpu->Regs()[0] = 0;
+                break;
+            case SYS_msync: // 65
+            case SYS_msync_nocancel: // 405
+                cpu->Regs()[0] = static_cast<u32>(guest_msync(
+                    cpu->Regs()[0], cpu->Regs()[1],
+                    static_cast<int>(cpu->Regs()[2])));
                 break;
             case SYS_fcntl:
             case SYS_fcntl_nocancel:

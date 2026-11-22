@@ -1309,6 +1309,90 @@ int Dynarmic_mprotect(u64 address, u64 size, int perms) {
 }
 
 /*
+ * Guest file mappings are host mmaps (MAP_SHARED stays shared), so msync
+ * goes to the host pages behind the range. Gangstar Rio msyncs its mapped
+ * save/cache file. The host ranges are collected under guestVmMutex and
+ * flushed after it is released, since MS_SYNC may wait for I/O. A range
+ * unmapped meanwhile only makes the host call fail. Like XNU: zero length
+ * is EINVAL, unknown flag bits are ignored, and holes are skipped (the
+ * mapped parts are still synced) and reported as ENOMEM.
+ */
+int Dynarmic_msync(u64 address, u64 size, int flags) {
+    flags &= MS_ASYNC | MS_SYNC | MS_INVALIDATE | MS_KILLPAGES |
+        MS_DEACTIVATE;
+    if (((flags & MS_ASYNC) && (flags & MS_SYNC)) ||
+            (address & DYN_PAGE_MASK) || size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (size > UINT32_MAX || address > UINT32_MAX) {
+        errno = ENOMEM;
+        return -1;
+    }
+    size = (size + DYN_PAGE_MASK) & ~static_cast<u64>(DYN_PAGE_MASK);
+    if (!GuestAddressRangeIsValid32(address, size)) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    struct HostRange {
+        uintptr_t start;
+        uintptr_t end;
+    };
+    std::vector<HostRange> ranges;
+    bool hole = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
+        khash_t(memory) *memory = sharedHandle.memory;
+        try {
+            for (u64 vaddr = address; vaddr < address + size;
+                    vaddr += DYN_PAGE_SIZE) {
+                const khiter_t k = kh_get(memory, memory, vaddr);
+                const t_memory_page page = k != kh_end(memory)
+                    ? kh_value(memory, k) : nullptr;
+                if (page == nullptr || page->addr == nullptr) {
+                    hole = true;
+                    continue;
+                }
+                const uintptr_t host =
+                    reinterpret_cast<uintptr_t>(page->addr);
+                if (!ranges.empty() && ranges.back().end == host) {
+                    ranges.back().end = host + DYN_PAGE_SIZE;
+                } else {
+                    ranges.push_back({host, host + DYN_PAGE_SIZE});
+                }
+            }
+        } catch (const std::exception &) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+
+    /*
+     * Killing or deactivating pages would act on whole 16 KiB host pages,
+     * which can hold neighbouring 4 KiB guest pages. Both are only hints,
+     * so the host call is skipped for them.
+     */
+    if ((flags & (MS_KILLPAGES | MS_DEACTIVATE)) == 0) {
+        const uintptr_t hostPageMask =
+            static_cast<uintptr_t>(vm_page_size) - 1;
+        for (const HostRange &range : ranges) {
+            const uintptr_t start = range.start & ~hostPageMask;
+            const uintptr_t end =
+                (range.end + hostPageMask) & ~hostPageMask;
+            if (msync(reinterpret_cast<void *>(start), end - start,
+                    flags) != 0)
+                return -1;
+        }
+    }
+    if (hole) {
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
+}
+
+/*
  * Class:     com_github_unidbg_arm_backend_dynarmic_Dynarmic
  * Method:    mem_write
  * Signature: (JJ[B)I

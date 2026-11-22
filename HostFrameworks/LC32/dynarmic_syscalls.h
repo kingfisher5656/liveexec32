@@ -117,6 +117,7 @@ int guest_pthread_sigmask(int how, u32 guest_set, u32 guest_old_set);
 ssize_t guest_readlink(u32 guest_path, u32 guest_buffer, size_t buffer_size);
 int guest_munmap(u32 guest_address, size_t length);
 int guest_mprotect(u32 guest_address, size_t length, int protection);
+int guest_msync(u32 guest_address, size_t length, int flags);
 int guest_fcntl(int fildes, int command, u32 guest_arg);
 int guest_proc_info(int call_number, int pid, int flavor, uint64_t arg,
                     u32 guest_buffer, int buffer_size);

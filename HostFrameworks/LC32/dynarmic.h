@@ -292,6 +292,8 @@ u32 Dynarmic_mmap(u32 address, u64 size, int protection, int flags,
                  int fildes, u64 off, u64 mask = DYN_PAGE_MASK,
                  bool purgable = false);
 int Dynarmic_mprotect(u64 address, u64 size, int perms);
+/* msync(2) on the host pages behind a guest range; -1 + errno on failure. */
+int Dynarmic_msync(u64 address, u64 size, int flags);
 /* Page-aligned, shared data aliases in the guest's own address space. */
 kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
     int flags, u32 source, boolean_t copy, vm_prot_t *protection);
