@@ -2609,6 +2609,8 @@ namespace {
  * let FrontBoard turn the scene with the phone before the anchor could pull
  * it back. Report portrait for that window itself; the application mask is
  * left alone so presented landscape controllers still find a common side. */
+static void LC32RetireStaleLegacyPortraitAnchor(UIWindowScene *scene);
+
 static IMP LC32OriginalWindowSupportedOrientationsConsultingApp;
 
 /* Modern Combat 4's logo movie leaves AVKit's AVFullScreenViewController
@@ -2664,8 +2666,9 @@ static void LC32InstallLegacyPortraitWindowMask(void) {
             (IMP)LC32WindowSupportedOrientationsConsultingApp);
 }
 
-static void LC32InstallLegacyPortraitAnchor(UIWindowScene *scene) {
-    LC32InstallLegacyPortraitWindowMask();
+/* One anchor per scene (UIKit.mm is non-ARC: the tables are retained once),
+ * and the guest window it currently stands in for. */
+static NSMapTable<UIWindowScene *, UIWindow *> *LC32LegacyPortraitAnchors(void) {
     static NSMapTable<UIWindowScene *, UIWindow *> *anchors;
     if(!anchors) {
         anchors = [NSMapTable weakToStrongObjectsMapTable];
@@ -2673,7 +2676,39 @@ static void LC32InstallLegacyPortraitAnchor(UIWindowScene *scene) {
         [anchors retain];
 #endif
     }
-    if(!scene || [anchors objectForKey:scene]) return;
+    return anchors;
+}
+
+static NSMapTable<UIWindowScene *, UIWindow *> *
+LC32LegacyPortraitAnchorOwners(void) {
+    static NSMapTable<UIWindowScene *, UIWindow *> *owners;
+    if(!owners) {
+        owners = [NSMapTable weakToWeakObjectsMapTable];
+#if !__has_feature(objc_arc)
+        [owners retain];
+#endif
+    }
+    return owners;
+}
+
+static void LC32InstallLegacyPortraitAnchor(UIWindow *window) {
+    UIWindowScene *scene = window.windowScene;
+    if(!scene) return;
+    LC32InstallLegacyPortraitWindowMask();
+    NSMapTable<UIWindowScene *, UIWindow *> *anchors =
+        LC32LegacyPortraitAnchors();
+    [LC32LegacyPortraitAnchorOwners() setObject:window forKey:scene];
+    UIWindow *existing = [anchors objectForKey:scene];
+    if(existing) {
+        if(existing.hidden) {
+            existing.hidden = NO;
+            if(@available(iOS 16.0, *))
+                [existing.rootViewController
+                    setNeedsUpdateOfSupportedInterfaceOrientations];
+            fprintf(stderr, "LC32: portrait anchor window restored\n");
+        }
+        return;
+    }
     UIWindow *anchor = [[UIWindow alloc] initWithWindowScene:scene];
     anchor.windowLevel = UIWindowLevelNormal + 5;
     anchor.backgroundColor = UIColor.clearColor;
@@ -2698,9 +2733,15 @@ static void LC32InstallLegacyPortraitAnchor(UIWindowScene *scene) {
 /* Install the anchor, and if the scene is already landscape (the phone was
  * held sideways at launch), ask for portrait back. */
 static void LC32RestoreLegacyPortraitScene(UIWindow *window) {
-    if(!LC32WindowKeepsLegacyPortrait(window)) return;
     UIWindowScene *scene = window.windowScene;
-    LC32InstallLegacyPortraitAnchor(scene);
+    if(!LC32WindowKeepsLegacyPortrait(window)) {
+        // The window the anchor stands in for may have gained a root.
+        if(scene && [LC32LegacyPortraitAnchorOwners() objectForKey:scene] ==
+                window)
+            LC32RetireStaleLegacyPortraitAnchor(scene);
+        return;
+    }
+    LC32InstallLegacyPortraitAnchor(window);
     if(!scene || !UIInterfaceOrientationIsLandscape(scene.interfaceOrientation))
         return;
     if(@available(iOS 16.0, *)) {
@@ -2755,6 +2796,43 @@ void LC32FitFullScreenRootlessWindow(UIWindow *window) {
     }
     UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
     const LC32FullScreenRootlessShape shape =
+}  // namespace
+
+/* The anchor stands in for a guest window that iPhone OS never rotated. When
+ * that window later gets a rotating root controller of its own (installed
+ * after the anchor went up) or goes away, the guest's controller decides the
+ * scene again: hide the anchor rather than pin the scene to portrait. */
+static void LC32RetireStaleLegacyPortraitAnchor(UIWindowScene *scene) {
+    UIWindow *anchor = scene ? [LC32LegacyPortraitAnchors() objectForKey:scene]
+                             : nil;
+    if(!anchor || anchor.hidden) return;
+    UIWindow *owner = [LC32LegacyPortraitAnchorOwners() objectForKey:scene];
+    if(owner && owner.windowScene == scene &&
+            LC32WindowKeepsLegacyPortrait(owner)) return;
+    anchor.hidden = YES;
+    fprintf(stderr, "LC32: portrait anchor window retired (%s)\n",
+        owner ? "guest window is no longer a portrait-only rootless window"
+              : "guest window is gone");
+    UIViewController *root =
+        owner ? LC32NativeWindowRootViewController(owner) : nil;
+    if(@available(iOS 16.0, *))
+        [root setNeedsUpdateOfSupportedInterfaceOrientations];
+}
+
+/* LegacyRotation.mm's -[UIWindow setRootViewController:] hook: a root
+ * installed after the anchor went up decides the scene from now on. */
+extern "C" void LC32UIKitWindowRootControllerChanged(UIWindow *window) {
+    UIWindowScene *scene = window.windowScene;
+    if(!scene ||
+            [LC32LegacyPortraitAnchorOwners() objectForKey:scene] != window)
+        return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LC32RetireStaleLegacyPortraitAnchor(scene);
+    });
+}
+
+namespace {
+
         LC32ClassifyFullScreenRootlessWindow(window, orientation);
     {
         static int remaining = 100;
@@ -6358,6 +6436,16 @@ static void LC32DebuggerStopRunLoopBlock(void) {
 }
 
 static void LC32DebuggerStopRunLoopNotify(void) {
+                        /* A rootless canvas window (Modern Conflict's
+                         * OpenKODE EAGL window) draws its landscape picture
+                         * into the portrait canvas itself. Keep the scene
+                         * portrait here: the startup-complete pass that
+                         * installs the anchor for rootless windows never
+                         * runs for games whose frame loop pumps a nested run
+                         * loop from a timer, so the scene turned with an
+                         * unlocked phone and showed the canvas sideways. */
+                        if(self.isKeyWindow)
+                            LC32RestoreLegacyPortraitScene(self);
     CFRunLoopRef runLoop = CFRunLoopGetMain();
     CFRunLoopPerformBlock(runLoop, kCFRunLoopCommonModes, ^{
         LC32DebuggerStopRunLoopBlock();

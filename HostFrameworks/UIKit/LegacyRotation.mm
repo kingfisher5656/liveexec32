@@ -42,6 +42,7 @@ extern "C" void LC32UIKitPortraitHostedSideChanged(UIInterfaceOrientation side);
 extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void);
 extern "C" bool LC32UIKitWindowIsPortraitHosted(UIWindow *window);
 extern "C" void LC32RefitPortraitPhoneCanvasWindowLater(UIWindow *window);
+extern "C" void LC32UIKitWindowRootControllerChanged(UIWindow *window);
 extern "C" bool dyld_program_sdk_at_least(LC32RotationBuildVersion version);
 
 namespace {
@@ -938,7 +939,10 @@ void AdoptRootSwallowedByGuestWindow(UIWindow *window, UIViewController *root) {
 - (void)lc32_rotationSetRootViewController:(UIViewController *)controller {
     UIViewController *previousRoot = NativeRoot(self);
     [self lc32_rotationSetRootViewController:controller];
-    if(previousRoot != controller) AdoptRootSwallowedByGuestWindow(self, controller);
+    if(previousRoot != controller) {
+        AdoptRootSwallowedByGuestWindow(self, controller);
+        LC32UIKitWindowRootControllerChanged(self);
+    }
     if(startupFinished || !pthread_main_np()) return;
     UIViewController *content = BackingContentController(controller);
     if(!content || !UsesModernRotationPolicy(object_getClass(content))) return;

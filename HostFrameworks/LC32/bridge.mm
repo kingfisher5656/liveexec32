@@ -7615,6 +7615,94 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
         LC32ProtocolOwnerClass(cls), selector, instanceMethod);
 }
 
+static id LC32NativeNilObjectGetter(id self, SEL _cmd) {
+    static std::atomic<bool> logged{false};
+    if(!logged.exchange(true)) {
+        fprintf(stderr,
+            "LC32: native caller read -[%s %s]; guest value is a C "
+            "pointer, returning nil\n",
+            self ? class_getName(object_getClass(self)) : "(null)",
+            _cmd ? sel_getName(_cmd) : "(null)");
+    }
+    return nil;
+}
+
+static void LC32NativeIgnoredObjectSetter(id self, SEL _cmd, id value) {
+}
+
+/*
+ * Old engines sometimes reuse a native accessor selector with an unrelated
+ * C pointer type.  OpenKODE's kdUIKitAppDelegate declares
+ *     @property KDWindow *window;
+ * while adopting UIApplicationDelegate, whose native window is a UIWindow.
+ * Modern UIKit asks the app delegate for that window on its own (overlay
+ * inset changes), and a C struct pointer can neither be bridged nor used as
+ * a native object.  Guest callers dispatch through the guest runtime and
+ * keep the real accessor; only native callers get a nil getter / ignored
+ * setter instead of aborting in the return/argument bridge.
+ */
+static IMP LC32NativeObjectAccessorForGuestPointer(SEL selector,
+                                                   const char *guestTypes,
+                                                   const char *nativeTypes) {
+    // Cheap rejection first: almost every method has neither a C pointer in
+    // its guest encoding nor an object in the native one.
+    if(!guestTypes || !nativeTypes || !strpbrk(guestTypes, "^*") ||
+       !strchr(nativeTypes, '@')) {
+        return nullptr;
+    }
+    NSMethodSignature *guestSignature = nil;
+    NSMethodSignature *nativeSignature = nil;
+    @try {
+        guestSignature =
+            [NSMethodSignature signatureWithObjCTypes:guestTypes];
+        nativeSignature =
+            [NSMethodSignature signatureWithObjCTypes:nativeTypes];
+    } @catch(NSException *exception) {
+        return nullptr;
+    }
+    if(!guestSignature || !nativeSignature ||
+       guestSignature.numberOfArguments !=
+           nativeSignature.numberOfArguments) {
+        return nullptr;
+    }
+    auto isCPointer = [](const char *type) {
+        type = LC32UnqualifiedType(type);
+        return *type == '^' || *type == '*';
+    };
+    auto isObject = [](const char *type) {
+        return *LC32UnqualifiedType(type) == '@';
+    };
+    auto isVoid = [](const char *type) {
+        return *LC32UnqualifiedType(type) == 'v';
+    };
+    if(guestSignature.numberOfArguments == 2 &&
+       isCPointer(guestSignature.methodReturnType) &&
+       isObject(nativeSignature.methodReturnType)) {
+        return (IMP)&LC32NativeNilObjectGetter;
+    }
+    /*
+     * Setters only: a void * argument still carries a native nil to the
+     * guest (LC32HostToGuestArgument round-trips 32-bit opaque tokens), so
+     * a callback such as -didFinish:(void *) must keep reaching the guest.
+     */
+    const char *selectorName = selector ? sel_getName(selector) : "";
+    const size_t selectorLength = strlen(selectorName);
+    const bool setterSelector = selectorLength > 4 &&
+        !strncmp(selectorName, "set", 3) &&
+        strchr(selectorName, ':') == selectorName + selectorLength - 1;
+    const char *guestArgument = guestSignature.numberOfArguments == 3
+        ? LC32UnqualifiedType([guestSignature getArgumentTypeAtIndex:2])
+        : "";
+    if(setterSelector && guestSignature.numberOfArguments == 3 &&
+       isVoid(guestSignature.methodReturnType) &&
+       isVoid(nativeSignature.methodReturnType) &&
+       isCPointer(guestArgument) && strncmp(guestArgument, "^v", 2) &&
+       isObject([nativeSignature getArgumentTypeAtIndex:2])) {
+        return (IMP)&LC32NativeIgnoredObjectSetter;
+    }
+    return nullptr;
+}
+
 @implementation LC32ObjCMethodResolver
 + (void)addMethod:(Method)method toClass:(Class)cls {
     class_addMethod(cls, method_getName(method), method_getImplementation(method), method_getTypeEncoding(method));
@@ -7798,13 +7886,26 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
     }
 
     const char *guestMethodTypes = host_method_types.hostPtr;
+    const char *expectedHostTypes =
+        LC32ExpectedHostMethodTypes(cls, sel);
+    IMP nativeAccessor = LC32NativeObjectAccessorForGuestPointer(
+        sel, guestMethodTypes, expectedHostTypes);
+    if(nativeAccessor) {
+        fprintf(stderr,
+            "LC32: guest %c[%s %s] uses C pointer types (%s); native "
+            "callers expecting %s get a %s\n",
+            class_isMetaClass(cls) ? '+' : '-', class_getName(cls),
+            selectorName, guestMethodTypes, expectedHostTypes,
+            nativeAccessor == (IMP)&LC32NativeNilObjectGetter
+                ? "nil object" : "no-op setter");
+        return class_addMethod(cls, sel, nativeAccessor, expectedHostTypes) ||
+            class_getInstanceMethod(cls, sel) != nullptr;
+    }
     const char *installedMethodTypes = guestMethodTypes;
     const char guestReturnType = *LC32UnqualifiedType(guestMethodTypes);
     char hostReturnType = guestReturnType;
     IMP floatingImplementation = nullptr;
     if(guestReturnType == 'f' || guestReturnType == 'd') {
-        const char *expectedHostTypes =
-            LC32ExpectedHostMethodTypes(cls, sel);
         if(expectedHostTypes) {
             const char expectedReturnType =
                 *LC32UnqualifiedType(expectedHostTypes);
@@ -7833,8 +7934,6 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
     IMP implementation = floatingImplementation
         ? floatingImplementation
         : (IMP)&LC32InvokeGuestSelector;
-    const char *expectedHostTypes =
-        LC32ExpectedHostMethodTypes(cls, sel);
     LC32ScalarCallbackSignature scalarSignature;
     const char *scalarHostTypes = installedMethodTypes;
     if(expectedHostTypes && LC32ParseScalarCallbackSignature(

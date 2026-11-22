@@ -8,3 +8,4 @@ extern "C" bool LC32UIKitKeepsLegacyScenePortrait(void) { return false; }
 extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void) { return 0; }
 extern "C" void LC32UIKitPortraitHostedSideChanged(UIInterfaceOrientation) {}
 extern "C" bool LC32UIKitWindowIsPortraitHosted(UIWindow *) { return false; }
+extern "C" void LC32UIKitWindowRootControllerChanged(UIWindow *) {}
