@@ -19,6 +19,9 @@ extern "C" bool LC32UIKitFixedLandscapePhoneScreen(CGRect *, CGRect *) { return 
 extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void) { return false; }
 extern "C" uint32_t LC32UIKitLegacyIPadCanvasEnabled(void) { return 0; }
 extern "C" uint32_t LC32UIKitLegacyCompatibilityEnabled(void) { return 0; }
+extern "C" bool LC32UIKitModernPhoneScreen(CGRect *, CGRect *) { return false; }
+extern "C" bool LC32UIKitModernCanvasWindowFrame(UIWindow *, CGRect *) { return false; }
+extern "C" void LC32UIKitModernCanvasWindowInitialized(UIWindow *) {}
 @implementation UIWindow
 - (instancetype)initWithFrame:(CGRect)frame {
     if((self = [super init])) _frame = _bounds = frame;

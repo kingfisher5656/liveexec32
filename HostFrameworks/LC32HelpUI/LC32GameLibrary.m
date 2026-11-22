@@ -207,8 +207,27 @@ static UIImage *LC32LoadIcon(NSString *bundlePath, NSDictionary *info) {
         (self.sdkVersion >> 8) & 0xff];
 }
 
+static double LC32HostShortEdge(void) {
+    const CGSize size = UIScreen.mainScreen.bounds.size;
+    return MIN(size.width, size.height);
+}
+
+/* As the runtime decides: an iPhone, or an iPhone-only game on an iPad. */
+static BOOL LC32PhoneCanvasHost(NSBundle *bundle) {
+    const LC32SupportedDeviceFamilies families =
+        LC32BundleSupportedDeviceFamilies(bundle);
+    return UIDevice.currentDevice.userInterfaceIdiom ==
+            UIUserInterfaceIdiomPhone ||
+        (families.supportsPhone && !families.supportsPad);
+}
+
 - (BOOL)aspectModeApplies {
     NSBundle *bundle = [NSBundle bundleWithPath:self.bundlePath];
+    if(self.sdkVersion >= 0x00080000) {
+        return LC32BundleModernCanvasForHost(bundle, self.sdkVersion,
+            LC32PhoneCanvasHost(bundle), LC32HostShortEdge(),
+            LC32AspectModeOriginal).applies;
+    }
     return LC32BundleAspectCanvasForHost(bundle, self.sdkVersion, YES,
         LC32AspectModeOriginal).applies;
 }
@@ -221,8 +240,30 @@ static UIImage *LC32LoadIcon(NSString *bundlePath, NSDictionary *info) {
         return @"iPad app: always shown on its 4:3 iPad screen";
     }
     if(self.sdkVersion >= 0x00080000) {
-        return @"Built for iOS 8 or later: screen shape settings do not "
-            "change it yet";
+        const LC32ModernCanvas modern = LC32BundleModernCanvasForHost(bundle,
+            self.sdkVersion, LC32PhoneCanvasHost(bundle), LC32HostShortEdge(),
+            LC32AspectModeOriginal);
+        if(!modern.applies) {
+            return LC32BundleSupportedDeviceFamilies(bundle).supportsPhone
+                ? @"Shown full screen in its own iPad layout"
+                : @"Not an iPhone app";
+        }
+        if(!modern.letterboxed) {
+            return @"Original shape: full screen (it supports this iPhone's "
+                "screen)";
+        }
+        NSString *side = LC32BundleLaunchesLandscape(bundle)
+            ? @"landscape" : @"portrait";
+        if(modern.shortEdge > 321) {
+            return [NSString stringWithFormat:@"Original shape 16:9 "
+                "(%.0f×%.0f, %@): made for the iPhone 6", modern.shortEdge,
+                modern.longEdge, side];
+        }
+        return modern.longEdge > 500
+            ? [NSString stringWithFormat:@"Original shape 16:9 (320×568, %@): "
+                "it has an iPhone 5 launch image but not an iPhone 6 one", side]
+            : [NSString stringWithFormat:@"Original shape 3:2 (320×480, %@): "
+                "no iPhone 5 or 6 launch image", side];
     }
     const LC32AspectCanvas canvas = LC32BundleAspectCanvasForHost(bundle,
         self.sdkVersion, YES, LC32AspectModeOriginal);

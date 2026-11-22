@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 typedef enum {
@@ -433,8 +434,8 @@ static inline BOOL LC32BundleMayRetainLegacyLandscapePhoneCanvas(
  *             (3:2) without 568-point launch art, else 320x568 (16:9)
  *   wide      320x568 even without tall launch art (screen-relative engines)
  *   fill      no letterboxed phone canvas: the game sees the whole screen
- * iPad canvases (iPad-only bundles) are unaffected. SDK 8+ bundles keep
- * their current behaviour for now. */
+ * iPad canvases (iPad-only bundles) are unaffected. SDK 8+ bundles follow
+ * LC32BundleModernCanvasForHost below. */
 typedef enum {
     LC32AspectModeAuto,
     LC32AspectModeOriginal,
@@ -511,6 +512,124 @@ static inline LC32AspectCanvas LC32BundleAspectCanvasForHost(
     result.longEdge = mode == LC32AspectModeWide ||
         LC32BundleContainsTallPhoneLaunchArt(bundle, [bundle infoDictionary])
         ? 568 : 480;
+    return result;
+}
+
+/* Whether a UILaunchImages array has art for a screen whose long edge is
+ * one of the given values (iPhone 6: 667, 6 Plus: 736, X: 812). */
+static inline BOOL LC32LaunchImageArrayContainsLongEdge(
+        id value, const double *edges, unsigned count) {
+    if(![value isKindOfClass:NSArray.class]) return NO;
+    for(id entry in (NSArray *)value) {
+        if(![entry isKindOfClass:NSDictionary.class]) continue;
+        NSString *size = [(NSDictionary *)entry objectForKey:
+            @"UILaunchImageSize"];
+        double width = 0, height = 0;
+        if(![size isKindOfClass:NSString.class] ||
+                sscanf([size UTF8String], " { %lf , %lf", &width,
+                       &height) != 2) {
+            continue;
+        }
+        const double longEdge = width > height ? width : height;
+        for(unsigned i = 0; i < count; i++) {
+            if(longEdge > edges[i] - 0.5 && longEdge < edges[i] + 0.5)
+                return YES;
+        }
+    }
+    return NO;
+}
+
+/* An iPhone-specific UILaunchImages~iphone array replaces the generic one. */
+static inline BOOL LC32BundleContainsLaunchArtForLongEdge(
+        NSDictionary *info, const double *edges, unsigned count) {
+    id images = [info objectForKey:@"UILaunchImages~iphone"];
+    if(![images isKindOfClass:NSArray.class] || ![(NSArray *)images count])
+        images = [info objectForKey:@"UILaunchImages"];
+    return LC32LaunchImageArrayContainsLongEdge(images, edges, count);
+}
+
+static inline BOOL LC32BundleHasLaunchStoryboard(NSDictionary *info) {
+    for(NSString *key in @[@"UILaunchStoryboardName~iphone",
+                           @"UILaunchStoryboardName"]) {
+        id name = [info objectForKey:key];
+        if([name isKindOfClass:NSString.class] && [(NSString *)name length])
+            return YES;
+    }
+    /* iOS 9 can name the default one in a UILaunchStoryboards dictionary. */
+    for(NSString *key in @[@"UILaunchStoryboards~iphone",
+                           @"UILaunchStoryboards"]) {
+        id storyboards = [info objectForKey:key];
+        if(![storyboards isKindOfClass:NSDictionary.class]) continue;
+        id name = [(NSDictionary *)storyboards
+            objectForKey:@"UIDefaultLaunchStoryboard"];
+        if([name isKindOfClass:NSString.class] && [(NSString *)name length])
+            return YES;
+    }
+    return NO;
+}
+
+/* iOS 7+ takes launch images from a UILaunchImages array when there is one
+ * and ignores the Default-568h file-name convention then. */
+static inline BOOL LC32BundleModernTallLaunchArt(
+        NSBundle *bundle, NSDictionary *info) {
+    for(NSString *key in @[@"UILaunchImages~iphone", @"UILaunchImages"]) {
+        id images = [info objectForKey:key];
+        if([images isKindOfClass:NSArray.class] && [(NSArray *)images count])
+            return LC32LaunchImageArrayContainsTallPhoneArt(images);
+    }
+    return LC32BundleContainsTallPhoneLaunchArt(bundle, info);
+}
+
+/* The screen iOS gave an SDK 8+ phone game on an iPhone X-class phone:
+ *   SDK 11+ with a launch storyboard, or iPhone X launch art: full screen
+ *   a launch storyboard or iPhone 6 / 6 Plus launch art: 375x667 (414x736
+ *     on a phone at least 414 points wide)
+ *   568-point launch art: 320x568
+ *   otherwise: 320x480
+ * original picks that screen; wide never goes below 16:9 (320x568); fill
+ * keeps the whole scene and auto keeps today's full-screen behaviour. */
+typedef struct {
+    /* NO: the mode does not change this bundle (it fills the scene). */
+    BOOL applies;
+    BOOL letterboxed;
+    /* Portrait-ordered canvas size in points. */
+    double shortEdge;
+    double longEdge;
+} LC32ModernCanvas;
+
+static inline LC32ModernCanvas LC32BundleModernCanvasForHost(
+        NSBundle *bundle, uint32_t sdkVersion, BOOL phoneHost,
+        double hostShortEdge, LC32AspectMode mode) {
+    LC32ModernCanvas result = {NO, NO, 0, 0};
+    if(mode == LC32AspectModeAuto || !phoneHost ||
+            sdkVersion < 0x00080000 ||
+            !LC32BundleSupportedDeviceFamilies(bundle).supportsPhone) {
+        return result;
+    }
+    result.applies = YES;
+    if(mode == LC32AspectModeFill) return result;
+    NSDictionary *info = [bundle infoDictionary];
+    const BOOL storyboard = LC32BundleHasLaunchStoryboard(info);
+    static const double xEdges[] = {812, 896};
+    if((sdkVersion >= 0x000B0000 && storyboard) ||
+            LC32BundleContainsLaunchArtForLongEdge(info, xEdges, 2)) {
+        return result;
+    }
+    static const double sixEdges[] = {667};
+    static const double plusEdges[] = {736};
+    const BOOL plusArt =
+        LC32BundleContainsLaunchArtForLongEdge(info, plusEdges, 1);
+    result.letterboxed = YES;
+    if(storyboard || plusArt ||
+            LC32BundleContainsLaunchArtForLongEdge(info, sixEdges, 1)) {
+        const BOOL plus = hostShortEdge >= 413.5 && (storyboard || plusArt);
+        result.shortEdge = plus ? 414 : 375;
+        result.longEdge = plus ? 736 : 667;
+    } else {
+        result.shortEdge = 320;
+        result.longEdge = mode == LC32AspectModeWide ||
+            LC32BundleModernTallLaunchArt(bundle, info) ? 568 : 480;
+    }
     return result;
 }
 

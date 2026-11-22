@@ -59,11 +59,12 @@ static NSString *const LC32AspectDetail =
     @"3:2 or 16:9, as iOS showed each game on later iPhones.";
 
 static NSString *const LC32ScreenFooter =
-    @"Original Aspect Ratio shows each pre-iOS 8 iPhone game in the shape iOS "
-    "gave it on later iPhones: 3:2 when it has no iPhone 5 launch image, 16:9 "
-    "when it has one. Off keeps LiveExec32's per-game rules, which show some "
-    "games full screen. A game can choose otherwise under Per-Game Settings; "
-    "iOS 8+ games are not changed yet.";
+    @"Original Aspect Ratio shows each iPhone game in the shape iOS gave it on "
+    "later iPhones: 3:2 when it has no iPhone 5 launch image, 16:9 when it has "
+    "one, and for iOS 8+ games made for the iPhone 6 a 375×667 screen "
+    "(414×736 on the largest phones). Off "
+    "keeps LiveExec32's per-game rules, which show some games full screen. A "
+    "game can choose otherwise under Per-Game Settings.";
 
 static NSString *const LC32ScaleDetail =
     @"How many pixels per point games render at. 2× is the original Retina "
@@ -73,9 +74,10 @@ static NSString *const LC32ScaleDetail =
 
 static NSString *const LC32ShapeDetail =
     @"Automatic: LiveExec32's per-game rules. Original: the shape iOS gave "
-    "this game (3:2 or 16:9). 16:9: a 320×568 screen even without an iPhone 5 "
-    "launch image, for engines that size themselves from the screen. Full "
-    "Screen: no black bars; some games draw for a fixed size and break.";
+    "this game (3:2, 16:9, or 375×667 for iOS 8+ games made for the iPhone "
+    "6). 16:9: never 3:2, so a 320×568 screen even without an iPhone 5 launch "
+    "image, for engines that size themselves from the screen. Full Screen: no "
+    "black bars; some games draw for a fixed size and break.";
 
 #pragma mark - Choice list
 

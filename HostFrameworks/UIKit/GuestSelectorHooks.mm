@@ -317,6 +317,10 @@ static id LC32LoadGuestKeyWindow(void) {
 // See LC32UIKitGuestStatusBarOrientationIsCosmetic: the side the guest set
 // without turning the scene (0 = none).
 static std::atomic<long> LC32GuestCosmeticStatusBarOrientation{0};
+// ModernPhoneCanvas.mm (the letterboxed screen of an SDK 8+ guest).
+extern "C" void LC32UIKitModernCanvasGuestMadeKey(UIWindow *window);
+extern "C" void LC32UIKitModernCanvasNoteStatusBarHidden(bool hidden);
+
 // See LC32UIKitRootlessStatusBarOrientationFollowsGuest: the landscape side a
 // rootless canvas game last set (0 = none).
 static std::atomic<long> LC32GuestRootlessStatusBarOrientation{0};
@@ -328,6 +332,7 @@ static std::atomic<long> LC32GuestRootlessStatusBarOrientation{0};
     // Only the game's own calls reach these, never the hosting app's.
     auto madeKey = [](id window, const uint64_t *) {
         LC32StoreGuestKeyWindow(window);
+        LC32UIKitModernCanvasGuestMadeKey(window);
     };
     LC32RegisterHostSelectorHook(UIWindow.class,
         @selector(makeKeyAndVisible), {nullptr, madeKey});
@@ -409,6 +414,7 @@ static std::atomic<long> LC32GuestRootlessStatusBarOrientation{0};
 // its sideways canvas, and showing it re-lays out the scaled game window (pause
 // menus toggle it). Keep it hidden while the game is shown that way.
 - (void)lc32_guestSetStatusBarHidden:(BOOL)hidden animated:(BOOL)animated {
+    LC32UIKitModernCanvasNoteStatusBarHidden(hidden);
     if(LC32UIKitPortraitHostedStatusBarOrientation()) hidden = YES;
     const SEL original = @selector(setStatusBarHidden:animated:);
     using SetHidden = void (*)(id, SEL, BOOL, BOOL);
@@ -417,6 +423,7 @@ static std::atomic<long> LC32GuestRootlessStatusBarOrientation{0};
 }
 
 - (void)lc32_guestSetStatusBarHidden:(BOOL)hidden {
+    LC32UIKitModernCanvasNoteStatusBarHidden(hidden);
     if(LC32UIKitPortraitHostedStatusBarOrientation()) hidden = YES;
     const SEL original = @selector(setStatusBarHidden:);
     using SetHidden = void (*)(id, SEL, BOOL);

@@ -20,6 +20,7 @@
 @interface UIScreen (LC32GuestScreenMetrics)
 - (CGFloat)lc32_guestScreenScale;
 - (CGFloat)lc32_guestScreenNativeScale;
+- (CGRect)lc32_guestScreenNativeBounds;
 - (CGRect)lc32_guestScreenBounds;
 - (CGRect)lc32_guestScreenApplicationFrame;
 @end
@@ -27,6 +28,12 @@
 extern "C" bool LC32UIKitFixedLandscapePhoneScreen(
     CGRect *bounds, CGRect *applicationFrame);
 extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void);
+// ModernPhoneCanvas.mm: the letterboxed screen of an SDK 8+ guest.
+extern "C" bool LC32UIKitModernPhoneScreen(
+    CGRect *bounds, CGRect *applicationFrame);
+extern "C" bool LC32UIKitModernCanvasWindowFrame(
+    UIWindow *window, CGRect *frame);
+extern "C" void LC32UIKitModernCanvasWindowInitialized(UIWindow *window);
 extern "C" uint32_t LC32UIKitLegacyIPadCanvasEnabled(void);
 extern "C" uint32_t LC32UIKitLegacyCompatibilityEnabled(void);
 
@@ -84,6 +91,9 @@ static CGRect LC32LandscapeLaunchExtent(UIScreen *screen, CGRect rect,
  * Start it at the real screen size so it turns with the scene. The guest's
  * GL view keeps the landscape size it was made with. */
 static void LC32FitLandscapeLaunchWindow(id window, const uint64_t *) {
+    if([window isKindOfClass:UIWindow.class]) {
+        LC32UIKitModernCanvasWindowInitialized((UIWindow *)window);
+    }
     if(![window isKindOfClass:UIWindow.class] ||
             !LC32UIKitGuestScreenIsLandscapeOnly()) {
         return;
@@ -180,6 +190,16 @@ static CGFloat LC32GuestRequestedRenderScale(UIScreen *screen) {
         }
         return size;
     }
+    // An SDK 8+ guest's letterboxed screen in pixels, portrait-ordered like
+    // every screen mode.
+    CGRect modern;
+    if(LC32UIKitModernPhoneScreen(&modern, nullptr) &&
+            LC32ModeIsMainScreenCurrentMode(self)) {
+        const CGFloat scale = [UIScreen.mainScreen lc32_guestScreenScale];
+        const CGFloat shortEdge = MIN(modern.size.width, modern.size.height);
+        const CGFloat longEdge = MAX(modern.size.width, modern.size.height);
+        return CGSizeMake(round(shortEdge * scale), round(longEdge * scale));
+    }
     // A requested render scale keeps the pixel mode in step with -scale:
     // the guest's screen at that scale (fixed canvas, also on SDK-clamped
     // hosts), else the panel's pixels scaled by requested/panel.
@@ -274,6 +294,21 @@ static CGFloat LC32GuestRequestedRenderScale(UIScreen *screen) {
     return scale;
 }
 
+/* Pixels of the guest's screen, portrait-ordered (iOS 8 API). */
+- (CGRect)lc32_guestScreenNativeBounds {
+    CGRect modern;
+    if(self == UIScreen.mainScreen &&
+            LC32UIKitModernPhoneScreen(&modern, nullptr)) {
+        const CGFloat scale = [self lc32_guestScreenNativeScale];
+        return CGRectMake(0, 0,
+            round(MIN(modern.size.width, modern.size.height) * scale),
+            round(MAX(modern.size.width, modern.size.height) * scale));
+    }
+    using RectGetter = CGRect (*)(id, SEL);
+    return ((RectGetter)LC32NativeHostMethod(self,
+        @selector(nativeBounds)))(self, @selector(nativeBounds));
+}
+
 - (CGFloat)lc32_guestScreenNativeScale {
     if(CGFloat requested = LC32GuestRequestedRenderScale(self)) {
         return requested;
@@ -288,6 +323,10 @@ static CGFloat LC32GuestRequestedRenderScale(UIScreen *screen) {
     if(LC32GetClassicScreenGeometry(self, &saved)) return saved.bounds;
     CGRect bounds;
     if(LC32UIKitFixedLandscapePhoneScreen(&bounds, nullptr)) return bounds;
+    if(self == UIScreen.mainScreen &&
+            LC32UIKitModernPhoneScreen(&bounds, nullptr)) {
+        return bounds;
+    }
     using RectGetter = CGRect (*)(id, SEL);
     bounds = ((RectGetter)LC32NativeHostMethod(self, @selector(bounds)))(
         self, @selector(bounds));
@@ -299,6 +338,10 @@ static CGFloat LC32GuestRequestedRenderScale(UIScreen *screen) {
     if(LC32GetClassicScreenGeometry(self, &saved)) return saved.applicationFrame;
     CGRect frame;
     if(LC32UIKitFixedLandscapePhoneScreen(nullptr, &frame)) return frame;
+    if(self == UIScreen.mainScreen &&
+            LC32UIKitModernPhoneScreen(nullptr, &frame)) {
+        return frame;
+    }
     using RectGetter = CGRect (*)(id, SEL);
     frame = ((RectGetter)LC32NativeHostMethod(self,
         @selector(applicationFrame)))(self, @selector(applicationFrame));
@@ -348,6 +391,8 @@ static bool LC32GuestFullScreenWindowRect(UIWindow *window, CGRect native,
 
 @implementation UIWindow (LC32GuestScreenMetrics)
 - (CGRect)lc32_guestWindowFrame {
+    CGRect modern;
+    if(LC32UIKitModernCanvasWindowFrame(self, &modern)) return modern;
     using RectGetter = CGRect (*)(id, SEL);
     const CGRect frame = ((RectGetter)LC32NativeHostMethod(self,
         @selector(frame)))(self, @selector(frame));
@@ -379,6 +424,8 @@ static bool LC32GuestFullScreenWindowRect(UIWindow *window, CGRect native,
         {@selector(lc32_guestScreenScale), nullptr});
     LC32RegisterHostSelectorHook(screen, @selector(nativeScale),
         {@selector(lc32_guestScreenNativeScale), nullptr});
+    LC32RegisterHostSelectorHook(screen, @selector(nativeBounds),
+        {@selector(lc32_guestScreenNativeBounds), nullptr});
     LC32RegisterHostSelectorHook(objc_getClass("UIWindow"),
         @selector(initWithFrame:), {nullptr, LC32FitLandscapeLaunchWindow});
     LC32RegisterHostSelectorHook(objc_getClass("UIWindow"), @selector(frame),

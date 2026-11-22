@@ -26,6 +26,9 @@ static const LC32BuiltinGameSetting LC32BuiltinGameSettings[] = {
     {"com.ea.deadspace.bv", "LC32_ASPECT", "auto"},
     /* Air Mail (Unity): full-screen 3D with the 3:2 menu patch. */
     {"com.chillingo.airmail", "LC32_ASPECT", "auto"},
+    /* Galaxy on Fire 2 HD: full screen, with its phone UI patch keeping the
+     * HUD in a centred 16:9 box. */
+    {"www.fishlabs.net.gof2hd", "LC32_ASPECT", "auto"},
 };
 
 static inline const char *LC32BuiltinGameSettingValue(

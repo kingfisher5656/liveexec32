@@ -808,6 +808,10 @@ struct LC32LegacyCanvasPolicy {
      * compatibility screen there (Tapsonic). Universal guests keep their
      * native iPad layout. */
     bool phoneCanvasHost;
+    /* SDK 8+ guests under LC32_ASPECT: the portrait-ordered iPhone screen
+     * iOS gave the game (375x667, 320x568 or 320x480); zero when the game
+     * fills the scene. See ModernPhoneCanvas.mm. */
+    CGSize modernPhoneCanvas;
 };
 
 const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
@@ -819,6 +823,7 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
         false,
         480,
         false,
+        CGSizeZero,
     };
     const char *guestExecutable = getenv("LC32_GUEST_EXECUTABLE");
     /* UIKit can create internal windows while the shim dylib is loading.
@@ -892,10 +897,41 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
                 fprintf(stderr, "LC32: LC32_ASPECT=%s: full screen\n",
                     aspectValue);
             }
-        } else if(aspect != LC32AspectModeAuto) {
+        }
+
+        /* SDK 8+ guests run on the modern UIKit path (the host reports
+         * their SDK), where iOS 8 screen geometry applies: the canvas is
+         * the whole guest screen and turns with the interface. */
+        const bool modernHost = LC32UIKitLegacyCompatibilityEnabled() &&
+            !LC32NativeLegacyRotationEnabled() &&
+            LC32GetGuestExecutableSDKVersion() >= 0x80000;
+        CGFloat hostShortEdge = 0;
+        if(modernHost && aspect != LC32AspectModeAuto) {
+            // Orientation-independent, safe off the main thread.
+            UIScreen *screen = UIScreen.mainScreen;
+            const CGFloat nativeScale = screen.nativeScale;
+            if(nativeScale > 0) {
+                hostShortEdge = screen.nativeBounds.size.width / nativeScale;
+            }
+        }
+        const LC32ModernCanvas modern = LC32BundleModernCanvasForHost(
+            bundle, LC32GetGuestExecutableSDKVersion(),
+            phoneHost && modernHost && result.kind ==
+                LC32LegacyIPadCanvasNone,
+            hostShortEdge, aspect);
+        if(modern.applies && modern.letterboxed) {
+            result.modernPhoneCanvas =
+                CGSizeMake(modern.shortEdge, modern.longEdge);
+            fprintf(stderr, "LC32: LC32_ASPECT=%s: %.0fx%.0f canvas "
+                "(SDK 8+)\n", aspectValue, modern.shortEdge,
+                modern.longEdge);
+        } else if(modern.applies) {
+            fprintf(stderr, "LC32: LC32_ASPECT=%s: full screen (SDK 8+)\n",
+                aspectValue);
+        } else if(!canvas.applies && aspect != LC32AspectModeAuto) {
             fprintf(stderr, "LC32: LC32_ASPECT=%s does not apply "
-                "(iPad canvas, SDK 8+, not a phone host or SDK-clamped "
-                "host)\n", aspectValue);
+                "(iPad canvas, not a phone host, or a host whose SDK does "
+                "not match the guest's)\n", aspectValue);
         }
     });
     return result;
@@ -903,6 +939,24 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
 
 CGFloat LC32GuestPhoneCanvasLongEdge(void) {
     return LC32GuestLegacyCanvasPolicy().phoneCanvasLongEdge;
+}
+
+extern "C" UIInterfaceOrientationMask LC32UIKitGuestDeclaredOrientations(
+        void) {
+    return LC32GuestInterfacePolicy().declaredOrientations;
+}
+
+extern "C" bool LC32UIKitGuestStatusBarHiddenByDefault(void) {
+    return LC32GuestInterfacePolicy().statusBarHidden;
+}
+
+/* Portrait-ordered size of an SDK 8+ guest's letterboxed screen, or zero. */
+extern "C" CGSize LC32UIKitModernPhoneCanvasSize(void) {
+#if LC32_UIKIT_COMPATIBILITY
+    return LC32GuestLegacyCanvasPolicy().modernPhoneCanvas;
+#else
+    return CGSizeZero;
+#endif
 }
 
 LC32LegacyIPadCanvasKind LC32GuestLegacyIPadCanvasKind(void) {
@@ -1705,6 +1759,7 @@ bool LC32WindowIsPortraitHosted(UIWindow *window) {
 
 extern "C" bool LC32UIKitGuestFixedCanvasDeviceOrientation(
     UIDeviceOrientation *orientation);
+extern "C" bool LC32UIKitGuestFixedCanvasFollowsRootPolicy(void);
 UIDeviceOrientation LC32SceneDeviceOrientation(UIWindowScene *scene);
 
 /* Modern Combat 4 (SDK 7.1, fixed 568 canvas, lists Portrait and both
@@ -1713,14 +1768,16 @@ UIDeviceOrientation LC32SceneDeviceOrientation(UIWindowScene *scene);
  * whole window to either landscape side. Hosting it upright is only needed
  * while the phone is upright: once it is actually held sideways, let the
  * scene follow and leave hosting for that turned window (see
- * LC32LeavePortraitHostForLandscapeDevice). */
+ * LC32LeavePortraitHostForLandscapeDevice). Modern Combat 3 on the same
+ * canvas (LC32_ASPECT=original) leaves hosting the same way; its window then
+ * follows the scene side (LC32FitLegacyDirectWindowLayers). */
 bool LC32PortraitHostFollowsLandscapeDevice(UIWindow *window) {
     if(@available(iOS 16.0, *)) {
     } else {
         return false;
     }
     return LC32WindowIsPortraitHostedLandscape(window) &&
-        LC32UIKitGuestFixedCanvasDeviceOrientation(nullptr) &&
+        LC32UIKitGuestFixedCanvasFollowsRootPolicy() &&
         (LC32GuestInterfacePolicy().declaredOrientations &
             UIInterfaceOrientationMaskLandscape) ==
                 UIInterfaceOrientationMaskLandscape;
@@ -1758,6 +1815,8 @@ bool LC32PortraitHostDeviceIsSideways(UIWindow *window) {
         UIDeviceOrientationIsLandscape(UIDevice.currentDevice.orientation);
 }
 
+void LC32ScheduleRootlessWindowLayerLayout(UIWindow *window);
+
 void LC32WatchPortraitHostDeviceTurns(UIWindow *window) {
     static bool installed;
     if(installed || !LC32PortraitHostFollowsLandscapeDevice(window)) return;
@@ -1772,6 +1831,14 @@ void LC32WatchPortraitHostDeviceTurns(UIWindow *window) {
                 [LC32NativeWindowRootViewController(target)
                     setNeedsUpdateOfSupportedInterfaceOrientations];
             }
+            /* A scene that is already on the side the phone turned to (an
+             * upright launch whose portrait request was refused) changes no
+             * geometry, so the scene observer never sees this turn. Check
+             * once FrontBoard has the new device side. */
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if(LC32LeavePortraitHostForLandscapeDevice(target))
+                    LC32ScheduleRootlessWindowLayerLayout(target);
+            });
         }];
 }
 
@@ -2653,11 +2720,13 @@ static IMP LC32OriginalWindowSupportedOrientationsConsultingApp;
  * (portrait and both landscape sides) and turned the scene with the phone:
  * portrait after a sideways launch (picture cropped), landscape under a
  * portrait-hosted window (picture sideways in a strip). Let the synthetic
- * root's policy decide for that window. */
+ * root's policy decide for that window. Modern Combat 3 under
+ * LC32_ASPECT=original has the same canvas and movie
+ * (LC32UIKitGuestFixedCanvasFollowsRootPolicy). */
 static bool LC32WindowFollowsFixedCanvasRootPolicy(
         UIWindow *window, UIViewController *&root) {
     if(![window isKindOfClass:UIWindow.class] || !window.guest_selfOrNull ||
-            !LC32UIKitGuestFixedCanvasDeviceOrientation(nullptr)) return false;
+            !LC32UIKitGuestFixedCanvasFollowsRootPolicy()) return false;
     root = LC32NativeWindowRootViewController(window);
     return [root isKindOfClass:LC32LegacyWindowRootController.class];
 }
@@ -2835,7 +2904,214 @@ namespace {
 
 void LC32ScheduleRootlessWindowLayerLayout(UIWindow *window);
 
+/* Modern Combat 3 (auto aspect) presents its Gameloft logo
+ * (MPMoviePlayerViewController) from a controller whose view is the game's
+ * renderer view, so after UIKit's legacy window-controller transition the
+ * movie view sits inside that view instead of straight in the window
+ * (LC32FitViewInFullScreenRootlessWindow). The transition places it from its
+ * own idea of the window: on an upright launch (the movie turned the scene)
+ * unturned at x=402 of a 402-point window, entirely off screen; on a
+ * sideways launch turned but centred at y=839, half off. Cover the window
+ * with it, counter-turned against the window's net turn (ours or UIKit's),
+ * so it stands upright on the landscape screen. Only the view of a presented
+ * (and settled) movie controller, inside an unturned window-covering view,
+ * is moved; the game's own views are left alone. Native IMPs and native
+ * geometry keep guest overrides out of this path. */
+bool LC32FullScreenRootlessWindowTurn(UIWindow *window, CGFloat &angle) {
+    // The eligibility of LC32ClassifyFullScreenRootlessWindow.
+    const UIInterfaceOrientationMask declared =
+        LC32GuestInterfacePolicy().declaredOrientations;
+    if(!window || !window.guest_selfOrNull ||
+            LC32GetGuestExecutableSDKVersion() >= 0x80000 ||
+            !LC32NativeLegacyRotationEnabled() ||
+            UIDevice.currentDevice.userInterfaceIdiom !=
+                UIUserInterfaceIdiomPhone ||
+            LC32GuestUsesFixedLandscapePhoneCanvas() ||
+            LC32GuestNeedsLegacyIPadCanvas() ||
+            LC32NativeWindowRootViewController(window) ||
+            !(declared & UIInterfaceOrientationMaskLandscape) ||
+            (declared & (UIInterfaceOrientationMaskPortrait |
+                         UIInterfaceOrientationMaskPortraitUpsideDown)))
+        return false;
+    UIWindowScene *scene = window.windowScene;
+    CALayer *layer = LC32NativeViewLayer(window);
+    if(!scene || !layer || LC32ObjectUsesGuestClass(layer) ||
+            !UIInterfaceOrientationIsLandscape(scene.interfaceOrientation) ||
+            !LC32TransformNearlyEquals(LC32NativeViewTransform(window),
+                CGAffineTransformIdentity))
+        return false;
+    // A screen-sized portrait window.
+    const CGSize sceneSize = scene.coordinateSpace.bounds.size;
+    const CGSize size = layer.bounds.size;
+    constexpr CGFloat epsilon = 0.5;
+    if(fabs(size.width - MIN(sceneSize.width, sceneSize.height)) > epsilon ||
+            fabs(size.height - MAX(sceneSize.width, sceneSize.height)) >
+                epsilon) return false;
+    // The net turn above the window: layer transforms and sublayer transforms.
+    CGAffineTransform total = CGAffineTransformIdentity;
+    unsigned remainingLayers = 32;
+    for(CALayer *ancestor = layer.superlayer; ancestor && remainingLayers--;
+            ancestor = ancestor.superlayer) {
+        if(!CATransform3DIsAffine(ancestor.sublayerTransform) ||
+                !CATransform3DIsAffine(ancestor.transform)) return false;
+        total = CGAffineTransformConcat(total,
+            CATransform3DGetAffineTransform(ancestor.sublayerTransform));
+        total = CGAffineTransformConcat(total,
+            CATransform3DGetAffineTransform(ancestor.transform));
+    }
+    if(!(hypot(total.a, total.b) > 0)) return false;
+    // Only an exact quarter turn either way (ours or UIKit's).
+    const CGFloat measured = atan2(total.b, total.a);
+    angle = round(measured / M_PI_2) * M_PI_2;
+    return fabs(measured - angle) < 0.01 && fabs(sin(angle)) > 0.5;
+}
+
+void LC32FitNestedPresentedViewsInFullScreenRootlessWindow(UIWindow *window) {
+    CGFloat angle;
+    if(!LC32FullScreenRootlessWindowTurn(window, angle)) return;
+    using ObjectGetter = id (*)(id, SEL);
+    using FlagGetter = BOOL (*)(id, SEL);
+    static ObjectGetter nextResponder = reinterpret_cast<ObjectGetter>(
+        class_getMethodImplementation(UIView.class, @selector(nextResponder)));
+    static ObjectGetter presenting = reinterpret_cast<ObjectGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(presentingViewController)));
+    static FlagGetter beingPresented = reinterpret_cast<FlagGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(isBeingPresented)));
+    static FlagGetter beingDismissed = reinterpret_cast<FlagGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(isBeingDismissed)));
+    static ObjectGetter presented = reinterpret_cast<ObjectGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(presentedViewController)));
+    static ObjectGetter parent = reinterpret_cast<ObjectGetter>(
+        class_getMethodImplementation(UIViewController.class,
+            @selector(parentViewController)));
+    const CGRect windowBounds = LC32NativeViewBounds(window);
+    const CGAffineTransform counterTurn = CGAffineTransformMakeRotation(-angle);
+    const CGAffineTransform turn = CGAffineTransformMake(
+        round(counterTurn.a), round(counterTurn.b),
+        round(counterTurn.c), round(counterTurn.d), 0, 0);
+    const CGRect bounds = CGRectMake(0, 0,
+        windowBounds.size.height, windowBounds.size.width);
+    const CGPoint childCenter =
+        CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
+    constexpr UIViewAutoresizing fill =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    constexpr CGFloat epsilon = 0.5;
+    auto samePoint = [](CGPoint a, CGPoint b) {
+        return fabs(a.x - b.x) < 0.01 && fabs(a.y - b.y) < 0.01;
+    };
+    static Class movieController =
+        NSClassFromString(@"MPMoviePlayerViewController");
+    if(!movieController) return;
+    auto isMovieController = [](Class cls) {
+        for(; cls; cls = class_getSuperclass(cls))
+            if(cls == movieController) return true;
+        return false;
+    };
+    for(UIView *host in LC32NativeViewSubviews(window)) {
+        /* The renderer view the movie was presented from covers the window
+         * unturned (a view LC32RotateFullScreenRootlessController turned is
+         * already upright and is left alone). Native geometry only: the host
+         * is usually a guest class. */
+        CALayer *hostLayer = LC32NativeViewLayer(host);
+        if(!hostLayer || !LC32TransformNearlyEquals(
+                LC32NativeViewTransform(host), CGAffineTransformIdentity))
+            continue;
+        const CGRect hostBounds = LC32NativeViewBounds(host);
+        const CGPoint hostCenter = LC32NativeViewCenter(host);
+        const CGPoint anchor = hostLayer.anchorPoint;
+        const CGPoint hostOrigin = {
+            hostCenter.x - anchor.x * hostBounds.size.width,
+            hostCenter.y - anchor.y * hostBounds.size.height,
+        };
+        if(fabs(hostBounds.size.width - windowBounds.size.width) > epsilon ||
+                fabs(hostBounds.size.height - windowBounds.size.height) >
+                    epsilon ||
+                fabs(hostOrigin.x - windowBounds.origin.x) > epsilon ||
+                fabs(hostOrigin.y - windowBounds.origin.y) > epsilon) continue;
+        // The window's centre in the host's bounds.
+        const CGPoint center = {
+            CGRectGetMidX(windowBounds) - hostOrigin.x + hostBounds.origin.x,
+            CGRectGetMidY(windowBounds) - hostOrigin.y + hostBounds.origin.y,
+        };
+        for(UIView *view in LC32NativeViewSubviews(host)) {
+            if(LC32ObjectUsesGuestClass(view)) continue;
+            id next = nextResponder(view, @selector(nextResponder));
+            // Movie presentations only (MPMoviePlayerViewController or the
+            // game's subclass of it).
+            if(!next || !isMovieController(object_getClass(next)) ||
+                    parent(next, @selector(parentViewController)) ||
+                    beingPresented(next, @selector(isBeingPresented)) ||
+                    beingDismissed(next, @selector(isBeingDismissed)))
+                continue;
+            /* The presented controller itself, not a child (AVKit's player
+             * controller inside a movie view reports its parent's
+             * presenter). */
+            id presenter = presenting(next, @selector(presentingViewController));
+            if(!presenter ||
+                    presented(presenter, @selector(presentedViewController)) !=
+                        next) continue;
+            // A full-window presentation, upright or turned.
+            const CGSize size = LC32NativeViewBounds(view).size;
+            const bool fullWindow =
+                (fabs(size.width - windowBounds.size.width) < epsilon &&
+                 fabs(size.height - windowBounds.size.height) < epsilon) ||
+                (fabs(size.width - windowBounds.size.height) < epsilon &&
+                 fabs(size.height - windowBounds.size.width) < epsilon);
+            if(!fullWindow) continue;
+            auto fillsView = [&](UIView *child) {
+                return !LC32ObjectUsesGuestClass(child) &&
+                    (LC32NativeViewAutoresizingMask(child) & fill) == fill &&
+                    LC32TransformNearlyEquals(LC32NativeViewTransform(child),
+                        CGAffineTransformIdentity);
+            };
+            bool placed =
+                LC32TransformNearlyEquals(LC32NativeViewTransform(view), turn) &&
+                CGRectEqualToRect(LC32NativeViewBounds(view), bounds) &&
+                samePoint(LC32NativeViewCenter(view), center);
+            for(UIView *child in placed ? LC32NativeViewSubviews(view) : nil) {
+                if(fillsView(child) &&
+                        (!CGRectEqualToRect(LC32NativeViewBounds(child),
+                            bounds) ||
+                         !samePoint(LC32NativeViewCenter(child),
+                            childCenter))) placed = false;
+            }
+            if(placed) continue;
+            const CGPoint before = LC32NativeViewCenter(view);
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            LC32NativeSetViewTransform(view, turn);
+            LC32NativeSetViewBounds(view, bounds);
+            LC32NativeSetViewCenter(view, center);
+            for(UIView *child in LC32NativeViewSubviews(view)) {
+                if(!fillsView(child)) continue;
+                LC32NativeSetViewBounds(child, bounds);
+                LC32NativeSetViewCenter(child, childCenter);
+            }
+            [CATransaction commit];
+            static int remaining = 20;
+            if(remaining > 0) {
+                remaining--;
+                fprintf(stderr, "LC32: presented %s inside %s covers the "
+                    "turned window (centre %.0f,%.0f -> %.0f,%.0f)\n",
+                    object_getClassName(next), object_getClassName(host),
+                    before.x, before.y, center.x, center.y);
+            }
+        }
+    }
+}
+
+void LC32FitFullScreenRootlessWindowLayers(UIWindow *window);
+
 void LC32FitFullScreenRootlessWindow(UIWindow *window) {
+    LC32FitFullScreenRootlessWindowLayers(window);
+    LC32FitNestedPresentedViewsInFullScreenRootlessWindow(window);
+}
+
+void LC32FitFullScreenRootlessWindowLayers(UIWindow *window) {
     LC32RestoreLegacyPortraitScene(window);
     if(LC32FitRootlessIPadWindow(window)) return;
     if(LC32WindowUsesRootlessPhoneCanvas(window)) {
@@ -3311,13 +3587,24 @@ bool LC32FitLegacyDirectWindowLayers(UIWindow *window) {
         desiredValue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     /* A scene-sized window stands in for the turned portrait panel of iOS 7:
      * it follows the scene's side, and the game flips its own picture for
-     * the other side (9mm). A game pinned to its launch side
+     * the other side (9mm). So does a window at the fixed canvas size when
+     * the game names no side, neither in its Info.plist nor at run time:
+     * Modern Combat 3 draws for the side the phone is held, and turning its
+     * window to its first listed side showed it upside down (or sideways)
+     * when launched held the other way. A game pinned to its launch side
      * (LC32UIKitGuestFixedCanvasDeviceOrientation) keeps that side. */
     const bool sceneSized = portraitRootlessWindow &&
         LC32WindowHasScenePortraitSize(window, windowLayer);
+    const bool guestChoseSide = LC32MaskForInterfaceOrientation(
+        (UIInterfaceOrientation)LC32LegacyRequestedOrientation.load(
+            std::memory_order_relaxed)) != 0 ||
+        LC32MaskForInterfaceOrientation(
+            LC32GuestInterfacePolicy().preferredOrientation) != 0;
+    const bool canvasSized = portraitRootlessWindow && !guestChoseSide &&
+        LC32WindowHasGuestPortraitCanvasSize(windowLayer);
     const UIInterfaceOrientation sceneSide =
         window.windowScene.interfaceOrientation;
-    const bool followsScene = sceneSized &&
+    const bool followsScene = (sceneSized || canvasSized) &&
         !LC32ObjectUsesGuestClass(window) &&
         UIInterfaceOrientationIsLandscape(sceneSide) &&
         !LC32UIKitGuestFixedCanvasDeviceOrientation(nullptr);
@@ -3325,8 +3612,9 @@ bool LC32FitLegacyDirectWindowLayers(UIWindow *window) {
         LC32LegacyWindowAncestorsSwapAxes(windowLayer);
     if(rootlessPhoneCanvas && !portraitRootlessWindow) {
         LC32FitRootlessWindowPlacement(window, windowLayer);
-    } else if(portraitRootlessWindow && ((followsScene && ancestorsTurned) ||
-            LC32RootlessWindowNeedsTurnedPlacement(window, windowLayer))) {
+    } else if(portraitRootlessWindow &&
+            ((followsScene && sceneSized && ancestorsTurned) ||
+             LC32RootlessWindowNeedsTurnedPlacement(window, windowLayer))) {
         /* With UIKit's layers still turned for another side, the fit adds
          * the half turn they lack, or removes ours when they match. */
         const CGAffineTransform before = LC32NativeViewTransform(window);
@@ -3334,7 +3622,7 @@ bool LC32FitLegacyDirectWindowLayers(UIWindow *window) {
             followsScene ? sceneSide : orientation);
         /* A presentation counter-turned against our previous turn would now
          * show upside down; fit it against the new one. */
-        if(sceneSized && !LC32TransformNearlyEquals(
+        if((sceneSized || canvasSized) && !LC32TransformNearlyEquals(
                 before, LC32NativeViewTransform(window)))
             LC32FitPresentedViewsInTurnedRootlessWindow(window, 0);
     } else if(ownsWindowPlacement && ancestorsTurned) {
@@ -5063,7 +5351,8 @@ extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void) {
             LC32NativeLegacyRotationEnabled() ||
             LC32GuestUsesFixedLandscapePhoneCanvas() ||
             LC32GuestUsesFixedPortraitPhoneCanvas() ||
-            LC32GuestNeedsLegacyIPadCanvas()) {
+            LC32GuestNeedsLegacyIPadCanvas() ||
+            LC32UIKitModernPhoneCanvasSize().width > 0) {
         return false;
     }
     const UIInterfaceOrientationMask declared =
@@ -5181,7 +5470,7 @@ extern "C" bool LC32UIKitGetViewDuringGuestLoad(
     [view release];
 #endif
     // See LC32WindowFollowsFixedCanvasRootPolicy.
-    if(LC32UIKitGuestFixedCanvasDeviceOrientation(nullptr))
+    if(LC32UIKitGuestFixedCanvasFollowsRootPolicy())
         LC32InstallLegacyPortraitWindowMask();
 }
 
@@ -6184,6 +6473,28 @@ extern "C" bool LC32UIKitGuestFixedCanvasDeviceOrientation(
     return true;
 }
 
+/* Fixed-canvas games whose rootless window the synthetic root's orientation
+ * policy decides (LC32WindowFollowsFixedCanvasRootPolicy), even when a
+ * leftover AVKit full-screen controller sits on top of it, and whose
+ * portrait hosting ends once the phone is held sideways
+ * (LC32PortraitHostFollowsLandscapeDevice): Modern Combat 4 (pinned to its
+ * launch side) and Modern Combat 3 under LC32_ASPECT=original (SDK 7.1, the
+ * same 568 canvas and logo movie; lists only the two landscape sides and
+ * names neither, so its window follows the scene side). Without this, an
+ * upright launch turned sideways showed MC3 rotated in a small box (the scene
+ * turned under the hosted window), and a sideways launch turned upright
+ * during the logo showed it in the top half (the scene went portrait). */
+extern "C" bool LC32UIKitGuestFixedCanvasFollowsRootPolicy(void) {
+    if(LC32UIKitGuestFixedCanvasDeviceOrientation(nullptr)) return true;
+    if(LC32GetGuestExecutableSDKVersion() < 0x60000 ||
+            LC32GetGuestExecutableSDKVersion() >= 0x80000 ||
+            !LC32GuestUsesFixedLandscapePhoneCanvas() ||
+            !LC32NativeLegacyRotationEnabled()) return false;
+    const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
+    return policy.declaredOrientations == UIInterfaceOrientationMaskLandscape &&
+        !LC32MaskForInterfaceOrientation(policy.preferredOrientation);
+}
+
 extern "C" u32 LC32UIKitGetLegacyStatusBarOrientation(void) {
     if(!LC32UIKitLegacyCompatibilityEnabled())
         return (u32)UIInterfaceOrientationUnknown;
@@ -7068,6 +7379,12 @@ static void LC32TransitionViewDidComplete(id self, SEL cmd, id transitionView,
         } else {
             LC32FitViewInFullScreenRootlessWindow(toView);
         }
+        /* A movie presented from the renderer's controller lands inside that
+         * view; the controller is still being presented here. */
+        UIWindow *window = LC32NativeViewWindow(toView);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LC32FitNestedPresentedViewsInFullScreenRootlessWindow(window);
+        });
     }
 }
 
