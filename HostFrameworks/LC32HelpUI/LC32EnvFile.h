@@ -18,7 +18,12 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)isValidKey:(NSString *)key;
 + (BOOL)isValidValue:(NSString *)value;
 
+/** Comment lines written when saving a file that has no lines yet. */
+@property(nonatomic, copy, nullable) NSArray<NSString *> *headerLines;
+
 - (instancetype)initWithPath:(NSString *)path;
+/** YES when at least one variable is switched on. */
+- (BOOL)hasEnabledEntries;
 - (void)reload;
 - (BOOL)save:(NSError **)error;
 

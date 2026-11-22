@@ -17,6 +17,8 @@ bool LC32GetClassicScreenGeometry(UIScreen *screen, LC32ClassicScreenGeometry *g
 // Fork-only fixed phone canvas and landscape-launch policies stay inactive.
 extern "C" bool LC32UIKitFixedLandscapePhoneScreen(CGRect *, CGRect *) { return false; }
 extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void) { return false; }
+extern "C" uint32_t LC32UIKitLegacyIPadCanvasEnabled(void) { return 0; }
+extern "C" uint32_t LC32UIKitLegacyCompatibilityEnabled(void) { return 0; }
 @implementation UIWindow
 - (instancetype)initWithFrame:(CGRect)frame {
     if((self = [super init])) _frame = _bounds = frame;
@@ -153,6 +155,41 @@ int main() {
             alternate.pixels = CGSizeMake(1920,1080);
             screen.availableModes = @[mode, alternate];
             check("alternate-main-mode", CGSizeEqualToSize(guestSize(alternate), CGSizeMake(960,540)));
+        }
+    }
+    @autoreleasepool {
+        // LC32_CANVAS_SCALE (global, per-game or Info.plist) picks the render
+        // scale for every guest, clamped to [1, panel], with -nativeScale and
+        // the pixel mode in step.
+        if(LC32_UIKIT_COMPATIBILITY) {
+            const bool enabled = LC32NativeLegacyRotationEnabled();
+            restoredClassic = false;
+            UIScreen *screen = UIScreen.mainScreen;
+            UIScreenMode *mode = [UIScreenMode new];
+            mode.pixels = CGSizeMake(1320, 2868);
+            mode.applicationPixels = CGSizeMake(880, 1912);
+            mode.lastLevel = -1;
+            screen.testScale = 3;
+            screen.nativeScale = 3;
+            screen.bounds = CGRectMake(0, 0, 440, 956);
+            screen.currentMode = mode;
+            screen.availableModes = @[mode];
+            SEL nativeSelector = LC32FindHostSelectorHook(UIScreen.class,
+                @selector(nativeScale)).replacement ?: @selector(nativeScale);
+            auto guestNativeScale = [&] {
+                return ((CGFloat (*)(id, SEL))LC32NativeHostMethod(screen,
+                    nativeSelector))(screen, nativeSelector);
+            };
+            setenv("LC32_CANVAS_SCALE", "1", 1);
+            check("render-scale-1x", guestScale(screen) == 1);
+            check("render-scale-1x-native-scale", guestNativeScale() == 1);
+            check("render-scale-1x-mode",
+                CGSizeEqualToSize(guestSize(mode), CGSizeMake(440, 956)));
+            setenv("LC32_CANVAS_SCALE", "5", 1);
+            check("render-scale-clamped-to-panel", guestScale(screen) == 3);
+            unsetenv("LC32_CANVAS_SCALE");
+            check("render-scale-unset", guestScale(screen) == (enabled ? 2 : 3) &&
+                guestNativeScale() == 3);
         }
     }
     printf("screen-metrics-host: %u checks, %u failures\n", checks, failures);

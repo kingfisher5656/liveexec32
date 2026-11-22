@@ -4,6 +4,7 @@
 #import "LC32ClassicPresentation.h"
 #include "../../include/LC32UIKitCompatibilityConfig.h"
 #if LC32_UIKIT_COMPATIBILITY
+#include <atomic>
 #include <cmath>
 #include "../../include/LC32GameProfile.h"
 
@@ -18,6 +19,7 @@
 
 @interface UIScreen (LC32GuestScreenMetrics)
 - (CGFloat)lc32_guestScreenScale;
+- (CGFloat)lc32_guestScreenNativeScale;
 - (CGRect)lc32_guestScreenBounds;
 - (CGRect)lc32_guestScreenApplicationFrame;
 @end
@@ -25,6 +27,8 @@
 extern "C" bool LC32UIKitFixedLandscapePhoneScreen(
     CGRect *bounds, CGRect *applicationFrame);
 extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void);
+extern "C" uint32_t LC32UIKitLegacyIPadCanvasEnabled(void);
+extern "C" uint32_t LC32UIKitLegacyCompatibilityEnabled(void);
 
 namespace {
 bool hasApplicationModeSize;
@@ -127,6 +131,33 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
         CGSizeEqualToSize(LC32NativeModeSize(mode), LC32NativeModeSize(current));
 }
 
+/* The render scale requested for this game, clamped to [1, panel scale],
+ * or 0 when none was requested or the screen is not the main display. */
+static CGFloat LC32GuestRequestedRenderScale(UIScreen *screen) {
+    if(screen != UIScreen.mainScreen) return 0;
+    const double requested = LC32GameProfileRenderScaleOverride();
+    if(!(requested > 0) || !std::isfinite(requested)) return 0;
+    // The virtual iPad canvas is a 1x 768x1024 screen (the guest UIKit shim
+    // answers -scale itself there).
+    if(LC32UIKitLegacyIPadCanvasEnabled()) return 0;
+    using ScaleGetter = CGFloat (*)(id, SEL);
+    const CGFloat panel = ((ScaleGetter)LC32NativeHostMethod(screen,
+        @selector(nativeScale)))(screen, @selector(nativeScale));
+    CGFloat ceiling = panel >= 1 && std::isfinite(panel) ? panel : 1;
+    // On an SDK-clamped host the guest shim caps a fixed canvas at 2x.
+    if(LC32UIKitLegacyCompatibilityEnabled() &&
+            LC32UIKitFixedLandscapePhoneScreen(nullptr, nullptr)) {
+        ceiling = MIN(ceiling, (CGFloat)2);
+    }
+    const CGFloat scale = MIN(MAX((CGFloat)requested, (CGFloat)1), ceiling);
+    static std::atomic<bool> logged{false};
+    if(!logged.exchange(true)) {
+        fprintf(stderr, "LC32: render scale %.2f (requested %.2f, panel "
+            "%.2f)\n", scale, requested, panel);
+    }
+    return scale;
+}
+
 @implementation UIScreenMode (LC32GuestScreenMetrics)
 - (CGSize)lc32_guestScreenModeSize {
     UIScreen *main = UIScreen.mainScreen;
@@ -148,6 +179,24 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
                 "(fixed phone canvas)\n", size.width, size.height);
         }
         return size;
+    }
+    // A requested render scale keeps the pixel mode in step with -scale:
+    // the guest's screen at that scale (fixed canvas, also on SDK-clamped
+    // hosts), else the panel's pixels scaled by requested/panel.
+    if(LC32ModeIsMainScreenCurrentMode(self)) {
+        UIScreen *main = UIScreen.mainScreen;
+        if(const CGFloat requested = LC32GuestRequestedRenderScale(main)) {
+            if(LC32UIKitFixedLandscapePhoneScreen(&canvas, nullptr)) {
+                return CGSizeMake(canvas.size.width * requested,
+                                  canvas.size.height * requested);
+            }
+            const CGFloat panel = NativeScale(main);
+            const CGSize native = LC32NativeModeSize(self);
+            if(panel > 0 && std::isfinite(panel)) {
+                return CGSizeMake(round(native.width * requested / panel),
+                                  round(native.height * requested / panel));
+            }
+        }
     }
     return [self lc32_applicationScreenModeSize];
 }
@@ -209,28 +258,29 @@ static bool LC32ModeIsMainScreenCurrentMode(UIScreenMode *mode) {
             scale *= appSize.width / nativeSize.width;
         }
     }
-    // The fixed phone canvas is a Retina 320x480 screen at most. Engines size
-    // their drawable from this, and some derive integer asset/world scales
-    // from the resulting pixel width. Games known to handle more (see
-    // LC32GameProfile.h) may render up to the display's native scale.
-    if(LC32UIKitFixedLandscapePhoneScreen(nullptr, nullptr)) {
-        const CGFloat cap = (CGFloat)LC32GameProfileCanvasScale();
-        if(cap > 2.0) {
-            // The compatibility mode above reports 2x for legacy SDKs; use
-            // the panel's own scale instead.
-            const CGFloat native = self.nativeScale;
-            scale = MAX((CGFloat)2.0, MIN(native, cap));
-            static bool logged;
-            if(!logged) {
-                logged = true;
-                fprintf(stderr, "LC32: fixed canvas scale %.2f (cap %.2f)\n",
-                    scale, cap);
-            }
-        } else if(scale > cap) {
-            scale = cap;
-        }
+    // A render scale chosen for this game (LC32_CANVAS_SCALE, per-game
+    // settings, or LC32GameProfile.h) applies to every guest on the main
+    // display, from 1x up to the panel's own scale. Engines size their
+    // drawable from this.
+    if(CGFloat requested = LC32GuestRequestedRenderScale(self)) {
+        return requested;
+    }
+    // Otherwise the fixed phone canvas is a Retina 320x480 screen at most.
+    // Some engines derive integer asset/world scales from the resulting
+    // pixel width.
+    if(LC32UIKitFixedLandscapePhoneScreen(nullptr, nullptr) && scale > 2.0) {
+        scale = 2.0;
     }
     return scale;
+}
+
+- (CGFloat)lc32_guestScreenNativeScale {
+    if(CGFloat requested = LC32GuestRequestedRenderScale(self)) {
+        return requested;
+    }
+    using ScaleGetter = CGFloat (*)(id, SEL);
+    return ((ScaleGetter)LC32NativeHostMethod(self, @selector(nativeScale)))(
+        self, @selector(nativeScale));
 }
 
 - (CGRect)lc32_guestScreenBounds {
@@ -327,6 +377,8 @@ static bool LC32GuestFullScreenWindowRect(UIWindow *window, CGRect native,
         {@selector(lc32_guestScreenApplicationFrame), nullptr});
     LC32RegisterHostSelectorHook(screen, @selector(scale),
         {@selector(lc32_guestScreenScale), nullptr});
+    LC32RegisterHostSelectorHook(screen, @selector(nativeScale),
+        {@selector(lc32_guestScreenNativeScale), nullptr});
     LC32RegisterHostSelectorHook(objc_getClass("UIWindow"),
         @selector(initWithFrame:), {nullptr, LC32FitLandscapeLaunchWindow});
     LC32RegisterHostSelectorHook(objc_getClass("UIWindow"), @selector(frame),

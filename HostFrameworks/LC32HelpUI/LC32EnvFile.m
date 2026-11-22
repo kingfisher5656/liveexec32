@@ -120,15 +120,31 @@ static NSString *LC32FormatLine(NSString *key, NSString *value, BOOL enabled) {
 }
 
 - (BOOL)save:(NSError **)error {
-    if(_lines.count == 0) {
-        [_lines addObject:@"# LiveExec32 settings, read when a 32-bit app starts."];
-        [_lines addObject:@"# Edited by the LiveExec32 app. Lines are LC32_NAME=value;"];
-        [_lines addObject:@"# a # in front switches a line off."];
+    // A file written for the first time starts with a short explanation.
+    if(![NSFileManager.defaultManager fileExistsAtPath:_path]) {
+        NSArray<NSString *> *header = self.headerLines ?: @[
+            @"# LiveExec32 settings, read when a 32-bit app starts.",
+            @"# Edited by the LiveExec32 app. Lines are LC32_NAME=value;",
+            @"# a # in front switches a line off."];
+        [_lines insertObjects:header atIndexes:[NSIndexSet indexSetWithIndexesInRange:
+            NSMakeRange(0, header.count)]];
     }
     NSString *text = [[_lines componentsJoinedByString:@"\n"]
         stringByAppendingString:@"\n"];
+    // Per-game files live in a folder that may not exist yet.
+    [NSFileManager.defaultManager createDirectoryAtPath:
+            _path.stringByDeletingLastPathComponent
+        withIntermediateDirectories:YES attributes:nil error:nil];
     return [text writeToFile:_path atomically:YES
         encoding:NSUTF8StringEncoding error:error];
+}
+
+- (BOOL)hasEnabledEntries {
+    for(NSString *line in _lines) {
+        LC32EnvLine parsed = LC32ParseLine(line);
+        if(parsed.isEntry && parsed.enabled) return YES;
+    }
+    return NO;
 }
 
 - (NSArray<NSString *> *)keys {

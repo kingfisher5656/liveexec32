@@ -40,6 +40,7 @@
 #include "debugger_server.h"
 #include "guest_bootstrap.h"
 #include <CoreFoundation/CoreFoundation.h>
+#include "../../include/LC32BuiltinGameSettings.h"
 
 extern "C" void LC32ConfigureLegacyAppTransportSecurity(
     uint32_t guestSDKVersion);
@@ -1098,29 +1099,74 @@ static void ExposeLegacyBundleInHome(const std::string &guestHome,
  * LiveExec32 reads LC32_* settings from "LiveExec32.env" in LiveContainer's
  * Documents folder (the folder holding Applications/, visible in Files as
  * On My iPhone > LiveContainer). One KEY=VALUE per line; # starts a comment.
- * A variable already present in the real environment wins.
+ * A variable already present in the real environment wins, and the first
+ * file to set a variable wins over later ones.
+ *
+ * Per-game settings live beside it in LiveExec32-Games/<app folder>.env,
+ * named after the installed .app folder without ".app" (LiveContainer names
+ * it after the bundle identifier). They are read before LiveExec32.env, so
+ * a game's own value overrides the global one. Between the two, a game's
+ * Info.plist may carry an "LC32Environment" dictionary of LC32_ defaults:
+ * patched IPAs use it to opt out of settings they were built around.
  */
-static void LoadUserEnvironmentFile(const char *guestExecutable) {
-    if(guestExecutable == nullptr) return;
-    const std::string executable(guestExecutable);
+namespace {
+
+/* The folder holding Applications/ for this executable, or "". */
+std::string LiveContainerRootForExecutable(const char *executablePath) {
+    if(executablePath == nullptr) return {};
+    const std::string executable(executablePath);
     const size_t applications = executable.rfind("/Applications/");
-    if(applications == std::string::npos) return;
-    const std::string path =
-        executable.substr(0, applications) + "/LiveExec32.env";
+    if(applications == std::string::npos) return {};
+    return executable.substr(0, applications);
+}
+
+/* "com.ea.deadspace.bv" for .../Applications/com.ea.deadspace.bv.app/x. */
+std::string InstalledAppFolderName(const char *executablePath) {
+    if(executablePath == nullptr) return {};
+    const std::string executable(executablePath);
+    const std::string marker = "/Applications/";
+    const size_t applications = executable.rfind(marker);
+    if(applications == std::string::npos) return {};
+    const size_t begin = applications + marker.size();
+    const size_t slash = executable.find('/', begin);
+    if(slash == std::string::npos || slash == begin) return {};
+    std::string folder = executable.substr(begin, slash - begin);
+    const std::string suffix = ".app";
+    if(folder.size() > suffix.size() &&
+            folder.compare(folder.size() - suffix.size(), suffix.size(),
+                suffix) == 0) {
+        folder.erase(folder.size() - suffix.size());
+    }
+    return folder;
+}
+
+void SetEnvironmentDefault(const std::string &key, const std::string &value,
+                           const char *source) {
+    if(key.compare(0, 5, "LC32_") != 0 || key.size() <= 5) {
+        fprintf(stderr, "LC32: %s: ignoring %s "
+            "(only LC32_ settings are read)\n", source, key.c_str());
+        return;
+    }
+    if(getenv(key.c_str()) != nullptr) return;
+    setenv(key.c_str(), value.c_str(), 0);
+    fprintf(stderr, "LC32: %s: %s=%s\n", source, key.c_str(), value.c_str());
+}
+
+void LoadEnvironmentFile(const std::string &path, const char *source) {
     FILE *file = fopen(path.c_str(), "r");
     if(file == nullptr) return;
     // Game and launcher usually share one folder; read each file once.
-    static dev_t loadedDevice;
-    static ino_t loadedInode;
+    static std::vector<std::pair<dev_t, ino_t>> loaded;
     struct stat metadata = {};
     if(fstat(fileno(file), &metadata) == 0) {
-        if(loadedInode != 0 && metadata.st_dev == loadedDevice &&
-                metadata.st_ino == loadedInode) {
-            fclose(file);
-            return;
+        for(const auto &entry : loaded) {
+            if(entry.first == metadata.st_dev &&
+                    entry.second == metadata.st_ino) {
+                fclose(file);
+                return;
+            }
         }
-        loadedDevice = metadata.st_dev;
-        loadedInode = metadata.st_ino;
+        loaded.emplace_back(metadata.st_dev, metadata.st_ino);
     }
     char line[512];
     while(fgets(line, sizeof(line), file) != nullptr) {
@@ -1141,18 +1187,112 @@ static void LoadUserEnvironmentFile(const char *guestExecutable) {
             key.pop_back();
         while(!value.empty() && isspace(static_cast<unsigned char>(value.front())))
             value.erase(0, 1);
-        if(key.compare(0, 5, "LC32_") != 0) {
-            fprintf(stderr, "LC32: LiveExec32.env: ignoring %s "
-                "(only LC32_ settings are read)\n", key.c_str());
-            continue;
-        }
-        if(getenv(key.c_str()) != nullptr) continue;
-        setenv(key.c_str(), value.c_str(), 0);
-        fprintf(stderr, "LC32: LiveExec32.env: %s=%s\n", key.c_str(),
-            value.c_str());
+        SetEnvironmentDefault(key, value, source);
     }
     fclose(file);
 }
+
+void LoadUserEnvironmentFile(const char *executable) {
+    const std::string root = LiveContainerRootForExecutable(executable);
+    if(!root.empty()) LoadEnvironmentFile(root + "/LiveExec32.env",
+        "LiveExec32.env");
+}
+
+void LoadGameEnvironmentFile(const char *rootExecutable,
+                             const std::string &appFolder) {
+    const std::string root = LiveContainerRootForExecutable(rootExecutable);
+    if(root.empty() || appFolder.empty()) return;
+    const std::string path = root + "/LiveExec32-Games/" + appFolder + ".env";
+    LoadEnvironmentFile(path, "per-game settings");
+}
+
+std::string StringFromCFString(CFStringRef string) {
+    if(string == nullptr || CFGetTypeID(string) != CFStringGetTypeID())
+        return {};
+    if(const char *direct = CFStringGetCStringPtr(string, kCFStringEncodingUTF8))
+        return direct;
+    const CFIndex size = CFStringGetMaximumSizeForEncoding(
+        CFStringGetLength(string), kCFStringEncodingUTF8) + 1;
+    std::vector<char> buffer(static_cast<size_t>(size));
+    if(!CFStringGetCString(string, buffer.data(), size, kCFStringEncodingUTF8))
+        return {};
+    return buffer.data();
+}
+
+/* Info.plist LC32Environment = {LC32_NAME = value; ...}: defaults shipped
+ * inside the IPA itself (string, number or boolean values), then
+ * LiveExec32's own defaults for the bundle (LC32BuiltinGameSettings.h). */
+void LoadBundleEnvironment(const char *guestExecutable) {
+    if(guestExecutable == nullptr) return;
+    std::string plistPath(guestExecutable);
+    const size_t slash = plistPath.rfind('/');
+    if(slash == std::string::npos) return;
+    plistPath.erase(slash);
+    plistPath += "/Info.plist";
+    FILE *file = fopen(plistPath.c_str(), "rb");
+    if(file == nullptr) return;
+    std::vector<UInt8> bytes;
+    UInt8 chunk[16384];
+    size_t count;
+    while((count = fread(chunk, 1, sizeof(chunk), file)) > 0 &&
+            bytes.size() < 8 * 1024 * 1024) {
+        bytes.insert(bytes.end(), chunk, chunk + count);
+    }
+    fclose(file);
+    if(bytes.empty()) return;
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, bytes.data(),
+        static_cast<CFIndex>(bytes.size()));
+    if(data == nullptr) return;
+    CFPropertyListRef plist = CFPropertyListCreateWithData(kCFAllocatorDefault,
+        data, kCFPropertyListImmutable, nullptr, nullptr);
+    CFRelease(data);
+    if(plist == nullptr) return;
+    if(CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+        CFTypeRef environment = CFDictionaryGetValue(
+            static_cast<CFDictionaryRef>(plist), CFSTR("LC32Environment"));
+        if(environment != nullptr &&
+                CFGetTypeID(environment) == CFDictionaryGetTypeID()) {
+            CFDictionaryApplyFunction(static_cast<CFDictionaryRef>(environment),
+                [](const void *key, const void *value, void *) {
+                    const std::string name =
+                        StringFromCFString(static_cast<CFStringRef>(key));
+                    if(name.empty() || value == nullptr) return;
+                    std::string text;
+                    const CFTypeID type = CFGetTypeID(value);
+                    if(type == CFStringGetTypeID()) {
+                        text = StringFromCFString(
+                            static_cast<CFStringRef>(value));
+                    } else if(type == CFBooleanGetTypeID()) {
+                        text = CFBooleanGetValue(
+                            static_cast<CFBooleanRef>(value)) ? "1" : "0";
+                    } else if(type == CFNumberGetTypeID()) {
+                        double number = 0;
+                        CFNumberGetValue(static_cast<CFNumberRef>(value),
+                            kCFNumberDoubleType, &number);
+                        char buffer[64];
+                        snprintf(buffer, sizeof(buffer), "%g", number);
+                        text = buffer;
+                    } else {
+                        return;
+                    }
+                    SetEnvironmentDefault(name, text, "Info.plist");
+                }, nullptr);
+        }
+        const std::string identifier = StringFromCFString(
+            static_cast<CFStringRef>(CFDictionaryGetValue(
+                static_cast<CFDictionaryRef>(plist),
+                CFSTR("CFBundleIdentifier"))));
+        for(const auto &setting : LC32BuiltinGameSettings) {
+            if(identifier == setting.bundleIdentifier) {
+                SetEnvironmentDefault(setting.key, setting.value,
+                    "built-in game settings");
+            }
+        }
+    }
+    CFRelease(plist);
+}
+
+}  // namespace
 
 int LC32RunGuest(int argc, char* argv[], char* envp[]) {
     if(argc < 2 || argv == nullptr || argv[0] == nullptr ||
@@ -1182,13 +1322,18 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
             "LC32: ignoring malformed guest environment variable %s\n",
             name.c_str());
     }
-    LoadUserEnvironmentFile(argv[1]);
     /*
-     * The LiveExec32 app's settings screen writes the file next to the
-     * Applications folder holding LiveExec32 itself; read that one too, for
-     * games kept in another LiveContainer folder (private vs. shared). Keys
-     * already set by the game's folder file win.
+     * Per-game files first, then the IPA's own defaults, then the global
+     * files. The LiveExec32 app's settings screen writes next to the
+     * Applications folder holding LiveExec32 itself; read that folder too,
+     * for games kept in another LiveContainer folder (private vs. shared).
+     * Files in the game's own folder win.
      */
+    const std::string appFolder = InstalledAppFolderName(argv[1]);
+    LoadGameEnvironmentFile(argv[1], appFolder);
+    LoadGameEnvironmentFile(argv[0], appFolder);
+    LoadBundleEnvironment(argv[1]);
+    LoadUserEnvironmentFile(argv[1]);
     LoadUserEnvironmentFile(argv[0]);
     LC32ProfileInitialize();
 

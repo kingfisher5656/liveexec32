@@ -40,10 +40,10 @@ inline const LC32GameProfile *LC32CurrentGameProfile() {
     static const LC32GameProfile profiles[] = {
         /* 9mm (Gameloft Glitch): uncapped render thread, variable timestep;
          * ran at scale 3 on device before the fixed canvas existed. */
-        { "com.gameloft.9mm", " IMGSGX543", 3.0, 120.0, false },
+        { "com.gameloft.9mm", " IMGSGX543", 3.0, 120.0, false, false },
         /* DJMAX Ray: lays out for 568 points only on a screen exactly 568
          * tall; elsewhere it draws a 480x320 picture into a corner. */
-        { "com.neowizInternet.game.djmaxray", nullptr, 0, 0, true },
+        { "com.neowizInternet.game.djmaxray", nullptr, 0, 0, true, false },
         /* RAGE HD (SDK 4.2): EAGLView root of a landscape-only controller,
          * drawn with a 480x320 projection; the portrait canvas showed its
          * menu sideways and squeezed. */
@@ -93,7 +93,9 @@ inline const char *LC32GameProfileGLVersionTag() {
     return profile ? profile->glVersionTag : nullptr;
 }
 
-/* LC32_CANVAS_SCALE=<n> sets the fixed-canvas scale cap. */
+/* LC32_CANVAS_SCALE=<n> sets the render scale (see
+ * LC32GameProfileRenderScaleOverride); this returns it with the old fixed
+ * canvas default of 2 when nothing is set. */
 inline double LC32GameProfileCanvasScale() {
     const LC32GameProfile *profile = LC32CurrentGameProfile();
     const double fallback = profile && profile->canvasScale > 0
@@ -101,6 +103,18 @@ inline double LC32GameProfileCanvasScale() {
     const double value = LC32GameProfileNumberFromEnv("LC32_CANVAS_SCALE",
         fallback);
     return value > 0 ? value : 2.0;
+}
+
+/* Render scale chosen for this game: LC32_CANVAS_SCALE (global, per-game
+ * settings or the IPA's Info.plist), else the profile's canvasScale; 0 when
+ * neither is set (fixed canvases then stay at 2x, pre-iOS-8 full-screen
+ * games at 2x, SDK 8+ games at the panel's own scale). Callers clamp it to
+ * [1, panel scale]. */
+inline double LC32GameProfileRenderScaleOverride() {
+    const double forced = LC32GameProfileNumberFromEnv("LC32_CANVAS_SCALE", 0);
+    if(forced > 0) return forced;
+    const LC32GameProfile *profile = LC32CurrentGameProfile();
+    return profile && profile->canvasScale > 0 ? profile->canvasScale : 0;
 }
 
 /* Default present cap; LC32_MAX_FPS still overrides it. */

@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #include <stdint.h>
+#include <string.h>
 
 typedef enum {
     LC32LegacyIPadCanvasNone,
@@ -424,6 +425,93 @@ static inline BOOL LC32BundleMayRetainLegacyLandscapePhoneCanvas(
     return LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
         LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
         LC32BundleDeclaresStableLandscapeSide(bundle);
+}
+
+/* LC32_ASPECT picks how pre-iOS-8 phone games are shaped on a phone host.
+ *   auto      today's per-case rules (default)
+ *   original  the screen iOS itself gave the game on a later iPhone: 320x480
+ *             (3:2) without 568-point launch art, else 320x568 (16:9)
+ *   wide      320x568 even without tall launch art (screen-relative engines)
+ *   fill      no letterboxed phone canvas: the game sees the whole screen
+ * iPad canvases (iPad-only bundles) are unaffected. SDK 8+ bundles keep
+ * their current behaviour for now. */
+typedef enum {
+    LC32AspectModeAuto,
+    LC32AspectModeOriginal,
+    LC32AspectModeWide,
+    LC32AspectModeFill,
+} LC32AspectMode;
+
+static inline LC32AspectMode LC32AspectModeFromString(const char *value) {
+    if(!value) return LC32AspectModeAuto;
+    if(strcmp(value, "original") == 0 || strcmp(value, "1") == 0)
+        return LC32AspectModeOriginal;
+    if(strcmp(value, "wide") == 0 || strcmp(value, "16:9") == 0)
+        return LC32AspectModeWide;
+    if(strcmp(value, "fill") == 0 || strcmp(value, "native") == 0)
+        return LC32AspectModeFill;
+    return LC32AspectModeAuto;
+}
+
+static inline BOOL LC32OrientationNameIsLandscape(id value) {
+    return [value isKindOfClass:NSString.class] &&
+        [(NSString *)value hasPrefix:@"UIInterfaceOrientationLandscape"];
+}
+
+/* Whether a game shows its first screen in landscape: a landscape-only
+ * policy, else a declared initial orientation (Air Mail declares an empty
+ * one), else the first listed side (Death Rally lists both landscape sides
+ * before portrait). */
+static inline BOOL LC32BundleLaunchesLandscape(NSBundle *bundle) {
+    if(LC32BundleUsesLandscapeOnlyPhonePolicy(bundle)) return YES;
+    NSDictionary *info = [bundle infoDictionary];
+    for(NSString *key in @[@"UIInterfaceOrientation~iphone",
+                           @"UIInterfaceOrientation"]) {
+        id initial = [info objectForKey:key];
+        if([initial isKindOfClass:NSString.class] &&
+                [(NSString *)initial hasPrefix:@"UIInterfaceOrientation"]) {
+            return LC32OrientationNameIsLandscape(initial);
+        }
+    }
+    NSArray *orientations = [info objectForKey:
+        @"UISupportedInterfaceOrientations~iphone"];
+    if(![orientations isKindOfClass:NSArray.class] || ![orientations count]) {
+        orientations = [info objectForKey:
+            @"UISupportedInterfaceOrientations"];
+    }
+    return [orientations isKindOfClass:NSArray.class] &&
+        [orientations count] != 0 &&
+        LC32OrientationNameIsLandscape([orientations objectAtIndex:0]);
+}
+
+typedef struct {
+    /* NO: the mode does not change this bundle (auto rules apply). */
+    BOOL applies;
+    /* A fixed phone canvas at all (NO for fill). */
+    BOOL letterboxed;
+    BOOL landscape;
+    double longEdge;
+} LC32AspectCanvas;
+
+static inline LC32AspectCanvas LC32BundleAspectCanvasForHost(
+        NSBundle *bundle, uint32_t sdkVersion, BOOL phoneHost,
+        LC32AspectMode mode) {
+    LC32AspectCanvas result = {NO, NO, NO, 480};
+    if(mode == LC32AspectModeAuto || !phoneHost ||
+            sdkVersion >= 0x00080000 ||
+            LC32BundleLegacyIPadCanvasKind(bundle, sdkVersion) !=
+                LC32LegacyIPadCanvasNone ||
+            !LC32BundleSupportedDeviceFamilies(bundle).supportsPhone) {
+        return result;
+    }
+    result.applies = YES;
+    if(mode == LC32AspectModeFill) return result;
+    result.letterboxed = YES;
+    result.landscape = LC32BundleLaunchesLandscape(bundle);
+    result.longEdge = mode == LC32AspectModeWide ||
+        LC32BundleContainsTallPhoneLaunchArt(bundle, [bundle infoDictionary])
+        ? 568 : 480;
+    return result;
 }
 
 #endif

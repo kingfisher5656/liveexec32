@@ -863,6 +863,40 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
             !result.usesFixedLandscapePhoneCanvas &&
             LC32BundleUsesFixedPortraitPhoneCanvasForHost(
                 bundle, LC32GetGuestExecutableSDKVersion(), phoneHost);
+
+        /* LC32_ASPECT (LiveExec32.env, per-game settings or the IPA's
+         * Info.plist) replaces the per-case rules above with one shape for
+         * every pre-iOS-8 phone game; see LC32BundleAspectCanvasForHost. */
+        const char *aspectValue = getenv("LC32_ASPECT");
+        const LC32AspectMode aspect = LC32AspectModeFromString(aspectValue);
+        /* Only where this policy alone decides the guest's screen: on an
+         * SDK-clamped host the guest UIKit shim keeps its own 320x480 rule
+         * and the portrait canvas is never installed. */
+        const bool aspectHost = LC32NativeLegacyRotationEnabled() &&
+            !LC32UIKitLegacyCompatibilityEnabled();
+        const LC32AspectCanvas canvas = LC32BundleAspectCanvasForHost(
+            bundle, LC32GetGuestExecutableSDKVersion(),
+            phoneHost && aspectHost, aspect);
+        if(canvas.applies) {
+            result.usesFixedLandscapePhoneCanvas =
+                canvas.letterboxed && canvas.landscape;
+            result.usesFixedPortraitPhoneCanvas =
+                canvas.letterboxed && !canvas.landscape;
+            result.mayRetainLegacyLandscapePhoneCanvas = false;
+            result.phoneCanvasLongEdge = canvas.longEdge;
+            if(canvas.letterboxed) {
+                fprintf(stderr, "LC32: LC32_ASPECT=%s: %s 320x%.0f canvas\n",
+                    aspectValue, canvas.landscape ? "landscape" : "portrait",
+                    canvas.longEdge);
+            } else {
+                fprintf(stderr, "LC32: LC32_ASPECT=%s: full screen\n",
+                    aspectValue);
+            }
+        } else if(aspect != LC32AspectModeAuto) {
+            fprintf(stderr, "LC32: LC32_ASPECT=%s does not apply "
+                "(iPad canvas, SDK 8+, not a phone host or SDK-clamped "
+                "host)\n", aspectValue);
+        }
     });
     return result;
 }
@@ -2575,6 +2609,8 @@ extern "C" bool LC32WindowKeepsLegacyPortrait(UIWindow *window) {
 
 }  // namespace
 
+static void LC32RetireStaleLegacyPortraitAnchor(UIWindowScene *scene);
+
 @interface LC32LegacyPortraitAnchorController : UIViewController
 @end
 
@@ -2609,8 +2645,6 @@ namespace {
  * let FrontBoard turn the scene with the phone before the anchor could pull
  * it back. Report portrait for that window itself; the application mask is
  * left alone so presented landscape controllers still find a common side. */
-static void LC32RetireStaleLegacyPortraitAnchor(UIWindowScene *scene);
-
 static IMP LC32OriginalWindowSupportedOrientationsConsultingApp;
 
 /* Modern Combat 4's logo movie leaves AVKit's AVFullScreenViewController
@@ -2762,40 +2796,6 @@ static void LC32RestoreLegacyPortraitScene(UIWindow *window) {
     }
 }
 
-void LC32ScheduleRootlessWindowLayerLayout(UIWindow *window);
-
-void LC32FitFullScreenRootlessWindow(UIWindow *window) {
-    LC32RestoreLegacyPortraitScene(window);
-    if(LC32FitRootlessIPadWindow(window)) return;
-    if(LC32WindowUsesRootlessPhoneCanvas(window)) {
-        LC32FitPresentedViewsInTurnedRootlessWindow(window, 0);
-        /* A device turn can make UIKit rebuild the window's transform
-         * layers without laying out anything of ours (9mm). */
-        LC32ScheduleRootlessWindowLayerLayout(window);
-    }
-    if(window.guest_selfOrNull) LC32WatchDeviceRotationForDiagnostics(window);
-    LC32LogFullScreenRootlessState(window,
-        LC32WindowIsFullScreenRootlessHosted(window) ? "fit(hosted)" : "fit");
-    CALayer *layer = LC32NativeViewLayer(window);
-    CALayer *parent = layer.superlayer;
-    if(!parent) return;
-    NSValue *applied = objc_getAssociatedObject(
-        parent, LC32FullScreenRootlessTurnKey);
-    if(applied) {
-        CATransform3D appliedTransform;
-        [applied getValue:&appliedTransform size:sizeof(appliedTransform)];
-        if(!CATransform3DEqualToTransform(
-                parent.sublayerTransform, appliedTransform)) {
-            // Another owner replaced it; leave theirs alone from now on.
-            objc_setAssociatedObject(parent, LC32FullScreenRootlessTurnKey,
-                nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            return;
-        }
-    } else if(!CATransform3DIsIdentity(parent.sublayerTransform)) {
-        return;
-    }
-    UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
-    const LC32FullScreenRootlessShape shape =
 }  // namespace
 
 /* The anchor stands in for a guest window that iPhone OS never rotated. When
@@ -2833,6 +2833,40 @@ extern "C" void LC32UIKitWindowRootControllerChanged(UIWindow *window) {
 
 namespace {
 
+void LC32ScheduleRootlessWindowLayerLayout(UIWindow *window);
+
+void LC32FitFullScreenRootlessWindow(UIWindow *window) {
+    LC32RestoreLegacyPortraitScene(window);
+    if(LC32FitRootlessIPadWindow(window)) return;
+    if(LC32WindowUsesRootlessPhoneCanvas(window)) {
+        LC32FitPresentedViewsInTurnedRootlessWindow(window, 0);
+        /* A device turn can make UIKit rebuild the window's transform
+         * layers without laying out anything of ours (9mm). */
+        LC32ScheduleRootlessWindowLayerLayout(window);
+    }
+    if(window.guest_selfOrNull) LC32WatchDeviceRotationForDiagnostics(window);
+    LC32LogFullScreenRootlessState(window,
+        LC32WindowIsFullScreenRootlessHosted(window) ? "fit(hosted)" : "fit");
+    CALayer *layer = LC32NativeViewLayer(window);
+    CALayer *parent = layer.superlayer;
+    if(!parent) return;
+    NSValue *applied = objc_getAssociatedObject(
+        parent, LC32FullScreenRootlessTurnKey);
+    if(applied) {
+        CATransform3D appliedTransform;
+        [applied getValue:&appliedTransform size:sizeof(appliedTransform)];
+        if(!CATransform3DEqualToTransform(
+                parent.sublayerTransform, appliedTransform)) {
+            // Another owner replaced it; leave theirs alone from now on.
+            objc_setAssociatedObject(parent, LC32FullScreenRootlessTurnKey,
+                nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return;
+        }
+    } else if(!CATransform3DIsIdentity(parent.sublayerTransform)) {
+        return;
+    }
+    UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
+    const LC32FullScreenRootlessShape shape =
         LC32ClassifyFullScreenRootlessWindow(window, orientation);
     {
         static int remaining = 100;
@@ -3357,6 +3391,45 @@ static void LC32NotePortraitCanvasDeviceSide(void) {
  * full-screen is otherwise sized to the scene by native UIKit) and scale the
  * native window to aspect-fit the scene, so drawing and hit-testing stay in
  * the guest's 320x480 coordinates. */
+/* Pre-iOS-8 UIKit sizes a window's root controller view from the physical
+ * screen (an internal call our guest screen hooks do not see), so a root
+ * installed after the canvas fit came out 402x874 inside the 320x568
+ * canvas (Nuts! under LC32_ASPECT=original) and drew past its right and
+ * bottom edges. Pull an upright root view that covers more than the canvas
+ * back to it; turned roots (Zenonia 3), landscape-shaped ones and smaller
+ * ones (Dungeon Raid's application frame) are left alone. */
+static void LC32FitPortraitPhoneCanvasRootView(UIWindow *window,
+                                              CGSize canvas) {
+    UIViewController *root = LC32NativeWindowRootViewController(window);
+    UIView *rootView = nil;
+    if(!root || !LC32ObjectUsesGuestClass(root) ||
+            !LC32NativeViewIfLoaded(root, &rootView) || !rootView ||
+            LC32NativeViewSuperview(rootView) != window ||
+            !CGAffineTransformIsIdentity(LC32NativeViewTransform(rootView))) {
+        return;
+    }
+    // Only a root that covers the whole canvas and more (a screen-sized
+    // root); a landscape-shaped root the game turns itself is left alone.
+    constexpr CGFloat epsilon = 0.5;
+    const CGRect bounds = LC32NativeViewBounds(rootView);
+    if(bounds.size.width < canvas.width - epsilon ||
+            bounds.size.height < canvas.height - epsilon ||
+            (bounds.size.width <= canvas.width + epsilon &&
+             bounds.size.height <= canvas.height + epsilon)) {
+        return;
+    }
+    LC32NativeSetViewBounds(rootView, CGRectMake(bounds.origin.x,
+        bounds.origin.y, canvas.width, canvas.height));
+    LC32NativeSetViewCenter(rootView,
+        CGPointMake(canvas.width / 2, canvas.height / 2));
+    static std::atomic<bool> logged{false};
+    if(!logged.exchange(true)) {
+        fprintf(stderr, "LC32: portrait canvas root view %.0fx%.0f -> "
+            "%.0fx%.0f\n", bounds.size.width, bounds.size.height,
+            canvas.width, canvas.height);
+    }
+}
+
 void LC32FitPortraitPhoneCanvasWindow(UIWindow *window) {
     if(!window || !window.guest_selfOrNull || !window.windowScene ||
             LC32ObjectUsesGuestClass(window) ||
@@ -3375,7 +3448,10 @@ void LC32FitPortraitPhoneCanvasWindow(UIWindow *window) {
     if(CGSizeEqualToSize(bounds.size, canvas) &&
             CGAffineTransformEqualToTransform(
                 LC32NativeViewTransform(window), target) &&
-            CGPointEqualToPoint(LC32NativeViewCenter(window), center)) return;
+            CGPointEqualToPoint(LC32NativeViewCenter(window), center)) {
+        LC32FitPortraitPhoneCanvasRootView(window, canvas);
+        return;
+    }
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     if(!CGSizeEqualToSize(bounds.size, canvas)) {
@@ -3385,6 +3461,9 @@ void LC32FitPortraitPhoneCanvasWindow(UIWindow *window) {
     }
     LC32NativeSetViewTransform(window, target);
     LC32NativeSetViewCenter(window, center);
+    // After the window: shrinking a window UIKit had stretched (320x696)
+    // also shrinks an autoresizing root by the same amount.
+    LC32FitPortraitPhoneCanvasRootView(window, canvas);
     [CATransaction commit];
 }
 
@@ -6357,6 +6436,16 @@ static id LC32ViewInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                         (int64_t)(delay * NSEC_PER_SEC)),
                     dispatch_get_main_queue(), ^{
+                        /* A rootless canvas window (Modern Conflict's
+                         * OpenKODE EAGL window) draws its landscape picture
+                         * into the portrait canvas itself. Keep the scene
+                         * portrait here: the startup-complete pass that
+                         * installs the anchor for rootless windows never
+                         * runs for games whose frame loop pumps a nested run
+                         * loop from a timer, so the scene turned with an
+                         * unlocked phone and showed the canvas sideways. */
+                        if(self.isKeyWindow)
+                            LC32RestoreLegacyPortraitScene(self);
                         LC32FitPortraitPhoneCanvasWindow(self);
                         LC32RotatePortraitPhoneCanvasController(self);
                     });
@@ -6436,16 +6525,6 @@ static void LC32DebuggerStopRunLoopBlock(void) {
 }
 
 static void LC32DebuggerStopRunLoopNotify(void) {
-                        /* A rootless canvas window (Modern Conflict's
-                         * OpenKODE EAGL window) draws its landscape picture
-                         * into the portrait canvas itself. Keep the scene
-                         * portrait here: the startup-complete pass that
-                         * installs the anchor for rootless windows never
-                         * runs for games whose frame loop pumps a nested run
-                         * loop from a timer, so the scene turned with an
-                         * unlocked phone and showed the canvas sideways. */
-                        if(self.isKeyWindow)
-                            LC32RestoreLegacyPortraitScene(self);
     CFRunLoopRef runLoop = CFRunLoopGetMain();
     CFRunLoopPerformBlock(runLoop, kCFRunLoopCommonModes, ^{
         LC32DebuggerStopRunLoopBlock();

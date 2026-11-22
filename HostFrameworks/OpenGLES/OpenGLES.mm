@@ -1147,6 +1147,16 @@ BOOL ReconcileDrawableStorage(EAGLContext *context, NSUInteger target,
                 }
             }
         }
+        static const bool logDrawables = [] {
+            const char *value = getenv("LC32_DRAWABLE_LOG");
+            return value && value[0] == '1';
+        }();
+        if(logDrawables && layer) {
+            const CGRect bounds = layer.bounds;
+            fprintf(stderr, "LC32: drawable %.0fx%.0f pt x%.2f -> %s\n",
+                bounds.size.width, bounds.size.height, layer.contentsScale,
+                result ? "ok" : "failed");
+        }
         if(result) {
             // Also retire the old record when native EAGL accepted the
             // replacement directly, without needing our release/retry.
