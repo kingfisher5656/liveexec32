@@ -1013,6 +1013,11 @@ static BOOL LC32MethodHasManualAdapter(NSString *className,
                [selector isEqualToString:@"cString"] ||
                [selector isEqualToString:@"cStringUsingEncoding:"] ||
                [selector isEqualToString:@"getCString:maxLength:encoding:"] ||
+               [selector isEqualToString:@"getCString:"] ||
+               [selector isEqualToString:@"getCString:maxLength:"] ||
+               [selector isEqualToString:
+                   @"getCString:maxLength:range:remainingRange:"] ||
+               [selector isEqualToString:@"lossyCString"] ||
                [selector isEqualToString:@"fileSystemRepresentation"] ||
                [selector isEqualToString:@"getFileSystemRepresentation:maxLength:"] ||
                [selector isEqualToString:@"getCharacters:"] ||

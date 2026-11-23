@@ -274,6 +274,38 @@ void LC32PostMovieDidFinish(id player, NSInteger reason);
 }
 @end
 
+/* Tap target for a movie turned in the game canvas whose app asked for
+ * user controls: a tap ends it the way the old Done button did. */
+@interface LC32LegacyMovieSkipTarget : NSObject <UIGestureRecognizerDelegate>
+@property(nonatomic, weak) id lc32_player;
+@end
+
+@implementation LC32LegacyMovieSkipTarget
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer
+        shouldRecognizeSimultaneouslyWithGestureRecognizer:
+            (UIGestureRecognizer *)other {
+    return YES;
+}
+- (void)lc32_skip:(UITapGestureRecognizer *)recognizer {
+    if(recognizer.state != UIGestureRecognizerStateEnded) return;
+    id player = self.lc32_player;
+    /* One finish per playback: not after the movie ended by itself, and not
+     * twice. -play clears the flag, so a replay can be skipped again. */
+    if(!player || LC32MoviePlayerWasStopped(player) ||
+            objc_getAssociatedObject(player, LC32MoviePlayerFinishedKey))
+        return;
+    objc_setAssociatedObject(player, LC32MoviePlayerFinishedKey, @YES,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    fprintf(stderr, "LC32: legacy movie skipped by tap\n");
+    ((void (*)(id, SEL))LC32OriginalMoviePlayerStop)(player, @selector(stop));
+    LC32PostMovieDidFinish(player, 2 /* MPMovieFinishReasonUserExited */);
+}
+@end
+
+namespace {
+const void *LC32MovieSkipTargetKey = &LC32MovieSkipTargetKey;
+}  // namespace
+
 namespace {
 void LC32RemoveMovieOverlay(id player) {
     LC32LegacyMovieOverlayWindow *overlay = player
@@ -577,10 +609,30 @@ void LC32TurnMovieInGameCanvas(id player) {
     }
     objc_setAssociatedObject(child, LC32MovieTurnedInGameCanvasKey, @YES,
         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    /* An app that asked for controls (N.O.V.A.'s intro: Fullscreen; its logo
+     * asks for None) let the player leave the movie with the Done button.
+     * Current controls would be laid out for the unturned view, so drop them
+     * and let a tap end the movie instead. */
+    const bool userCanExit =
+        [player respondsToSelector:@selector(controlStyle)] &&
+        ((NSInteger (*)(id, SEL))objc_msgSend)(
+            player, @selector(controlStyle)) != 0 /* None */;
     if([player respondsToSelector:@selector(setControlStyle:)]) {
-        // Full-screen movies of that era had no transport controls here.
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(
             player, @selector(setControlStyle:), 0 /* None */);
+    }
+    if(userCanExit) {
+        LC32LegacyMovieSkipTarget *target = [LC32LegacyMovieSkipTarget new];
+        target.lc32_player = player;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+            initWithTarget:target action:@selector(lc32_skip:)];
+        tap.delegate = target;
+        tap.cancelsTouchesInView = NO;
+        child.userInteractionEnabled = YES;
+        [child addGestureRecognizer:tap];
+        // The recognizer holds its target weakly.
+        objc_setAssociatedObject(child, LC32MovieSkipTargetKey, target,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -593,13 +645,14 @@ void LC32TurnMovieInGameCanvas(id player) {
     if(child.backgroundColor == nil) child.backgroundColor = UIColor.blackColor;
     [CATransaction commit];
     fprintf(stderr, "LC32: full-screen movie turned in the game canvas "
-        "(%.0fx%.0f, side %ld)\n", bounds.size.height,
-        bounds.size.width, (long)side);
+        "(%.0fx%.0f, side %ld%s)\n", bounds.size.height,
+        bounds.size.width, (long)side, userCanExit ? ", tap skips" : "");
 
     /* MediaPlayer attaches its playback view to the proxy later, at the
      * proxy's old size; keep the proxy's children filling it. */
     __weak UIView *weakChild = child;
     __weak UIView *weakMovieView = movieView;
+    __weak id weakPlayer = player;
     [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES
         block:^(NSTimer *timer) {
             UIView *turned = weakChild;
@@ -614,6 +667,18 @@ void LC32TurnMovieInGameCanvas(id player) {
                 if(!CGRectEqualToRect(grandchild.frame, view.bounds))
                     grandchild.frame = view.bounds;
             }
+            if(!userCanExit) return;
+            /* AVKit's player view would take the skip tap; it shows no
+             * controls here anyway. Leave the app's own overlays alone. */
+            id current = weakPlayer;
+            UIViewController *playback =
+                [current respondsToSelector:@selector(playerViewController)]
+                ? ((UIViewController *(*)(id, SEL))objc_msgSend)(
+                    current, @selector(playerViewController)) : nil;
+            UIView *playbackView = playback.viewIfLoaded;
+            if(playbackView && [playbackView isDescendantOfView:turned] &&
+                    playbackView.userInteractionEnabled)
+                playbackView.userInteractionEnabled = NO;
         }];
 }
 
