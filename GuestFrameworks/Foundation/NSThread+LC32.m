@@ -605,6 +605,37 @@ uint64_t LC32NSThreadHostThread(NSThread *thread) {
     return hostThread;
 }
 
+/*
+ * Queue a non-waiting perform for a started thread on its native perform
+ * source, which the thread's run loop services before it waits again (as
+ * native -performSelector:onThread:withObject:waitUntilDone:NO does).
+ * Returns NO when the thread has no host thread yet; the caller falls back.
+ */
+BOOL LC32NSThreadQueueNativePerform(NSThread *thread, id target,
+        SEL selector, id object, NSArray *modes) {
+    if(!thread || !thread->_lc32State) return NO;
+    LC32NSThreadState *state = thread->_lc32State;
+    pthread_mutex_lock(&state->lock);
+    const uint64_t hostThread = state->hostThread;
+    pthread_mutex_unlock(&state->lock);
+    if(!hostThread) return NO;
+
+    LC32PendingThreadPerform *request = [LC32PendingThreadPerform new];
+    request->target = [target retain];
+    request->object = [object retain];
+    request->selector = selector;
+    request->modes = [modes copy];
+    /* Native performing retains the request through delivery. */
+    static uint64_t performSelector __attribute__((aligned(8)));
+    LC32InvokeHostSelector(request.host_self,
+        LC32CachedHostSelector(&performSelector,
+            @selector(performSelector:onThread:withObject:waitUntilDone:modes:), NO),
+        LC32GetHostSelector(@selector(lc32_fire:)), hostThread,
+        (uint64_t)0, (uint64_t)NO, [request->modes host_self], (uint64_t)0);
+    [request release];
+    return YES;
+}
+
 BOOL LC32NSThreadQueuePerformBeforeStart(NSThread *thread, id target,
         SEL selector, id object, BOOL wait, NSArray *modes) {
     if(!thread || !thread->_lc32State) return NO;

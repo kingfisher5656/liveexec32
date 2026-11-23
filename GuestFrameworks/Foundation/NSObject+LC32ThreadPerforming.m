@@ -7,6 +7,8 @@ extern BOOL LC32NSThreadIsCurrentThread(NSThread *thread);
 extern uint64_t LC32NSThreadHostThread(NSThread *thread);
 extern BOOL LC32NSThreadQueuePerformBeforeStart(NSThread *thread, id target,
     SEL selector, id object, BOOL wait, NSArray *modes);
+extern BOOL LC32NSThreadQueueNativePerform(NSThread *thread, id target,
+    SEL selector, id object, NSArray *modes);
 
 static NSArray *LC32CommonRunLoopModes(void) {
     return [NSArray arrayWithObject:NSRunLoopCommonModes];
@@ -23,19 +25,27 @@ static NSArray *LC32CommonRunLoopModes(void) {
 
     /*
      * Keep same-thread delivery tied to a guest request.  Forwarding this
-     * case through native -performSelector:onThread: installs a host run-loop
-     * source whose target is only a mirror of the guest object.  The delayed
-     * performing shim instead uses a host-backed timer which explicitly
-     * re-enters the guest to invoke the original selector.  In particular,
-     * YTApiaryDeviceAuthenticator queues work back to its current thread with
-     * waitUntilDone:NO; the native NSThread source never re-entered the guest,
-     * so performQueuedRequest: was never run.
+     * case through native -performSelector:onThread: with the original target
+     * installs a host run-loop source whose target is only a mirror of the
+     * guest object.  In particular, YTApiaryDeviceAuthenticator queues work
+     * back to its current thread with waitUntilDone:NO; the native NSThread
+     * source never re-entered the guest, so performQueuedRequest: was never
+     * run.  A guest LC32PendingThreadPerform does re-enter the guest.
+     *
+     * Use the native perform source rather than a zero-delay timer: iOS runs
+     * a queued same-thread perform before its run loop waits again in one of
+     * the perform's modes, so a common-mode perform precedes the next
+     * CADisplayLink frame.  A timer races that frame.  Paladog! parses its database, hands the rows over with
+     * performSelectorOnMainThread:waitUntilDone:NO, and reads them in the
+     * next frame; when the frame won, objectAtIndex: threw on the empty list
+     * and the game stayed on its loading screen.
      */
     if(LC32NSThreadIsCurrentThread(thread)) {
         if(wait) {
             ((void (*)(id, SEL, id))objc_msgSend)(
                 self, selector, object);
-        } else {
+        } else if(!LC32NSThreadQueueNativePerform(
+                thread, self, selector, object, modes)) {
             [self performSelector:selector withObject:object afterDelay:0
                           inModes:modes];
         }
