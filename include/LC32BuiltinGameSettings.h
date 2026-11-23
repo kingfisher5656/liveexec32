@@ -29,6 +29,9 @@ static const LC32BuiltinGameSetting LC32BuiltinGameSettings[] = {
     /* Galaxy on Fire 2 HD: full screen, with its phone UI patch keeping the
      * HUD in a centred 16:9 box. */
     {"www.fishlabs.net.gof2hd", "LC32_ASPECT", "auto"},
+    /* Epic Zen Garden (Unreal Engine 4, 30 MB executable): startup code
+     * alone overflows the default 32 MiB JIT cache several times. */
+    {"com.epicgames.ZenGarden", "LC32_JIT_CACHE_MB", "64"},
 };
 
 static inline const char *LC32BuiltinGameSettingValue(

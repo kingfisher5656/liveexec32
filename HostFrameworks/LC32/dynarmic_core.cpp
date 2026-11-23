@@ -459,6 +459,11 @@ static int ValidateGuestMunmapRangeLocked(
         return -1;
     }
     khash_t(memory) *memory = sharedHandle.memory;
+    if (memory == nullptr) {
+        /* The guest VM is gone (native objects may outlive it). */
+        errno = EINVAL;
+        return -1;
+    }
     const u64 end = address + size;
 
     /*
@@ -488,6 +493,23 @@ int ValidateGuestMunmapRange(
     return ValidateGuestMunmapRangeLocked(address, size);
 }
 
+
+/*
+ * Remove a Dynarmic_direct_mmap view of host memory, but only while its first
+ * page still shows that host address: a native owner may outlive the guest
+ * VM, or the guest may have replaced the range in the meantime.
+ */
+int Dynarmic_munmap_direct(u32 address, u64 size, const void *host) {
+    std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
+    khash_t(memory) *memory = sharedHandle.memory;
+    if (memory == nullptr) return -1;
+    const khiter_t k = kh_get(memory, memory, address);
+    if (k == kh_end(memory) || kh_value(memory, k)->addr != host ||
+            kh_value(memory, k)->backing != nullptr) {
+        return -1;
+    }
+    return Dynarmic_munmap(address, size);
+}
 
 int Dynarmic_munmap(u64 address, u64 size) {
     std::unique_lock<std::recursive_mutex> lock(

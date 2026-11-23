@@ -287,6 +287,7 @@ void LC32ApplyFastFP(Dynarmic::A32::UserConfig &config);
 std::uint32_t LC32GuestInitialFpscr();
 void Dynarmic_nativeDestroy();
 int Dynarmic_munmap(u64 address, u64 size);
+int Dynarmic_munmap_direct(u32 address, u64 size, const void *host);
 u32 Dynarmic_direct_mmap(u32 address, u64 size, int protection, int flags, void *src, u64 off);
 u32 Dynarmic_mmap(u32 address, u64 size, int protection, int flags,
                  int fildes, u64 off, u64 mask = DYN_PAGE_MASK,

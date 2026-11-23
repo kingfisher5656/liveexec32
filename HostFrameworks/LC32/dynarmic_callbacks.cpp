@@ -35,6 +35,7 @@ static bool GuestSVCMayPark(int number) {
 }
 extern "C" uint32_t LC32_OpenGLES_DispatchInline(uint32_t opcode, uint32_t guestCall, uint32_t stack);
 extern "C" bool LC32_OpenGLES_InlineDispatchAllowed(void);
+extern "C" uint32_t LC32_Metal_DispatchInline(uint32_t opcode, uint32_t guestCall, uint32_t stack);
 namespace {
 static kern_return_t WaitForGuestSemaphore(
         semaphore_t semaphore, const mach_timespec_t *timeout = nullptr) {
@@ -2685,6 +2686,14 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                     if (target == (u64)&LC32_OpenGLES_Dispatch &&
                             LC32_OpenGLES_InlineDispatchAllowed()) {
                         cpu->Regs()[0] = LC32_OpenGLES_DispatchInline(
+                            cpu->Regs()[2], cpu->Regs()[3],
+                            cpu->Regs()[Reg::SP]);
+                        break;
+                    }
+                    /* Metal state/draw calls likewise (the guest picks
+                     * this entry only for calls that run no guest code). */
+                    if (target == (u64)&LC32_Metal_DispatchInline) {
+                        cpu->Regs()[0] = LC32_Metal_DispatchInline(
                             cpu->Regs()[2], cpu->Regs()[3],
                             cpu->Regs()[Reg::SP]);
                         break;

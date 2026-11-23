@@ -361,6 +361,8 @@ static std::atomic<long> LC32GuestRootlessStatusBarOrientation{0};
 }
 @end
 
+extern "C" long LC32UIKitLandscapeLaunchStatusBarOrientation(void);
+
 @interface UIApplication (LC32GuestStatusBarOrientation)
 - (UIInterfaceOrientation)lc32_guestStatusBarOrientation;
 - (void)lc32_guestSetStatusBarOrientation:(UIInterfaceOrientation)orientation;
@@ -518,6 +520,8 @@ static void LC32GuestNoteRootlessStatusBarOrientation(
     const long rootlessSide = LC32GuestRootlessStatusBarOrientation.load();
     if(rootlessSide && LC32GuestRootlessStatusBarGate())
         return (UIInterfaceOrientation)rootlessSide;
+    if(const long launchSide = LC32UIKitLandscapeLaunchStatusBarOrientation())
+        return (UIInterfaceOrientation)launchSide;
     const SEL original = @selector(statusBarOrientation);
     using GetOrientation = UIInterfaceOrientation (*)(id, SEL);
     return ((GetOrientation)LC32NativeHostMethod(self, original))(self, original);

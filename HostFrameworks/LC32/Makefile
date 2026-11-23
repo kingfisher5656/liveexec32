@@ -78,7 +78,7 @@ LiveExec32Shared_FILES = \
 	../CoreText/CoreText.mm ../CoreMedia/CoreMedia.mm ../CoreVideo/CoreVideo.mm \
 	../AudioToolbox/AudioToolbox.mm \
 	../Accelerate/Accelerate.mm \
-	../OpenAL/OpenAL.mm ../OpenGLES/OpenGLES.mm ../UIKit/UIKit.mm \
+	../OpenAL/OpenAL.mm ../OpenGLES/OpenGLES.mm ../Metal/Metal.mm ../UIKit/UIKit.mm \
 	../UIKit/LegacyAutoLayout.mm ../UIKit/LegacyFonts.mm ../UIKit/LegacyAlerts.mm \
 	../UIKit/LegacyRotation.mm ../UIKit/LegacyNibLoading.mm ../UIKit/LegacyNibClasses.mm ../UIKit/GuestSelectorHooks.mm \
 	../UIKit/GuestScreenMetrics.mm ../UIKit/GuestStatusBar.mm ../UIKit/ClassicPresentation.mm \
@@ -91,6 +91,7 @@ LiveExec32Shared_CFLAGS = \
 LiveExec32Shared_CCFLAGS = -std=c++17
 dynarmic_native_jit.cpp_CFLAGS = -I$(DYNARMIC_ROOT)/externals/oaknut/include
 crash_exception.mm_CFLAGS = -fobjc-arc
+../Metal/Metal.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyFonts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyAlerts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyRotation.mm_CFLAGS = -fobjc-arc

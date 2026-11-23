@@ -2303,6 +2303,8 @@ extern "C" u32 LC32LoadNativeFramework(u32 guestFrameworkName) {
  * guest half loads Metal before resolving this thunk; do not cache a failed
  * dlsym lookup in case an older host loads the framework lazily.
  */
+extern "C" u32 LC32MetalGuestProxyClass(id object);
+
 extern "C" u32 LC32_Metal_MTLCreateSystemDefaultDevice(void) {
     using CreateDefaultDevice = id (*)(void);
     CreateDefaultDevice createDefaultDevice =
@@ -6260,11 +6262,20 @@ LC32DeferredGuestPinReleases() {
 
 static thread_local bool LC32DrainingGuestPinReleases;
 
+/* Set while a host call runs inline from inside the guest JIT (Metal state
+ * calls): guest code cannot run then, so a native release that would drop a
+ * guest reference is queued like one from a non-guest thread and drained at
+ * this thread's next host-to-guest message. */
+static thread_local int LC32InlineHostCallDepth;
+
+extern "C" void LC32EnterInlineHostCall(void) { ++LC32InlineHostCallDepth; }
+extern "C" void LC32LeaveInlineHostCall(void) { --LC32InlineHostCallDepth; }
+
 static void LC32ReleaseGuestReference(
         u32 guestObject, LC32GuestReleaseKind kind,
         id hostObjectToKeepAlive = nil,
         u64 weakRegistryGeneration = 0) {
-    if(threadHandle.jit && threadHandle.cb) {
+    if(threadHandle.jit && threadHandle.cb && !LC32InlineHostCallDepth) {
         if(kind == LC32GuestReleaseKind::LifetimePin) {
             LC32RefreshHostWeakMappingRetiringOwner(
                 guestObject, weakRegistryGeneration);
@@ -6359,7 +6370,7 @@ extern "C" void LC32ReleaseGuestBlock(u32 guestBlock) {
 }
 
 static void LC32DrainDeferredGuestPinReleases() {
-    if(LC32DrainingGuestPinReleases ||
+    if(LC32DrainingGuestPinReleases || LC32InlineHostCallDepth ||
             !threadHandle.jit || !threadHandle.cb) {
         return;
     }
@@ -7385,6 +7396,14 @@ static u32 LC32CreateGuestProxy(id hostObject, u32 guestClass) {
             ptr = guest_objc_getClass(class_getName(matchedHostClass));
             if(ptr) break;
             matchedHostClass = class_getSuperclass(matchedHostClass);
+        }
+        /* Native Metal objects have private classes; give them the guest
+         * proxy class of the Metal protocol they implement. */
+        if(ptr && matchedHostClass == [NSObject class] &&
+                !object_isClass(self)) {
+            if(const u32 metalClass = LC32MetalGuestProxyClass(self)) {
+                ptr = metalClass;
+            }
         }
     }
     if(!ptr) {

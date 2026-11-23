@@ -219,6 +219,12 @@ static const char *GuestMachineOverride() {
              * re-reads hw.machine and logs it (every frame; 200k lines),
              * and it gets no quality tier. */
             { "com.2k.bioshock", "bioshock", "iPhone7,2" },
+            /* Early Unreal Engine 4 (IOSPlatformMisc GetIOSDeviceType)
+             * knows iPhone models up to iPhone7,x (iPhone 6 / 6 Plus) and
+             * stops with LowLevelFatalError "This IOS device type is not
+             * supported by UE4" on anything newer. Later UE4 maps unknown
+             * newer models forward, so only the known early games. */
+            { "com.epicgames.ZenGarden", nullptr, "iPhone7,2" },
         };
         /* NSBundle.mainBundle is the guest .app under LiveContainer (and in
          * the simulator harness); CFBundleGetMainBundle may not be. */

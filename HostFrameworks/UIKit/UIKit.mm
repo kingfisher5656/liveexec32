@@ -5534,6 +5534,47 @@ extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void) {
 #endif
 }
 
+/*
+ * The status bar side matching LC32LandscapeLaunchExtent: while the scene of
+ * an SDK 8+ landscape-only guest is still the launcher's portrait, report the
+ * landscape side iOS is about to turn it to (the held side, else
+ * LandscapeRight like UIKit), so the guest does not decide it was launched in
+ * portrait. Unreal Engine 4 reads this once at launch to pick and turn its
+ * splash image and never looks again. 0 once the scene is landscape.
+ */
+extern "C" long LC32UIKitLandscapeLaunchStatusBarOrientation(void) {
+    if(!LC32UIKitGuestScreenIsLandscapeOnly()) return 0;
+    /* Guest selector hooks do not apply to these native calls. */
+    const CGRect bounds = UIScreen.mainScreen.bounds;
+    if(bounds.size.width >= bounds.size.height) return 0;
+    const UIInterfaceOrientationMask declared =
+        LC32GuestInterfacePolicy().declaredOrientations;
+    UIInterfaceOrientation side = UIInterfaceOrientationUnknown;
+    switch(UIDevice.currentDevice.orientation) {
+        case UIDeviceOrientationLandscapeLeft:
+            side = UIInterfaceOrientationLandscapeRight;
+            break;
+        case UIDeviceOrientationLandscapeRight:
+            side = UIInterfaceOrientationLandscapeLeft;
+            break;
+        default:
+            break;
+    }
+    if(side == UIInterfaceOrientationUnknown ||
+            !(declared & (1UL << side))) {
+        side = (declared & UIInterfaceOrientationMaskLandscapeRight)
+            ? UIInterfaceOrientationLandscapeRight
+            : UIInterfaceOrientationLandscapeLeft;
+    }
+    static std::atomic<bool> logged{false};
+    if(!logged.exchange(true)) {
+        fprintf(stderr, "LC32: guest status bar orientation reported as %ld "
+            "while the scene is still portrait (landscape-only SDK 8+ "
+            "guest)\n", (long)side);
+    }
+    return (long)side;
+}
+
 extern "C" BOOL LC32NativeLegacyRotationCanCallGuest(void) {
     return LC32CanQueryGuestOrientation();
 }
