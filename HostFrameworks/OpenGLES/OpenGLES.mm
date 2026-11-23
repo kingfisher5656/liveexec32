@@ -3286,6 +3286,18 @@ size_t VertexAttribElementCount(GLenum pname) {
             glGetRenderbufferParameteriv(GL_RENDERBUFFER,
                 GL_RENDERBUFFER_HEIGHT, &height);
         }
+        // UIKit.mm compares it with the layer's view to find a renderer that
+        // missed a landscape turn.
+        static const void *storageKey = (const void *)sel_registerName(
+            "lc32_drawableStorageSize");
+        const CGSize storage = CGSizeMake(width, height);
+        objc_setAssociatedObject(drawableLayer, storageKey,
+            result && width > 0 && height > 0
+                ? [NSValue valueWithBytes:&storage objCType:@encode(CGSize)]
+                : nil,
+            // Atomic: the main thread reads it while a render thread may
+            // replace it.
+            OBJC_ASSOCIATION_RETAIN);
         const CGRect bounds = drawableLayer.bounds;
         fprintf(stderr, "LC32GL storage %s %dx%d layer=%.0fx%.0f scale=%.2f\n",
             result ? "ok" : "failed", width, height, bounds.size.width,

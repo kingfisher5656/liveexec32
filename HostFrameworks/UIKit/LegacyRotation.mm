@@ -43,6 +43,10 @@ extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void);
 extern "C" bool LC32UIKitWindowIsPortraitHosted(UIWindow *window);
 extern "C" void LC32RefitPortraitPhoneCanvasWindowLater(UIWindow *window);
 extern "C" void LC32UIKitWindowRootControllerChanged(UIWindow *window);
+extern "C" void LC32UIKitNoteRootlessControllerOrientation(
+    UIViewController *controller, UIInterfaceOrientation orientation);
+extern "C" bool LC32UIKitHoldsRendererLaunchRotation(
+    UIWindow *window, UIViewController *controller);
 extern "C" bool dyld_program_sdk_at_least(LC32RotationBuildVersion version);
 
 namespace {
@@ -365,6 +369,9 @@ void UpdateWindow(UIWindow *window, UIInterfaceOrientation orientation,
     LC32LegacyRotationState *state = WindowState(window);
     const bool initializing = state.initializedController != controller;
     if(initialOnly && !initializing) return;
+    // A full-screen renderer turns after its first frame (UIKit.mm).
+    if(!NativeRoot(window) &&
+            LC32UIKitHoldsRendererLaunchRotation(window, controller)) return;
     // Rootless legacy windows have no native rotation client yet. Once one is
     // registered, respect UIKit's presentation and rotation-lock decisions.
     if(NativeRoot(window) && nativeRotationQuery) {
@@ -401,7 +408,11 @@ void UpdateWindow(UIWindow *window, UIInterfaceOrientation orientation,
                     UIApplication.sharedApplication.statusBarOrientationAnimationDuration;
                 [window _setRotatableClient:controller toOrientation:orientation
                     updateStatusBar:YES duration:duration force:sameOrientation isRotating:YES];
-                if(initialSync) [controller didRotateFromInterfaceOrientation:orientation];
+                if(initialSync) {
+                    [controller didRotateFromInterfaceOrientation:orientation];
+                    // UIKit.mm's missed-turn repair must not repeat it.
+                    LC32UIKitNoteRootlessControllerOrientation(controller, orientation);
+                }
             } @finally {
                 activeRequest = request.previous;
             }

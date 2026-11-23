@@ -2316,8 +2316,12 @@ LC32FullScreenRootlessShape LC32ClassifyFullScreenRootlessWindow(
     return parentPortrait ? Shape::Resync : Shape::None;
 }
 
+/* fullScreen: called for a full-screen rootless window (the launch-turn
+ * hold and the missed-turn repair apply only there, not to the fixed
+ * portrait canvas, which shares the turn itself). */
 void LC32RotateFullScreenRootlessController(
-        UIWindow *window, UIInterfaceOrientation orientation);
+        UIWindow *window, UIInterfaceOrientation orientation,
+        bool fullScreen = true);
 
 
 // TEMP device diagnostics for the Air Mail/Starfront landscape report.
@@ -3272,8 +3276,120 @@ void LC32FitFullScreenRootlessWindowLayers(UIWindow *window) {
 const void *LC32FullScreenRootlessControllerOrientationKey =
     &LC32FullScreenRootlessControllerOrientationKey;
 
+/* Set once the guest has presented a GL frame (LegacyFrameRate.mm), or once
+ * the wait for one has timed out after startup. */
+std::atomic<bool> LC32GuestPresentedFrame{false};
+std::atomic<bool> LC32FullScreenRootlessFrameWaitOver{false};
+
+void LC32RefitAllFullScreenRootlessWindows(void) {
+    for(UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if(![scene isKindOfClass:UIWindowScene.class]) continue;
+        for(UIWindow *window in ((UIWindowScene *)scene).windows)
+            LC32FitFullScreenRootlessWindow(window);
+    }
+}
+
+/* The size of the GL storage last allocated for this layer (OpenGLES.mm
+ * records it under the same selector-named key). */
+bool LC32LayerDrawableStorageSize(CALayer *layer, CGSize *size) {
+    static const void *key = (const void *)sel_registerName(
+        "lc32_drawableStorageSize");
+    NSValue *value = layer ? objc_getAssociatedObject(layer, key) : nil;
+    if(!value || strcmp(value.objCType, @encode(CGSize)) != 0) return false;
+    [value getValue:size size:sizeof(*size)];
+    return size->width > 0 && size->height > 0;
+}
+
+/* A renderer view that ended up turned to landscape (UIKit's legacy movie
+ * transition does that when it restores the presenter) while its GL storage
+ * is still the portrait one: the game was never told about the turn. */
+bool LC32RendererMissedLandscapeTurn(UIView *view) {
+    CALayer *layer = LC32NativeViewLayer(view);
+    if(![layer isKindOfClass:CAEAGLLayer.class]) return false;
+    CGSize storage;
+    if(!LC32LayerDrawableStorageSize(layer, &storage)) return false;
+    const CGRect bounds = LC32NativeViewBounds(view);
+    return storage.width < storage.height &&
+        bounds.size.width > bounds.size.height;
+}
+
+/* iPhone OS turned a launching app after its first frame, and engines read
+ * the screen during that frame: Air Mail picks its iPad 3 fonts when
+ * Screen.width > 1200 there, so an earlier turn (2x landscape is 1704 wide)
+ * blows its menu text up. Hold a full-screen renderer controller's first
+ * turn until the guest has presented once (or the wait has timed out). */
+bool LC32HoldsRendererLaunchRotation(UIView *view,
+                                     UIViewController *controller) {
+    return !LC32GuestPresentedFrame.load(std::memory_order_acquire) &&
+        !LC32FullScreenRootlessFrameWaitOver.load(std::memory_order_acquire) &&
+        [LC32NativeViewLayer(view) isKindOfClass:CAEAGLLayer.class] &&
+        !objc_getAssociatedObject(controller,
+            LC32FullScreenRootlessControllerOrientationKey);
+}
+
+void LC32LogHeldRendererLaunchRotation(UIViewController *controller) {
+    static bool logged;
+    if(logged) return;
+    logged = true;
+    fprintf(stderr, "LC32: holding %s's launch rotation until its first "
+        "frame\n", object_getClassName(controller));
+}
+
+/* UIKit's legacy movie transition can restore a renderer view already
+ * turned to landscape without the rotation callbacks. LegacyRotation.mm
+ * normally sends them when the view returns to the window, but on an iOS 27
+ * device the dismissed logo movie stays listed as presented, which makes it
+ * skip: Unity then stretches its portrait surface over the landscape screen
+ * and maps touches wrongly. Send them if the storage is still portrait a
+ * little later (that sync, or a didRotate UIKit sent, reallocates it on the
+ * game's next frame). */
+void LC32RepairMissedLandscapeTurnLater(UIWindow *window, UIView *view,
+        UIViewController *controller, UIInterfaceOrientation orientation) {
+    // Process-lifetime game objects; the block retains them until it runs.
+    UIWindow *pendingWindow = window;
+    UIView *pendingView = view;
+    UIViewController *pendingController = controller;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+            dispatch_get_main_queue(), ^{
+        if(!LC32CanQueryGuestOrientation() ||
+                LC32NativeViewSubviews(pendingWindow).firstObject !=
+                    pendingView ||
+                pendingView.nextResponder != pendingController ||
+                !LC32RendererMissedLandscapeTurn(pendingView)) return;
+        // Still the full-screen rootless window, on this side.
+        UIInterfaceOrientation side = UIInterfaceOrientationUnknown;
+        if(LC32ClassifyFullScreenRootlessWindow(pendingWindow, side) ==
+                LC32FullScreenRootlessShape::None || side != orientation ||
+                !LC32TransformNearlyEquals(LC32NativeViewTransform(pendingView),
+                    CGAffineTransformMakeRotation(
+                        orientation == UIInterfaceOrientationLandscapeLeft
+                            ? -M_PI_2 : M_PI_2))) return;
+        NSNumber *told = objc_getAssociatedObject(pendingController,
+            LC32FullScreenRootlessControllerOrientationKey);
+        // Told already; its renderer has not reallocated yet.
+        if(told && told.integerValue == orientation) return;
+        SEL should = @selector(shouldAutorotateToInterfaceOrientation:);
+        if([pendingController respondsToSelector:should] &&
+                !((BOOL (*)(id, SEL, UIInterfaceOrientation))objc_msgSend)(
+                    pendingController, should, orientation)) return;
+        const UIInterfaceOrientation from = told
+            ? (UIInterfaceOrientation)told.integerValue
+            : UIInterfaceOrientationPortrait;
+        fprintf(stderr, "LC32: %s was turned without rotation callbacks; "
+            "sending them so its renderer resizes\n",
+            object_getClassName(pendingController));
+        objc_setAssociatedObject(pendingController,
+            LC32FullScreenRootlessControllerOrientationKey, @(orientation),
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [pendingController willRotateToInterfaceOrientation:orientation
+                                                   duration:0];
+        [pendingController didRotateFromInterfaceOrientation:from];
+    });
+}
+
 void LC32RotateFullScreenRootlessController(
-        UIWindow *window, UIInterfaceOrientation orientation) {
+        UIWindow *window, UIInterfaceOrientation orientation,
+        bool fullScreen) {
     /* iPhone OS delivered the launch rotation after startup; Unity resizes
      * its surface on didRotate only once rendering has begun. */
     if(!LC32CanQueryGuestOrientation()) return;
@@ -3282,10 +3398,19 @@ void LC32RotateFullScreenRootlessController(
     if(!view || ![next isKindOfClass:UIViewController.class] ||
             !LC32ObjectUsesGuestClass(next)) return;
     UIViewController *controller = (UIViewController *)next;
+    if(fullScreen && LC32HoldsRendererLaunchRotation(view, controller)) {
+        LC32LogHeldRendererLaunchRotation(controller);
+        return;
+    }
     const CGAffineTransform target = CGAffineTransformMakeRotation(
         orientation == UIInterfaceOrientationLandscapeLeft ? -M_PI_2 : M_PI_2);
     const CGAffineTransform current = LC32NativeViewTransform(view);
-    if(LC32TransformNearlyEquals(current, target)) return;
+    if(LC32TransformNearlyEquals(current, target)) {
+        if(fullScreen && LC32RendererMissedLandscapeTurn(view))
+            LC32RepairMissedLandscapeTurnLater(window, view, controller,
+                orientation);
+        return;
+    }
     // Only from the untouched portrait view or the other landscape side.
     if(!LC32TransformNearlyEquals(current, CGAffineTransformIdentity) &&
             !LC32TransformNearlyEquals(current, CGAffineTransformInvert(target)))
@@ -3826,7 +3951,7 @@ void LC32RotatePortraitPhoneCanvasController(UIWindow *window) {
     }
     // The last question iPhone OS asked was about the side it turned to.
     (void)accepts(side);
-    LC32RotateFullScreenRootlessController(window, side);
+    LC32RotateFullScreenRootlessController(window, side, false);
     LC32NotePortraitCanvasGuestSide(view, !(right && left));
 }
 
@@ -5127,12 +5252,18 @@ void LC32FinishGuestOrientationStartupAfterLaunch(void) {
             if(LC32NativeLegacyRotationEnabled()) {
                 LC32FinishNativeLegacyRotationStartup();
                 // Rotation was held back until the renderer is up.
-                for(UIScene *scene in
-                        UIApplication.sharedApplication.connectedScenes) {
-                    if(![scene isKindOfClass:UIWindowScene.class]) continue;
-                    for(UIWindow *window in ((UIWindowScene *)scene).windows)
-                        LC32FitFullScreenRootlessWindow(window);
-                }
+                LC32RefitAllFullScreenRootlessWindows();
+                // A full-screen renderer's turn also waits for its first
+                // frame (LC32RotateFullScreenRootlessController), but not
+                // forever: a game might draw only once turned.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                        5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                    if(LC32GuestPresentedFrame.load(std::memory_order_acquire))
+                        return;
+                    LC32FullScreenRootlessFrameWaitOver.store(
+                        true, std::memory_order_release);
+                    LC32RefitAllFullScreenRootlessWindows();
+                });
             } else {
                 LC32AdoptLegacyRootViewControllers();
             }
@@ -5218,6 +5349,44 @@ extern "C" bool LC32UIKitKeepsLegacyScenePortrait(void) {
     return LC32FullScreenRootlessHosting.load(std::memory_order_acquire) ||
         LC32PortraitHostedLandscape == LC32PortraitHostState::Hosted ||
         LC32GuestUsesFixedPortraitPhoneCanvas();
+}
+
+/* LegacyRotation.mm: its startup sync must not turn a full-screen rootless
+ * renderer before its first frame either (see LC32RotateFullScreenRootless-
+ * Controller, which turns it once that frame is up). */
+extern "C" bool LC32UIKitHoldsRendererLaunchRotation(
+        UIWindow *window, UIViewController *controller) {
+    if(!window || !controller || LC32GuestPresentedFrame.load(
+            std::memory_order_acquire)) return false;
+    UIView *view = LC32NativeViewSubviews(window).firstObject;
+    if(!view || view.nextResponder != controller ||
+            !LC32HoldsRendererLaunchRotation(view, controller)) return false;
+    UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
+    if(LC32ClassifyFullScreenRootlessWindow(window, orientation) ==
+            LC32FullScreenRootlessShape::None) return false;
+    LC32LogHeldRendererLaunchRotation(controller);
+    return true;
+}
+
+/* LegacyRotation.mm: it gave a rootless window's first-subview controller
+ * its rotation callbacks for this orientation. */
+extern "C" void LC32UIKitNoteRootlessControllerOrientation(
+        UIViewController *controller, UIInterfaceOrientation orientation) {
+    if(!controller) return;
+    objc_setAssociatedObject(controller,
+        LC32FullScreenRootlessControllerOrientationKey, @(orientation),
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+/* LegacyFrameRate.mm, on every guest presentRenderbuffer: (any thread). The
+ * first one releases a full-screen renderer's held launch rotation. */
+extern "C" void LC32UIKitNoteGuestPresent(void) {
+    if(LC32GuestPresentedFrame.load(std::memory_order_relaxed) ||
+            LC32GuestPresentedFrame.exchange(true, std::memory_order_acq_rel))
+        return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LC32RefitAllFullScreenRootlessWindows();
+    });
 }
 
 /* LegacyMoviePlayer.mm: fit the game window again after a movie closed. */

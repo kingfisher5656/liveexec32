@@ -9,3 +9,8 @@ extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void) { return 
 extern "C" void LC32UIKitPortraitHostedSideChanged(UIInterfaceOrientation) {}
 extern "C" bool LC32UIKitWindowIsPortraitHosted(UIWindow *) { return false; }
 extern "C" void LC32UIKitWindowRootControllerChanged(UIWindow *) {}
+extern "C" bool LC32UIKitHoldsRendererLaunchRotation(UIWindow *, UIViewController *) {
+    return false;
+}
+extern "C" void LC32UIKitNoteRootlessControllerOrientation(
+    UIViewController *, UIInterfaceOrientation) {}

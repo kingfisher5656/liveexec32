@@ -314,6 +314,9 @@ void PaceGuestPresent(EAGLContext *context) {
 
 @end
 
+// UIKit.mm: a full-screen renderer's launch rotation waits for this.
+extern "C" void LC32UIKitNoteGuestPresent(void);
+
 @interface EAGLContext (LC32GuestFramePacing)
 - (BOOL)lc32_guestPresentRenderbuffer:(NSUInteger)target;
 @end
@@ -338,6 +341,7 @@ void PaceGuestPresent(EAGLContext *context) {
     if(LC32ProfileActive)
         LC32ProfileAddPresent(presentStart - paceStart,
             mach_absolute_time() - presentStart);
+    if(result) LC32UIKitNoteGuestPresent();
     return result;
     }
 }
