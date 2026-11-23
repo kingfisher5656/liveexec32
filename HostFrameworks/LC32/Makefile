@@ -89,6 +89,7 @@ LiveExec32Shared_CFLAGS = \
 	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS) \
 	-include "$(LC32_GUEST_OVERRIDE_HEADER)"
 LiveExec32Shared_CCFLAGS = -std=c++17
+dynarmic_native_jit.cpp_CFLAGS = -I$(DYNARMIC_ROOT)/externals/oaknut/include
 crash_exception.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyFonts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyAlerts.mm_CFLAGS = -fobjc-arc

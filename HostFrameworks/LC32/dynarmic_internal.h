@@ -682,6 +682,7 @@ void DrainDebuggerMachCalls();
 void ScheduleMainGuestWorkqueueTransition();
 void DestroyNativeGuestJit(NativeGuestJit *runtime);
 void JoinNativeGuestJit(NativeGuestJit *runtime);
+void ReserveNativeGuestJitAddressSpace();
 bool StartNativeGuestWorkqueueWorker(const GuestWorkqueueJob &job);
 
 u32 GuestBsdthreadCreate(

@@ -443,6 +443,11 @@ IMP LC32OriginalMoviePlayerSetFullscreenAnimated;
 const void *LC32MovieFullscreenRequestedKey = &LC32MovieFullscreenRequestedKey;
 const void *LC32MovieTurnedInGameCanvasKey =
     &LC32MovieTurnedInGameCanvasKey;
+// Per full-screen request: waits used so far, and whether one is scheduled.
+const void *LC32MovieFullscreenWaitsKey = &LC32MovieFullscreenWaitsKey;
+const void *LC32MovieFullscreenWaitPendingKey =
+    &LC32MovieFullscreenWaitPendingKey;
+bool LC32ControllerChainInTransition(UIViewController *controller);
 
 NSInteger LC32GameCanvasMovieSide(UIWindow *window) {
     if(LC32GetGuestExecutableSDKVersion() >= 0x80000) return 0;
@@ -460,6 +465,42 @@ NSInteger LC32GameCanvasMovieSide(UIWindow *window) {
     return UIInterfaceOrientationIsLandscape(side) ? side : 0;
 }
 
+/*
+ * Gameloft's MoviePlayer (Asphalt 7, SDK 6.1) puts its own controller's view
+ * inside the full-window EAGL view and presents an MPMoviePlayerViewController
+ * from it; the legacy presentation swaps the movie in at the same place. The
+ * game sets control style None and fullscreen = YES, and turns the movie view
+ * itself (-[MoviePlayer rotateSubView:]). Forwarding that full-screen request
+ * makes current MediaPlayer on an iOS 27 device move the video into AVKit's
+ * full-screen presentation, which the legacy window presentation puts at the
+ * bottom of the game window, under the EAGL view: the intro played black.
+ * A movie already filling the game window from inside the app's own view
+ * needs no full-screen presentation; leave it where the app put it.
+ */
+bool LC32MovieFillsGameWindowInline(id player, UIView *movieView,
+                                    UIView *child) {
+    UIWindow *window = movieView.window;
+    if(!window || child == movieView || child.superview != window ||
+            [child.nextResponder respondsToSelector:@selector(moviePlayer)])
+        return false;
+    if(![player respondsToSelector:@selector(controlStyle)] ||
+            ((NSInteger (*)(id, SEL))objc_msgSend)(
+                player, @selector(controlStyle)) != 0 /* None */) return false;
+    const CGRect bounds = window.bounds;
+    CGRect covered = CGRectIntersection(bounds,
+        [movieView convertRect:movieView.bounds toView:window]);
+    // What a clipping ancestor cuts off is not on screen.
+    for(UIView *v = movieView.superview; v && v != window && !CGRectIsNull(covered);
+            v = v.superview) {
+        if(v.clipsToBounds)
+            covered = CGRectIntersection(covered,
+                [v convertRect:v.bounds toView:window]);
+    }
+    return !CGRectIsNull(covered) &&
+        covered.size.width * covered.size.height >=
+            0.9 * bounds.size.width * bounds.size.height;
+}
+
 void LC32TurnMovieInGameCanvas(id player) {
     if(!player || LC32MoviePlayerWasStopped(player) ||
             !objc_getAssociatedObject(player, LC32MovieFullscreenRequestedKey) ||
@@ -470,6 +511,42 @@ void LC32TurnMovieInGameCanvas(id player) {
     // The overlay window of a stand-alone movie is already turned.
     if(!window || [window isKindOfClass:LC32LegacyMovieOverlayWindow.class])
         return;
+    /* Settle the request only once a presentation carrying the movie has
+     * finished: during it the movie sits in UIKit's transition view, and a
+     * legacy presentation from an embedded presenter then swaps it into the
+     * app's own view (Asphalt 7). */
+    UIViewController *movieController = nil;
+    for(UIResponder *r = movieView; r && ![r isKindOfClass:UIWindow.class];
+            r = r.nextResponder) {
+        if([r isKindOfClass:UIViewController.class]) {
+            movieController = (UIViewController *)r;
+            break;
+        }
+    }
+    if(movieController && LC32ControllerChainInTransition(movieController)) {
+        // One retry chain per request, whichever callback found it busy.
+        if(objc_getAssociatedObject(player, LC32MovieFullscreenWaitPendingKey))
+            return;
+        NSNumber *waits = objc_getAssociatedObject(player,
+            LC32MovieFullscreenWaitsKey);
+        if(waits.intValue < 50) {  // 5 s
+            objc_setAssociatedObject(player, LC32MovieFullscreenWaitsKey,
+                @(waits.intValue + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(player, LC32MovieFullscreenWaitPendingKey,
+                @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            __weak id weakPlayer = player;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                    100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                id retryPlayer = weakPlayer;
+                if(!retryPlayer) return;
+                objc_setAssociatedObject(retryPlayer,
+                    LC32MovieFullscreenWaitPendingKey, nil,
+                    OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                LC32TurnMovieInGameCanvas(retryPlayer);
+            });
+            return;
+        }
+    }
     UIView *child = movieView;
     while(child.superview && child.superview != window) child = child.superview;
     if(objc_getAssociatedObject(child, LC32MovieTurnedInGameCanvasKey)) return;
@@ -487,6 +564,12 @@ void LC32TurnMovieInGameCanvas(id player) {
     if(!placedByApp || !side || bounds.size.height <= bounds.size.width) {
         objc_setAssociatedObject(player, LC32MovieFullscreenRequestedKey, nil,
             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if(!placedByApp &&
+                LC32MovieFillsGameWindowInline(player, movieView, child)) {
+            fprintf(stderr, "LC32: full-screen movie kept inline in %s\n",
+                object_getClassName(child));
+            return;
+        }
         ((void (*)(id, SEL, BOOL, BOOL))
             LC32OriginalMoviePlayerSetFullscreenAnimated)(
                 player, @selector(setFullscreen:animated:), YES, NO);
@@ -543,6 +626,9 @@ bool LC32KeepMovieInGameWindow(id player, BOOL fullscreen) {
     }
     if(!LC32GameCanvasMovieSide(nil)) return false;
     objc_setAssociatedObject(player, LC32MovieFullscreenRequestedKey, @YES,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // A new request gets its own wait budget (LC32TurnMovieInGameCanvas).
+    objc_setAssociatedObject(player, LC32MovieFullscreenWaitsKey, nil,
         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // The app adds the movie's view to its window right after this.
     __weak id weakPlayer = player;
@@ -625,16 +711,76 @@ bool LC32ShouldDropMovieNotification(NSString *name, id object,
         LC32IsRepeatingMovieLoopEnd(object, userInfo);
 }
 
+/*
+ * iPhone OS posted PlaybackStateDidChange when a movie played to its end,
+ * before PlaybackDidFinish; current MediaPlayer goes to Paused without one.
+ * Gameloft's MoviePlayer (Asphalt 7) keeps an "is playing" flag from the
+ * state notifications and leaves its intro only when that flag is clear and
+ * DidFinish has set its "ended" flag, so a movie watched to the end left the
+ * game on a black screen with only its Skip button. (Its Paused handler also
+ * clears "ended", so the state change has to come first.) Remember the last
+ * state each player announced and post the missing change before DidFinish.
+ */
+const void *LC32MoviePlayerAnnouncedStateKey =
+    &LC32MoviePlayerAnnouncedStateKey;
+
+NSInteger LC32MoviePlayerState(id player) {
+    return [player respondsToSelector:@selector(playbackState)]
+        ? ((NSInteger (*)(id, SEL))objc_msgSend)(player,
+            @selector(playbackState)) : -1;
+}
+
+void LC32BeforeMovieNotification(NSNotificationCenter *center,
+                                 NSString *name, id object,
+                                 NSDictionary *userInfo) {
+    if(!name || !object) return;
+    if(LC32MoviePlayerStateChangeName &&
+            [name isEqualToString:LC32MoviePlayerStateChangeName]) {
+        objc_setAssociatedObject(object, LC32MoviePlayerAnnouncedStateKey,
+            @(LC32MoviePlayerState(object)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    if(!LC32MoviePlayerStateChangeName || !LC32MoviePlayerDidFinishName ||
+            ![name isEqualToString:LC32MoviePlayerDidFinishName]) return;
+    static NSString *reasonKey = ^NSString * {
+        NSString *__strong *key = (NSString *__strong *)dlsym(RTLD_DEFAULT,
+            "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey");
+        return key && *key ? *key
+            : @"MPMoviePlayerPlaybackDidFinishReasonUserInfoKey";
+    }();
+    id reason = [userInfo isKindOfClass:NSDictionary.class]
+        ? userInfo[reasonKey] : nil;
+    NSNumber *announced = objc_getAssociatedObject(object,
+        LC32MoviePlayerAnnouncedStateKey);
+    const NSInteger state = LC32MoviePlayerState(object);
+    if(![reason respondsToSelector:@selector(integerValue)] ||
+            [reason integerValue] != 0 /* PlaybackEnded */ ||
+            announced.integerValue != 1 /* Playing */ || state < 0 ||
+            state == 1) return;
+    objc_setAssociatedObject(object, LC32MoviePlayerAnnouncedStateKey, @(state),
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    /* The movie is finishing now: a dismissal from the app's state handler
+     * must not post a second DidFinish (UserExited) of its own. */
+    objc_setAssociatedObject(object, LC32MoviePlayerFinishedKey, @YES,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ((void (*)(id, SEL, id, id, id))
+        LC32OriginalPostNotificationNameObjectUserInfo)(center,
+            @selector(postNotificationName:object:userInfo:),
+            LC32MoviePlayerStateChangeName, object, nil);
+}
+
 void LC32LegacyPostNotification(NSNotificationCenter *self, SEL cmd,
                                 NSNotification *note) {
     if(LC32ShouldDropMovieNotification(note.name, note.object, note.userInfo))
         return;
+    LC32BeforeMovieNotification(self, note.name, note.object, note.userInfo);
     ((void (*)(id, SEL, id))LC32OriginalPostNotification)(self, cmd, note);
 }
 
 void LC32LegacyPostNotificationNameObjectUserInfo(NSNotificationCenter *self,
         SEL cmd, NSNotificationName name, id object, NSDictionary *userInfo) {
     if(LC32ShouldDropMovieNotification(name, object, userInfo)) return;
+    LC32BeforeMovieNotification(self, name, object, userInfo);
     ((void (*)(id, SEL, id, id, id))
         LC32OriginalPostNotificationNameObjectUserInfo)(
             self, cmd, name, object, userInfo);
@@ -653,6 +799,8 @@ void LC32PostPlayingWhenStarted(__weak id weakPlayer, int attempt) {
         return;
     if(LC32MoviePlayerIsPlaying(player)) {
         objc_setAssociatedObject(player, LC32MoviePlayerPlayingPostedKey, @YES,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(player, LC32MoviePlayerAnnouncedStateKey, @1,
             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [NSNotificationCenter.defaultCenter
             postNotificationName:LC32MoviePlayerStateChangeName object:player];
@@ -812,6 +960,16 @@ void LC32LegacyMovieProxyUpdateContainment(UIView *self, SEL cmd,
     ((void (*)(id, SEL, id, id))LC32OriginalMovieProxyUpdateContainment)(
         self, cmd, window, superview);
     LC32FitMovieProxyPlaybackView(self, player);
+    /* A swallowed full-screen request (LC32KeepMovieInGameWindow) is settled
+     * once the movie's view is in a window. The app may attach it only when
+     * it presents the movie, after every other check ran (Asphalt 7). */
+    if(window && player &&
+            objc_getAssociatedObject(player, LC32MovieFullscreenRequestedKey)) {
+        __weak id weakPlayer = player;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LC32TurnMovieInGameCanvas(weakPlayer);
+        });
+    }
 }
 
 void LC32LegacyMovieProxyLayoutSubviews(UIView *self, SEL cmd) {

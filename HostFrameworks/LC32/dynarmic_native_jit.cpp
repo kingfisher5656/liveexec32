@@ -1,6 +1,8 @@
 
 #include "dynarmic_internal.h"
 
+#include <oaknut/dual_code_block.hpp>
+
 void InvalidateAllGuestJits(
         u32 address, size_t size) {
     if (size == 0) {
@@ -372,6 +374,59 @@ static constexpr size_t PrewarmedNativeGuestJits = 12;
 static bool BuildNativeGuestJitParts(
         size_t processorId, PooledNativeGuestJit &parts);
 
+// A separate cache is required for every JIT. Keep the per-pthread footprint
+// well below Dynarmic's 128 MiB default. 16 MiB thrashed on Modern Combat 4's
+// game thread: the hot code did not fit, so the cache filled and was cleared
+// every few seconds of play on device, each clear a visible hitch while
+// everything was recompiled. 32 MiB held it with no clears during play.
+// Untouched cache pages cost no memory. LC32_JIT_CACHE_MB (4-128; e.g. from
+// LiveExec32.env) overrides it.
+static size_t NativeGuestJitCacheSize() {
+    size_t size = 32 * 1024 * 1024;
+    if (const char *mb = getenv("LC32_JIT_CACHE_MB")) {
+        const long value = strtol(mb, nullptr, 10);
+        if (value >= 4 && value <= 128)
+            size = static_cast<size_t>(value) * 1024 * 1024;
+    }
+    return size;
+}
+
+/*
+ * The iOS 26 JIT debugger prepares each new code cache, but it can only reach
+ * the low 64 GiB of the address space (StikDebug sends page addresses as nine
+ * hex digits). Once that runs out, e.g. while Asphalt 7 loads its first race,
+ * new mappings land at 0x70_xxxx_xxxx; the cache of a thread created then is
+ * never prepared and its first instruction dies with KERN_CODESIGN_ERROR.
+ * Set address space aside for the worker caches while it is still free; the
+ * reservations cost no memory. LC32_JIT_LOW_SLOTS overrides the count (0 turns
+ * it off); with DYNARMIC_DUAL_MAPPED=1 it also exercises the path elsewhere.
+ */
+void ReserveNativeGuestJitAddressSpace() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        // Only worker JITs take slots, and only dual-mapped code blocks use
+        // them (oaknut::ConfigurableCodeBlock makes the same choice).
+        const char *dual = getenv("DYNARMIC_DUAL_MAPPED");
+        const bool dualMapped = dual != nullptr
+            ? dual[0] != '\0' && strcmp(dual, "0") != 0
+            : oaknut::detail::RequiresDualMapping();
+        if (!NativeGuestThreadsEnabled() || !dualMapped) return;
+        long slots = oaknut::detail::UsesJIT26PrepareRegion() ? 32 : 0;
+        if (const char *value = getenv("LC32_JIT_LOW_SLOTS")) {
+            slots = std::clamp<long>(strtol(value, nullptr, 10), 0,
+                static_cast<long>(MaxNativeGuestProcessors));
+        }
+        if (slots <= 0) return;
+        const size_t size = NativeGuestJitCacheSize();
+        const size_t reserved = oaknut::ReserveLowDualCodeBlockSlots(
+            size, static_cast<size_t>(slots));
+        fprintf(stderr,
+            "LC32: reserved %zu of %ld guest thread JIT regions "
+            "(%zu MiB each) below 64 GiB\n",
+            reserved, slots, size >> 20);
+    });
+}
+
 static bool TakePooledNativeGuestJit(
         size_t processorId, PooledNativeGuestJit &parts) {
     if (processorId >= MaxNativeGuestProcessors) return false;
@@ -428,19 +483,7 @@ static bool BuildNativeGuestJitParts(
     config.check_halt_on_memory_access = true;
     config.define_unpredictable_behaviour = true;
     LC32ApplyFastFP(config);
-    // A separate cache is required for every JIT. Keep the per-pthread
-    // footprint well below Dynarmic's 128 MiB default. 16 MiB thrashed on
-    // Modern Combat 4's game thread: the hot code did not fit, so the cache
-    // filled and was cleared every few seconds of play on device, each clear
-    // a visible hitch while everything was recompiled. 32 MiB held it with no
-    // clears during play. Untouched cache pages cost no memory.
-    // LC32_JIT_CACHE_MB (4-128; e.g. from LiveExec32.env) overrides it.
-    config.code_cache_size = 32 * 1024 * 1024;
-    if (const char *mb = getenv("LC32_JIT_CACHE_MB")) {
-        const long value = strtol(mb, nullptr, 10);
-        if (value >= 4 && value <= 128)
-            config.code_cache_size = static_cast<size_t>(value) * 1024 * 1024;
-    }
+    config.code_cache_size = NativeGuestJitCacheSize();
 
     DynarmicCallbacks32SetPageTable(
         parts.callbacks,

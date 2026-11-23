@@ -199,6 +199,7 @@ bool Dynarmic_nativeInitialize() {
         RegisterGuestVmEpochParticipant(
             &mainGuestVmParticipant);
     }
+    ReserveNativeGuestJitAddressSpace();
     nativeLifecycleState =
         NativeLifecycleState::Running;
     lifecycleLock.unlock();
