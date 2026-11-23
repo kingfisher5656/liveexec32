@@ -7542,8 +7542,12 @@ static void LC32TransitionViewDidComplete(id self, SEL cmd, id transitionView,
         });
     }
     if([toView isKindOfClass:UIView.class]) {
-        if(LC32ViewIsInTurnedFullScreenRootlessWindow(toView) &&
-                LC32RestoreMoviePresenterAfterTransition(toView)) {
+        /* A movie presenter's view gets its own geometry back in any window
+         * (Starfront's sits in its EAGLView); only a turned full-screen
+         * window needs fitting again afterwards. */
+        const bool fullScreen =
+            LC32ViewIsInTurnedFullScreenRootlessWindow(toView);
+        if(LC32RestoreMoviePresenterAfterTransition(toView) && fullScreen) {
             LC32FitFullScreenRootlessWindow(LC32NativeViewWindow(toView));
         } else {
             LC32FitViewInFullScreenRootlessWindow(toView);

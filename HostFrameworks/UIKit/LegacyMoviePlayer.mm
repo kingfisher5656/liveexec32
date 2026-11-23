@@ -102,6 +102,9 @@ struct LC32EmbeddedPresenterGeometry {
     CGAffineTransform transform;
     // Straight in a turned full-screen window: finish after the transition.
     bool fullScreenWindow;
+    // The movie's dismissal has started; an earlier transition back to the
+    // presenter (while the movie's presentation waited) must not use it up.
+    bool dismissing;
 };
 
 /* UIView's and UIViewController's own IMPs: the guest may subclass both, and
@@ -139,11 +142,23 @@ void LC32RecordEmbeddedPresenterGeometry(UIViewController *presenter) {
         LC32NativeCall<CGAffineTransform>(UIView.class, view,
                                           @selector(transform)),
         LC32ViewIsInTurnedFullScreenRootlessWindow(view),
+        false,
     };
     objc_setAssociatedObject(view, LC32EmbeddedPresenterGeometryKey,
         [NSValue valueWithBytes:&geometry
                        objCType:@encode(LC32EmbeddedPresenterGeometry)],
         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// An animated legacy transition still holds the view.
+bool LC32ViewIsInTransitionView(UIView *view) {
+    static Class transitionView = NSClassFromString(@"UITransitionView");
+    if(!transitionView) return false;
+    for(UIView *superview = LC32NativeSuperview(view); superview;
+            superview = LC32NativeSuperview(superview)) {
+        if([superview isKindOfClass:transitionView]) return true;
+    }
+    return false;
 }
 
 void LC32RestoreEmbeddedPresenterGeometry(UIView *view, bool finished) {
@@ -1634,29 +1649,89 @@ void LC32InstallLegacyMoviePlayerHook(const struct mach_header *, intptr_t) {
 
 /* Called by the legacy dismissal hook (LegacyAlerts.mm) once UIKit's dismiss
  * transition has run, with the controller that presented the movie. */
+namespace {
+constexpr int LC32PresenterTransitionPollLimit = 40;      // 40 x 50 ms = 2 s
+constexpr int64_t LC32PresenterTransitionPollDelay = 50 * NSEC_PER_MSEC;
+
+/* Finish an embedded presenter's restore once UIKit's dismissal has let go
+ * of the view. LC32RestoreMoviePresenterAfterTransition normally finishes
+ * first; this bounds the record's life if that hook sees another view (a
+ * transition around a container of the presenter). */
+void LC32FinishEmbeddedPresenterRestore(UIView *view, int remaining) {
+    if(!objc_getAssociatedObject(view, LC32EmbeddedPresenterGeometryKey))
+        return;
+    if(LC32ViewIsInTransitionView(view) && remaining > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     LC32PresenterTransitionPollDelay),
+                       dispatch_get_main_queue(), ^{
+            LC32FinishEmbeddedPresenterRestore(view, remaining - 1);
+        });
+        return;
+    }
+    LC32RestoreEmbeddedPresenterGeometry(view, true);
+}
+} // namespace
+
 extern "C" void LC32RestoreEmbeddedMoviePresenter(
         UIViewController *presenter) {
     UIView *view = LC32NativeViewIfLoaded(presenter);
-    if(!view || !objc_getAssociatedObject(
-            view, LC32EmbeddedPresenterGeometryKey)) return;
+    NSValue *saved = view ? objc_getAssociatedObject(
+        view, LC32EmbeddedPresenterGeometryKey) : nil;
+    if(!saved) return;
+    LC32EmbeddedPresenterGeometry geometry;
+    [saved getValue:&geometry size:sizeof(geometry)];
+    geometry.dismissing = true;
+    objc_setAssociatedObject(view, LC32EmbeddedPresenterGeometryKey,
+        [NSValue valueWithBytes:&geometry
+                       objCType:@encode(LC32EmbeddedPresenterGeometry)],
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     LC32RestoreEmbeddedPresenterGeometry(view, false);
     // The transition can apply scene geometry again when it completes. In a
-    // turned full-screen window that happens later, after its animation;
+    // turned full-screen window, or while an animated dismissal is still in
+    // its UITransitionView, that happens later;
     // LC32RestoreMoviePresenterAfterTransition finishes there.
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSValue *saved = objc_getAssociatedObject(
+        NSValue *pending = objc_getAssociatedObject(
             view, LC32EmbeddedPresenterGeometryKey);
-        LC32EmbeddedPresenterGeometry geometry = {};
-        [saved getValue:&geometry size:sizeof(geometry)];
-        LC32RestoreEmbeddedPresenterGeometry(view, !geometry.fullScreenWindow);
+        if(!pending) return;
+        LC32EmbeddedPresenterGeometry current = {};
+        [pending getValue:&current size:sizeof(current)];
+        if(current.fullScreenWindow) {
+            LC32RestoreEmbeddedPresenterGeometry(view, false);
+            return;
+        }
+        if(!LC32ViewIsInTransitionView(view)) {
+            LC32RestoreEmbeddedPresenterGeometry(view, true);
+            return;
+        }
+        LC32RestoreEmbeddedPresenterGeometry(view, false);
+        LC32FinishEmbeddedPresenterRestore(view,
+                                           LC32PresenterTransitionPollLimit);
     });
 }
 
 /* Called by UIKit.mm once the legacy transition that brought a presenter's
- * view back into its window has completed. */
+ * view back has completed. -[UIWindowController transitionViewDidComplete:...]
+ * turns that view for the scene's orientation: in a landscape scene
+ * Starfront's presenter, embedded in its EAGLView, got a quarter turn and
+ * left a third of the canvas uncovered. A second finger there landed on the
+ * exclusiveTouch EAGLView itself, so UIKit dropped both touches and large
+ * two-finger selection boxes never started. */
 extern "C" bool LC32RestoreMoviePresenterAfterTransition(UIView *view) {
-    if(!view || !objc_getAssociatedObject(
-            view, LC32EmbeddedPresenterGeometryKey)) return false;
+    NSValue *saved = view ? objc_getAssociatedObject(
+        view, LC32EmbeddedPresenterGeometryKey) : nil;
+    if(!saved) return false;
+    LC32EmbeddedPresenterGeometry geometry;
+    [saved getValue:&geometry size:sizeof(geometry)];
+    // Outside a turned full-screen window, act only on the movie's dismissal.
+    if(!geometry.fullScreenWindow && !geometry.dismissing) return false;
+    if(!CGAffineTransformEqualToTransform(geometry.transform,
+            LC32NativeCall<CGAffineTransform>(UIView.class, view,
+                                              @selector(transform)))) {
+        fprintf(stderr, "LC32: movie presenter view in %s was turned by its "
+            "dismissal; restored\n",
+            object_getClassName(LC32NativeSuperview(view)));
+    }
     LC32RestoreEmbeddedPresenterGeometry(view, true);
     return true;
 }
