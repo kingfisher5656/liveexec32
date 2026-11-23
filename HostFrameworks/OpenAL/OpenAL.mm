@@ -350,6 +350,27 @@ static size_t BytesPerCaptureSample(ALenum format) {
     }
 }
 
+// Streaming engines written for early iOS (N.O.V.A.'s StreamingSound) keep
+// refilling and requeueing their ring buffers with 0 bytes after a
+// non-looping stream ends, until the source runs dry. Current Apple OpenAL
+// rejects a zero-byte alBufferData/alBufferDataStatic with AL_INVALID_VALUE
+// and keeps the buffer's previous PCM, so the last chunks of the stream are
+// requeued forever (a voice line repeating its final syllable). Upload one
+// silent frame instead: the buffer then plays out at once, like an empty one.
+static void EmptyBufferUpload(std::vector<uint8_t> *bytes, ALenum format) {
+    const size_t frameBytes = BytesPerCaptureSample(format);
+    if (frameBytes == 0) return; // formats outside core PCM: native behavior
+    const bool eightBit =
+        format == AL_FORMAT_MONO8 || format == AL_FORMAT_STEREO8;
+    bytes->assign(frameBytes, eightBit ? 0x80 : 0x00);
+
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        fprintf(stderr, "LC32: OpenAL zero-byte buffer upload; "
+                        "storing one silent frame instead\n");
+    }
+}
+
 static ALCdevice *DeviceForToken(uint32_t token, bool *valid,
                                  ALenum *captureFormat = nullptr) {
     void *pointer = nullptr;
@@ -699,13 +720,15 @@ uint32_t LC32_OpenAL_Dispatch(uint32_t opcode, uint32_t guestPacket,
             w[0] = alIsBuffer(static_cast<ALuint>(w[0]));
             break;
         case LC32_OPENAL_OP_alBufferData: {
+            const ALenum format = static_cast<ALenum>(w[1]);
             const ALsizei size = static_cast<ALsizei>(w[3]);
             size_t byteCount = 0;
             if (!TransferSize<uint8_t>(size, &byteCount)) return 0;
             std::vector<uint8_t> bytes;
             if (!ReadGuestArray(w[2], size, &bytes)) return 0;
-            alBufferData(static_cast<ALuint>(w[0]),
-                         static_cast<ALenum>(w[1]), bytes.data(), size,
+            if (size == 0) EmptyBufferUpload(&bytes, format);
+            alBufferData(static_cast<ALuint>(w[0]), format, bytes.data(),
+                         static_cast<ALsizei>(bytes.size()),
                          static_cast<ALsizei>(w[4]));
             break;
         }

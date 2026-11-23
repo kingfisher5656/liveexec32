@@ -29,6 +29,14 @@ int main(void) {
     for(unsigned i = 0; i < 3; ++i)
         alBufferData(buffers[i], AL_FORMAT_MONO16, pcm, sizeof(pcm), 8000);
     CHECK(alGetError() == AL_NO_ERROR, "create-pcm-and-source");
+    /* Early-iOS streamers refill with 0 bytes after a stream ends. Current
+     * Apple OpenAL rejects that and keeps the stale PCM, which then repeats. */
+    alBufferData(buffers[2], AL_FORMAT_MONO16, pcm, 0, 8000);
+    ALint emptySize = -1;
+    alGetBufferi(buffers[2], AL_SIZE, &emptySize);
+    CHECK(alGetError() == AL_NO_ERROR && (emptySize == 0 || emptySize == 2),
+          "zero-byte-upload-empties-buffer"); /* empty, or one silent frame */
+    alBufferData(buffers[2], AL_FORMAT_MONO16, pcm, sizeof(pcm), 8000);
     alSourceQueueBuffers(source, 2, buffers);
     CHECK(property(source, AL_SOURCE_TYPE) == AL_STREAMING, "streaming-type");
     CHECK(property(source, AL_BUFFERS_QUEUED) == 2, "queued-count");
