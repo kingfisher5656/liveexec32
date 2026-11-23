@@ -1004,8 +1004,9 @@ static void ExposeLegacyHomeBesideBundle(const std::string &guestHome,
  * their bundle path as NSHomeDirectory() + "/<name>.app/..." (Death Rally
  * uses CFBundleDisplayName + ".app/Risoursa/" and fopen()s DeathRally.ini
  * there). LiveContainer names the bundle folder by bundle ID and keeps it
- * outside HOME, so map HOME/<name>.app to the bundle for every name a game
- * could have used: executable, CFBundleName and CFBundleDisplayName.
+ * outside HOME, so map HOME/<name>.app and <bundle folder>/<name>.app to the
+ * bundle for every name a game could have used: executable, CFBundleName and
+ * CFBundleDisplayName.
  */
 static void AddLegacyBundleNameCandidate(std::vector<std::string> &names,
                                          CFDictionaryRef info, CFStringRef key) {
@@ -1063,21 +1064,38 @@ static void ExposeLegacyBundleInHome(const std::string &guestHome,
     if(stream) CFRelease(stream);
     if(infoURL) CFRelease(infoURL);
 
-    // Guest code may see HOME with or without the /private firmlink prefix.
-    std::vector<std::string> homes{guestHome};
-    if(guestHome.rfind("/private/var/", 0) == 0) {
-        homes.push_back(guestHome.substr(strlen("/private")));
-    } else if(guestHome.rfind("/var/", 0) == 0) {
-        homes.push_back("/private" + guestHome);
-    }
+    // Before iOS 8 the bundle's folder was also HOME, so games reach their
+    // data through it as well: Assassin's Creed chdir()s to the bundle URL
+    // minus its last component and opens "<cwd>/AssassinsCreed.app/UK.bar".
+    // LiveContainer's folder holds com.gameloft.AssassinsCreed.app instead,
+    // so the bundle's parent needs the same names as HOME.
+    const size_t bundleSlash = bundle.find_last_of('/');
+    const std::string bundleParent = bundleSlash != std::string::npos &&
+        bundleSlash != 0 ? bundle.substr(0, bundleSlash) : std::string();
+
+    // Guest code may see a /var path with or without the /private firmlink
+    // prefix.
+    std::vector<std::string> folders;
+    auto addFolder = [&folders](const std::string &folder) {
+        if(folder.empty() || folder == "/") return;
+        folders.push_back(folder);
+        if(folder.rfind("/private/var/", 0) == 0) {
+            folders.push_back(folder.substr(strlen("/private")));
+        } else if(folder.rfind("/var/", 0) == 0) {
+            folders.push_back("/private" + folder);
+        }
+    };
+    addFolder(guestHome);
+    addFolder(bundleParent);
     std::vector<std::string> added;
-    for(const std::string &home : homes)
+    std::string besideBundle;
+    for(const std::string &folder : folders)
     for(const std::string &name : names) {
         if(name.empty() || name == "." || name == ".." ||
                 name.find('/') != std::string::npos) {
             continue;
         }
-        const std::string alias = home + "/" + name + ".app";
+        const std::string alias = folder + "/" + name + ".app";
         if(alias == bundle) continue;
         bool duplicate = false;
         for(const std::string &existing : added) {
@@ -1091,6 +1109,14 @@ static void ExposeLegacyBundleInHome(const std::string &guestHome,
         added.push_back(alias);
         LC32_DEBUG_PRINTF("legacy bundle alias %s -> %s\n",
             alias.c_str(), bundle.c_str());
+        if(folder == bundleParent) {
+            if(!besideBundle.empty()) besideBundle += ", ";
+            besideBundle += name + ".app";
+        }
+    }
+    if(!besideBundle.empty()) {
+        fprintf(stderr, "LC32: app bundle also reachable beside itself as %s\n",
+            besideBundle.c_str());
     }
 }
 
