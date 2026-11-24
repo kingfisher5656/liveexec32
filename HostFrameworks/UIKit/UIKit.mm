@@ -6778,12 +6778,43 @@ static void LC32LoadMainInterfaceFile(id self, SEL _cmd) {
  * native screen. Dungeon Raid's MainViewController EAGLView then came out
  * 393x852 inside the fixed portrait canvas, and its 320x480 GL viewport
  * (bottom-left of that drawable) landed below the screen. Give top-level
- * guest controllers the guest's own screen while that canvas is active. */
+ * guest controllers the guest's own screen while that canvas is active.
+ *
+ * The landscape canvas needs the same answer for an iOS 6 landscape-only
+ * controller whose nib view is the GL view itself. Eufloria HD builds its
+ * framebuffer from -awakeFromNib, before any window exists, and configures
+ * its renderer once with that drawable's swapped size (iOS 6 on an iPhone 5:
+ * 640x1136 -> a 1136x640 picture, drawn into the 1136x640 storage UIKit's
+ * landscape turn makes it reallocate). The native-screen 393x852 gave it a
+ * 1704x786 picture, and kept LC32LegacyPhoneCanvasGeometryMode from
+ * recognising the 320x568 GL root, so it got the portrait canvas: an
+ * upright, squeezed picture. Other landscape-canvas roots keep the native
+ * frame; their classification depends on it. */
 static CGRect (*LC32OriginalDefaultInitialViewFrame)(id, SEL);
+
+static bool LC32NibGLRootNeedsGuestInitialFrame(UIViewController *controller) {
+    /* Landscape-only by an explicit supported-orientations list: a lone
+     * landscape UIInterfaceOrientation is only the launch side. */
+    const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
+    if(!LC32GuestUsesFixedLandscapePhoneCanvas() ||
+            LC32GetGuestExecutableSDKVersion() < 0x60000 ||
+            !policy.constrainsControllerOrientations ||
+            (policy.declaredOrientations &
+             (UIInterfaceOrientationMaskPortrait |
+              UIInterfaceOrientationMaskPortraitUpsideDown))) {
+        return false;
+    }
+    UIView *view = nil;
+    static Class eaglLayerClass = NSClassFromString(@"CAEAGLLayer");
+    return LC32NativeViewIfLoaded(controller, &view) && view &&
+        [LC32NativeViewLayer(view) isKindOfClass:eaglLayerClass];
+}
 
 static CGRect LC32DefaultInitialViewFrame(id self, SEL _cmd) {
     CGRect bounds, applicationFrame;
-    if(LC32GuestUsesFixedPortraitPhoneCanvas() &&
+    if((LC32GuestUsesFixedPortraitPhoneCanvas() ||
+                LC32NibGLRootNeedsGuestInitialFrame(
+                    (UIViewController *)self)) &&
             LC32ObjectUsesGuestClass(self) &&
             !((UIViewController *)self).parentViewController &&
             LC32UIKitFixedLandscapePhoneScreen(&bounds, &applicationFrame)) {
