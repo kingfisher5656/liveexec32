@@ -24,6 +24,25 @@ static LC32CoreFoundationCallbacksMode LC32SetCallbacksMode(
         return LC32CoreFoundationCallbacksNull;
     if(LC32SetUsesCFTypeCallbacks(callbacks))
         return LC32CoreFoundationCallbacksCFType;
+    /*
+     * Non-retaining CF-object sets, e.g. Sky Gamblers' registry built with
+     * {0, NULL, NULL, CFCopyDescription, CFEqual, CFHash}.  The function
+     * pointers are guest code, so classify the semantics here and let the
+     * host use native CFCopyDescription/CFEqual/CFHash on the host objects.
+     * Accept only CF-object hashing; a pointer hash next to CFEqual would
+     * give different bucket semantics.
+     */
+    if(callbacks->version == 0 && !callbacks->retain &&
+       !callbacks->release &&
+       callbacks->equal == (CFSetEqualCallBack)CFEqual &&
+       (callbacks->hash == (CFSetHashCallBack)CFHash ||
+        callbacks->hash == kCFTypeSetCallBacks.hash)) {
+        if(callbacks->copyDescription ==
+                (CFSetCopyDescriptionCallBack)CFCopyDescription)
+            return LC32CoreFoundationCallbacksWeakCFType;
+        if(!callbacks->copyDescription)
+            return LC32CoreFoundationCallbacksWeakCFTypeNoDescription;
+    }
     CRSetCrashLogMessage(
         "LC32: CFSet creation called with custom callbacks");
     HALT;

@@ -121,14 +121,24 @@ const CFArrayCallBacks *ArrayCallbacks(uint32_t mode) {
     return reinterpret_cast<const CFArrayCallBacks *>(UINTPTR_MAX);
 }
 
+CFHashCode WeakCFTypeHash(const void *value);
+
 const CFSetCallBacks *SetCallbacks(uint32_t mode) {
+    static const CFSetCallBacks weakCFTypeCallbacks = {
+        0, nullptr, nullptr, CFCopyDescription, CFEqual, WeakCFTypeHash,
+    };
+    static const CFSetCallBacks weakCFTypeNoDescriptionCallbacks = {
+        0, nullptr, nullptr, nullptr, CFEqual, WeakCFTypeHash,
+    };
     switch(static_cast<LC32CoreFoundationCallbacksMode>(mode)) {
         case LC32CoreFoundationCallbacksCFType:
             return &kCFTypeSetCallBacks;
         case LC32CoreFoundationCallbacksNull:
             return nullptr;
         case LC32CoreFoundationCallbacksWeakCFType:
+            return &weakCFTypeCallbacks;
         case LC32CoreFoundationCallbacksWeakCFTypeNoDescription:
+            return &weakCFTypeNoDescriptionCallbacks;
         case LC32CoreFoundationCallbacksCopyString:
         case LC32CoreFoundationCallbacksRetainedObjectNoDescriptionOrEqual:
         case LC32CoreFoundationCallbacksInvalid:
