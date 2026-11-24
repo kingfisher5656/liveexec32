@@ -1245,9 +1245,27 @@ OSStatus EnsureNativeAudioSessionInitialized() {
 
 id SharedAVAudioSession();
 
-OSStatus SetNativeAudioSessionActive(BOOL active) {
+OSStatus SetNativeAudioSessionActive(BOOL active, u32 flags = 0) {
+    /* NotifyOthersOnDeactivation is the only legacy flag; it maps to
+     * AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation (1). */
+    const NSUInteger options =
+        !active && (flags &
+            kAudioSessionSetActiveFlag_NotifyOthersOnDeactivation) ?
+        1 : 0;
     id session = SharedAVAudioSession();
+    SEL optionsSelector = sel_registerName("setActive:withOptions:error:");
     SEL selector = sel_registerName("setActive:error:");
+    if(session && options &&
+       [session respondsToSelector:optionsSelector]) {
+        NSError *error = nil;
+        const BOOL succeeded =
+            reinterpret_cast<BOOL (*)(id, SEL, BOOL, NSUInteger,
+                NSError **)>(objc_msgSend)(session, optionsSelector,
+                    active, options, &error);
+        if(succeeded) return noErr;
+        return error ? static_cast<OSStatus>(error.code)
+                     : kAudioSessionUnspecifiedError;
+    }
     if(session && [session respondsToSelector:selector]) {
         NSError *error = nil;
         const BOOL succeeded =
@@ -1258,7 +1276,8 @@ OSStatus SetNativeAudioSessionActive(BOOL active) {
                      : kAudioSessionUnspecifiedError;
     }
 
-    return AudioSessionSetActive(active);
+    return flags ? AudioSessionSetActiveWithFlags(active, flags)
+                 : AudioSessionSetActive(active);
 }
 
 OSStatus DispatchAudioSessionSetActive(
@@ -1269,6 +1288,17 @@ OSStatus DispatchAudioSessionSetActive(
     if(initializationStatus != noErr) return initializationStatus;
 
     return SetNativeAudioSessionActive(SlotU32(call, 0) != 0);
+}
+
+OSStatus DispatchAudioSessionSetActiveWithFlags(
+        const LC32AudioToolboxCall &call) {
+    if(!RequireSlots(call, 2)) return kAudio_ParamError;
+    const OSStatus initializationStatus =
+        EnsureNativeAudioSessionInitialized();
+    if(initializationStatus != noErr) return initializationStatus;
+
+    return SetNativeAudioSessionActive(SlotU32(call, 0) != 0,
+        SlotU32(call, 1));
 }
 
 OSStatus DispatchAudioSessionSetProperty(
@@ -2583,6 +2613,72 @@ OSStatus DispatchAudioFileWriteBytes(
     }
     if(writtenBytes > requestedBytes ||
        !WriteGuestU32(SlotU32(call, 3), writtenBytes)) {
+        return kAudio_ParamError;
+    }
+    return status;
+}
+
+OSStatus DispatchAudioFileWritePackets(
+        const LC32AudioToolboxCall &call) {
+    if(!RequireSlots(call, 7) || !SlotU32(call, 5))
+        return kAudio_ParamError;
+    auto entry = FindAudioFile(SlotU32(call, 0));
+    if(!entry) return kAudio_ParamError;
+
+    const u32 byteCount = SlotU32(call, 2);
+    const u32 descriptionAddress = SlotU32(call, 3);
+    u32 requestedPackets = 0;
+    if(!ReadGuestU32(SlotU32(call, 5), requestedPackets) ||
+       byteCount > kMaximumAudioBytes ||
+       (byteCount && !SlotU32(call, 6)) ||
+       (descriptionAddress && requestedPackets >
+            kMaximumAudioBytes /
+                sizeof(GuestAudioStreamPacketDescription))) {
+        return kAudio_ParamError;
+    }
+
+    /* Native AudioFile distinguishes a null pointer from an empty non-null
+     * one, so keep a placeholder element when the guest passed a pointer. */
+    std::vector<uint8_t> bytes(byteCount ? byteCount : 1);
+    if(byteCount && !ReadGuestBytes(SlotU32(call, 6), byteCount,
+            bytes.data())) {
+        return kAudio_ParamError;
+    }
+    std::vector<AudioStreamPacketDescription> packetDescriptions;
+    if(descriptionAddress) {
+        packetDescriptions.resize(requestedPackets ? requestedPackets : 1);
+        if(!ReadGuestBytes(descriptionAddress,
+                static_cast<size_t>(requestedPackets) *
+                    sizeof(GuestAudioStreamPacketDescription),
+                packetDescriptions.data())) {
+            return kAudio_ParamError;
+        }
+        /* Offsets index the copied buffer; keep every packet inside it. */
+        for(u32 index = 0; index < requestedPackets; ++index) {
+            const AudioStreamPacketDescription &description =
+                packetDescriptions[index];
+            if(description.mStartOffset < 0 ||
+               static_cast<uint64_t>(description.mStartOffset) > byteCount ||
+               description.mDataByteSize >
+                   byteCount - static_cast<u32>(description.mStartOffset)) {
+                return kAudio_ParamError;
+            }
+        }
+    }
+
+    UInt32 writtenPackets = requestedPackets;
+    OSStatus status;
+    {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        if(!entry->file) return kAudio_ParamError;
+        status = AudioFileWritePackets(entry->file,
+            static_cast<Boolean>(SlotU32(call, 1)), byteCount,
+            descriptionAddress ? packetDescriptions.data() : nullptr,
+            static_cast<SInt64>(call.slots[4]), &writtenPackets,
+            SlotU32(call, 6) ? bytes.data() : nullptr);
+    }
+    if(writtenPackets > requestedPackets ||
+       !WriteGuestU32(SlotU32(call, 5), writtenPackets)) {
         return kAudio_ParamError;
     }
     return status;
@@ -4062,6 +4158,9 @@ extern "C" u32 LC32_AudioToolbox_Dispatch(u32 opcode, u32 guestCall, u32) {
         case LC32AudioToolboxOpAudioSessionSetActive:
             return static_cast<u32>(
                 DispatchAudioSessionSetActive(call));
+        case LC32AudioToolboxOpAudioSessionSetActiveWithFlags:
+            return static_cast<u32>(
+                DispatchAudioSessionSetActiveWithFlags(call));
         case LC32AudioToolboxOpAudioSessionSetProperty:
             return static_cast<u32>(
                 DispatchAudioSessionSetProperty(call));
@@ -4162,6 +4261,9 @@ extern "C" u32 LC32_AudioToolbox_Dispatch(u32 opcode, u32 guestCall, u32) {
         case LC32AudioToolboxOpAudioFileWriteBytes:
             return static_cast<u32>(
                 DispatchAudioFileWriteBytes(call));
+        case LC32AudioToolboxOpAudioFileWritePackets:
+            return static_cast<u32>(
+                DispatchAudioFileWritePackets(call));
         case LC32AudioToolboxOpAudioConverterNew:
             return static_cast<u32>(
                 DispatchAudioConverterNew(call));

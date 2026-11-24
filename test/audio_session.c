@@ -66,5 +66,15 @@ int main(void) {
             AudioSessionSetActive(false), noErr);
     }
 
+    OSStatus flaggedActiveStatus = AudioSessionSetActiveWithFlags(true, 0);
+    passed &= check_status("audio-session-set-active-with-flags",
+        flaggedActiveStatus, noErr);
+    if(flaggedActiveStatus == noErr) {
+        passed &= check_status("audio-session-set-inactive-notify-others",
+            AudioSessionSetActiveWithFlags(false,
+                kAudioSessionSetActiveFlag_NotifyOthersOnDeactivation),
+            noErr);
+    }
+
     return !passed;
 }

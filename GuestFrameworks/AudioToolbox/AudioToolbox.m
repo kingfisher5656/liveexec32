@@ -2216,6 +2216,14 @@ OSStatus AudioSessionSetActive(Boolean active) {
         LC32_AUDIO_U32(active != false));
 }
 
+/* Corona SDK (ALONE...) deactivates with NotifyOthersOnDeactivation when the
+ * app resigns active; a missing export aborted the guest at lazy binding. */
+OSStatus AudioSessionSetActiveWithFlags(Boolean active, UInt32 inFlags) {
+    return (OSStatus)LC32_AUDIO_CALL(
+        LC32AudioToolboxOpAudioSessionSetActiveWithFlags,
+        LC32_AUDIO_U32(active != false), LC32_AUDIO_U32(inFlags));
+}
+
 OSStatus AudioSessionSetProperty(AudioSessionPropertyID inID, UInt32 inDataSize, const void * inData) {
     if(inDataSize && !inData) return kAudio_ParamError;
     const OSStatus status = (OSStatus)LC32_AUDIO_CALL(
@@ -2414,6 +2422,26 @@ OSStatus AudioFileWriteBytes(AudioFileID audioFile,
         (uint64_t)startingByte,
         LC32_AUDIO_U32((uintptr_t)ioNumBytes),
         LC32_AUDIO_U32((uintptr_t)inBuffer));
+}
+
+OSStatus AudioFileWritePackets(
+        AudioFileID audioFile,
+        Boolean useCache,
+        UInt32 numBytes,
+        const AudioStreamPacketDescription *packetDescriptions,
+        SInt64 startingPacket,
+        UInt32 *ioNumPackets,
+        const void *buffer) {
+    if(!audioFile || !ioNumPackets) return kAudio_ParamError;
+    if(numBytes && !buffer) return kAudio_ParamError;
+    return (OSStatus)LC32_AUDIO_CALL(
+        LC32AudioToolboxOpAudioFileWritePackets,
+        LC32_AUDIO_U32((uintptr_t)audioFile), LC32_AUDIO_U32(useCache),
+        LC32_AUDIO_U32(numBytes),
+        LC32_AUDIO_U32((uintptr_t)packetDescriptions),
+        (uint64_t)startingPacket,
+        LC32_AUDIO_U32((uintptr_t)ioNumPackets),
+        LC32_AUDIO_U32((uintptr_t)buffer));
 }
 
 OSStatus AudioFileClose(AudioFileID audioFile) {

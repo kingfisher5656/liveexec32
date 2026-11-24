@@ -57,19 +57,29 @@ int main(int argc, char **argv) {
     OSStatus writeStatus = created
         ? AudioFileWriteBytes(created, false, 0, &bytesToWrite, samples)
         : kAudio_ParamError;
+    const int16_t packetSamples[] = {11, -22, 333, -4444};
+    UInt32 packetsToWrite = 4;
+    OSStatus writePacketsStatus = created
+        ? AudioFileWritePackets(created, false, sizeof(packetSamples), NULL,
+            4, &packetsToWrite, packetSamples)
+        : kAudio_ParamError;
+    OSStatus writePacketsNullCountStatus = created
+        ? AudioFileWritePackets(created, false, sizeof(packetSamples), NULL,
+            8, NULL, packetSamples)
+        : kAudio_ParamError;
     OSStatus createCloseStatus = created
         ? AudioFileClose(created) : kAudio_ParamError;
 
     AudioFileID opened = NULL;
     OSStatus openStatus = AudioFileOpenURL(url, kAudioFileReadPermission,
         kAudioFileCAFType, &opened);
-    int16_t returnedSamples[4] = {};
-    AudioStreamPacketDescription descriptions[4];
+    int16_t returnedSamples[8] = {};
+    AudioStreamPacketDescription descriptions[8];
     memset(descriptions, 0xa5, sizeof(descriptions));
-    AudioStreamPacketDescription expectedDescriptions[4];
+    AudioStreamPacketDescription expectedDescriptions[8];
     memcpy(expectedDescriptions, descriptions, sizeof(descriptions));
     UInt32 returnedBytes = UINT32_MAX;
-    UInt32 packets = 4;
+    UInt32 packets = 8;
     OSStatus readPacketsStatus = opened
         ? AudioFileReadPackets(opened, false, &returnedBytes, descriptions,
             0, &packets, returnedSamples)
@@ -92,6 +102,15 @@ int main(int argc, char **argv) {
     printf("audio-file-write-count: %s (%u)\n",
         bytesToWrite == sizeof(samples) ? "PASS" : "FAIL",
         (unsigned int)bytesToWrite);
+    passed &= report_status("audio-file-write-packets", writePacketsStatus);
+    passed &= packetsToWrite == 4;
+    printf("audio-file-write-packets-count: %s (%u)\n",
+        packetsToWrite == 4 ? "PASS" : "FAIL",
+        (unsigned int)packetsToWrite);
+    passed &= writePacketsNullCountStatus == kAudio_ParamError;
+    printf("audio-file-write-packets-null-count: %s (%d)\n",
+        writePacketsNullCountStatus == kAudio_ParamError ? "PASS" : "FAIL",
+        (int)writePacketsNullCountStatus);
     passed &= report_status("audio-file-created-close", createCloseStatus);
     passed &= report_status("audio-file-reopen", openStatus);
     const int readPacketsSucceeded = readPacketsStatus == noErr ||
@@ -99,8 +118,10 @@ int main(int argc, char **argv) {
     passed &= readPacketsSucceeded;
     printf("audio-file-read-packets: %s (%d)\n",
         readPacketsSucceeded ? "PASS" : "FAIL", (int)readPacketsStatus);
-    const int packetDataMatches = returnedBytes == sizeof(samples) &&
-        packets == 4 && !memcmp(returnedSamples, samples, sizeof(samples));
+    const int packetDataMatches =
+        returnedBytes == sizeof(samples) + sizeof(packetSamples) &&
+        packets == 8 && !memcmp(returnedSamples, samples, sizeof(samples)) &&
+        !memcmp(returnedSamples + 4, packetSamples, sizeof(packetSamples));
     passed &= packetDataMatches;
     printf("audio-file-read-packet-data: %s (bytes=%u packets=%u)\n",
         packetDataMatches ? "PASS" : "FAIL", (unsigned int)returnedBytes,
