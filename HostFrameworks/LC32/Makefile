@@ -5,7 +5,7 @@ GO_EASY_ON_ME := 1
 STRIP = 0
 # Theos otherwise pairs STRIP=0 with -O0. Keep symbols for device traces while
 # compiling the emulator and bridge hot paths as release code.
-OPTFLAG = -O2
+OPTFLAG = -O3
 # Verbose bridge, loader, memory, and syscall traces are opt-in, independent
 # of optimization or debug symbols. Errors remain enabled in every build.
 LC32_DEBUG_LOGS ?= 0
@@ -59,6 +59,7 @@ DYNARMIC_CMAKE_POLICY_FLAGS :=
 endif
 
 LiveExec32Shared_FILES = \
+	arm64_outline_atomics.c \
 	lc32_profile.cpp \
 	LiveExec32Shared.cpp guest_bootstrap.cpp debugger_server.cpp \
 	crash_exception.mm guest_dispatch.mm guest_timer_queue.cpp guest_timers.cpp \
@@ -87,8 +88,10 @@ LiveExec32Shared_FILES = \
 LiveExec32Shared_CFLAGS = \
 	-I. -I$(DYNARMIC_ROOT)/src -I../../include -DDYNARMIC_MASTER \
 	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS) \
+	-moutline-atomics -mtune=apple-a14 -flto=thin \
 	-include "$(LC32_GUEST_OVERRIDE_HEADER)"
 LiveExec32Shared_CCFLAGS = -std=c++17
+arm64_outline_atomics.c_CFLAGS = -mno-outline-atomics -fno-lto
 dynarmic_native_jit.cpp_CFLAGS = -I$(DYNARMIC_ROOT)/externals/oaknut/include
 crash_exception.mm_CFLAGS = -fobjc-arc
 ../Metal/Metal.mm_CFLAGS = -fobjc-arc
@@ -102,7 +105,7 @@ crash_exception.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyFrameRate.mm_CFLAGS = -fobjc-arc
 ../UIKit/ModernPhoneCanvas.mm_CFLAGS = -fobjc-arc
 LiveExec32Shared_OBJ_FILES = $(DYNARMIC_STATIC_LIBS)
-LiveExec32Shared_LDFLAGS = -L../../External/mini-gdbstub/build -Wl,-weak-lMobileGestalt
+LiveExec32Shared_LDFLAGS = -flto=thin -Wl,-object_path_lto,$(THEOS_OBJ_DIR)/LiveExec32Shared.lto.o -L../../External/mini-gdbstub/build -Wl,-weak-lMobileGestalt
 LiveExec32Shared_LIBRARIES = gdbstub
 LiveExec32Shared_FRAMEWORKS = \
 	Accelerate AudioToolbox CFNetwork CoreFoundation CoreMedia CoreVideo Foundation GameKit IOKit \
@@ -154,16 +157,17 @@ lc32-dynarmic-static:
 		-DDYNARMIC_FRONTENDS=A32 \
 		-DBUILD_TESTING=OFF \
 		-DDYNARMIC_TESTS=OFF \
-		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_CROSSCOMPILING=true \
 		-DCMAKE_SYSTEM_NAME=Darwin \
 		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 		-DCMAKE_OSX_SYSROOT="$(ISYSROOT)" \
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
 		-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-		-DCMAKE_C_FLAGS="-arch arm64"
+		-DCMAKE_C_FLAGS="-arch arm64 -O3 -DNDEBUG -moutline-atomics -mtune=apple-a14 -flto=thin -gline-tables-only" \
+		-DCMAKE_CXX_FLAGS="-arch arm64 -O3 -DNDEBUG -moutline-atomics -mtune=apple-a14 -flto=thin -gline-tables-only"
 	env -u MAKEFLAGS cmake --build "$(DYNARMIC_BUILD_DIR)" \
-		--target dynarmic --parallel 4
+		--target dynarmic --parallel 8
 	@for archive in $(DYNARMIC_STATIC_LIBS); do \
 		test -f "$$archive" || { \
 			echo "Dynarmic build did not produce $$archive" >&2; \

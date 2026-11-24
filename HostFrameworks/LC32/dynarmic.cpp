@@ -186,6 +186,8 @@ extern "C" void LC32RetiredGuestMemoryForProfile(
     }
 }
 
+thread_local size_t currentThreadGuestVmEpochDepth = 0;
+
 GuestVmEpochPark::GuestVmEpochPark(
         GuestVmEpochParticipant *participant)
     : participant(participant) {
@@ -198,6 +200,8 @@ GuestVmEpochPark::GuestVmEpochPark(
         return;
     }
     savedDepth = participant->activeDepth;
+    savedThreadDepth = currentThreadGuestVmEpochDepth;
+    currentThreadGuestVmEpochDepth = 0;
     participant->activeDepth = 0;
     ReclaimRetiredMemoryBackingsLocked();
 }
@@ -213,6 +217,7 @@ GuestVmEpochPark::~GuestVmEpochPark() {
     assert(participant->activeDepth == 0);
     participant->activeDepth = savedDepth;
     participant->epoch = guestVmEpoch;
+    currentThreadGuestVmEpochDepth = savedThreadDepth;
 }
 
 GuestVmEpochGuard::GuestVmEpochGuard(
@@ -226,12 +231,15 @@ GuestVmEpochGuard::GuestVmEpochGuard(
     if (participant->activeDepth++ == 0) {
         participant->epoch = guestVmEpoch;
     }
+    ++currentThreadGuestVmEpochDepth;
 }
 
 GuestVmEpochGuard::~GuestVmEpochGuard() {
     if (participant == nullptr) {
         return;
     }
+    assert(currentThreadGuestVmEpochDepth != 0);
+    --currentThreadGuestVmEpochDepth;
     std::lock_guard<std::mutex> lock(guestVmEpochMutex);
     assert(participant->activeDepth != 0);
     if (--participant->activeDepth == 0) {

@@ -480,7 +480,7 @@ static bool BuildNativeGuestJitParts(
     config.global_monitor = sharedHandle.monitor;
     config.always_little_endian = false;
     config.wall_clock_cntpct = true;
-    config.check_halt_on_memory_access = true;
+    config.check_halt_on_memory_access = false;
     config.define_unpredictable_behaviour = true;
     LC32ApplyFastFP(config);
     config.code_cache_size = NativeGuestJitCacheSize();
@@ -488,13 +488,20 @@ static bool BuildNativeGuestJitParts(
     DynarmicCallbacks32SetPageTable(
         parts.callbacks,
         sharedHandle.num_page_table_entries,
-        sharedHandle.page_table);
+        sharedHandle.page_table,
+        sharedHandle.write_page_table);
     if (sharedHandle.page_table != nullptr) {
         config.page_table = reinterpret_cast<
             std::array<std::uint8_t *,
                 Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES> *>(
                     sharedHandle.page_table);
-        config.absolute_offset_page_table = false;
+        if (sharedHandle.write_page_table != nullptr) {
+            config.write_page_table = reinterpret_cast<
+                std::array<std::uint8_t *,
+                    Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES> *>(
+                        sharedHandle.write_page_table);
+        }
+        config.absolute_offset_page_table = true;
         config.detect_misaligned_access_via_page_table =
             16 | 32 | 64 | 128;
         config.only_detect_misalignment_via_page_table_on_page_boundary =

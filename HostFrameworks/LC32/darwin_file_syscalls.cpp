@@ -242,7 +242,7 @@ int LC32CopyGuestCString(u32 guest_string, char output[PATH_MAX]) {
             DYN_PAGE_SIZE - (address & DYN_PAGE_MASK);
         const size_t chunk_length = std::min(
             static_cast<size_t>(PATH_MAX) - copied, page_remaining);
-        std::array<char, DYN_PAGE_SIZE> chunk = {};
+        std::array<char, DYN_PAGE_SIZE> chunk;
         if (!read_guest_memory_with_permissions(
                 address, chunk.data(), chunk_length, PROT_READ)) {
             return EFAULT;

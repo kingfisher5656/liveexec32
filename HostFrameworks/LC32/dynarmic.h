@@ -231,6 +231,7 @@ typedef struct {
     khash_t(memory) *memory;
     size_t num_page_table_entries;
     void **page_table;
+    void **write_page_table;
     union {
         DynarmicCallbacks32 *cb;
         Dynarmic::A32::UserCallbacks *ucb;
@@ -288,7 +289,8 @@ std::uint32_t LC32GuestInitialFpscr();
 void Dynarmic_nativeDestroy();
 int Dynarmic_munmap(u64 address, u64 size);
 int Dynarmic_munmap_direct(u32 address, u64 size, const void *host);
-u32 Dynarmic_direct_mmap(u32 address, u64 size, int protection, int flags, void *src, u64 off);
+u32 Dynarmic_direct_mmap(u32 address, u64 size, int protection, int flags,
+                         void *src, u64 off, bool volatileExternal = false);
 u32 Dynarmic_mmap(u32 address, u64 size, int protection, int flags,
                  int fildes, u64 off, u64 mask = DYN_PAGE_MASK,
                  bool purgable = false);

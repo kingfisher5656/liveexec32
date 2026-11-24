@@ -184,9 +184,14 @@ public:
 private:
     GuestVmEpochParticipant *participant;
     size_t savedDepth = 0;
+    size_t savedThreadDepth = 0;
 };
 
 extern "C" GuestVmEpochParticipant *CurrentGuestVmEpochParticipantForThread();
+extern thread_local size_t currentThreadGuestVmEpochDepth;
+inline bool CurrentThreadInGuestVmEpoch() {
+    return currentThreadGuestVmEpochDepth != 0;
+}
 
 struct GuestStopRequest {
     int signal = SIGTRAP;
@@ -321,7 +326,7 @@ const std::shared_ptr<DynarmicCP15> &DynarmicCallbacks32CP15(
     DynarmicCallbacks32 *callbacks);
 void DynarmicCallbacks32SetPageTable(
     DynarmicCallbacks32 *callbacks, size_t entryCount,
-    void **pageTable);
+    void **pageTable, void **writePageTable);
 void DynarmicCallbacks32BindJit(
     DynarmicCallbacks32 *callbacks, Dynarmic::A32::Jit *jit,
     DynarmicCpsr *cpsr);
@@ -501,8 +506,16 @@ void symbolicate_call_stack(
     symbolicated_call *callStack, int callStackLen,
     const std::vector<GuestImageSnapshot> &images);
 int HostProtectionForGuestPermissions(int permissions);
-void *GuestPageTablePointer(
+void *GuestReadPageTableEntry(
     u64 guestPageAddress, const t_memory_page page);
+void *GuestWritePageTableEntry(
+    u64 guestPageAddress, const t_memory_page page);
+void UpdateGuestPageTableEntries(
+    u64 guestPageAddress, const t_memory_page page);
+void ClearGuestPageTableEntries(u64 guestPageAddress);
+void MarkGuestPageEverExternal(u64 guestPageAddress);
+bool GuestPageEverExternal(u64 pageIndex);
+void ResetGuestExternalPageBitmap();
 extern "C" int ReplaceGuestMemoryRangeWithPrivateCopy(
     u32 address, size_t size, const void *source);
 char *get_memory_page_with_permissions(

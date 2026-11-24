@@ -533,6 +533,28 @@ public:
             return enabled;
         }();
         if (!fixesEnabled) return word;
+        struct FixBloomFilter {
+            uint64_t mask1 = 0;
+            uint64_t mask2 = 0;
+            static constexpr uint64_t Bit1(u32 addr) {
+                return UINT64_C(1) << (((addr >> 2) ^ (addr >> 10)) & 63u);
+            }
+            static constexpr uint64_t Bit2(u32 addr) {
+                return UINT64_C(1) << (((addr >> 6) ^ (addr >> 16)) & 63u);
+            }
+        };
+        static const FixBloomFilter fixFilter = [] {
+            FixBloomFilter filter;
+            for (const GuestCodeFix &fix : fixes) {
+                filter.mask1 |= FixBloomFilter::Bit1(fix.address);
+                filter.mask2 |= FixBloomFilter::Bit2(fix.address);
+            }
+            return filter;
+        }();
+        if ((fixFilter.mask1 & FixBloomFilter::Bit1(vaddr)) == 0 ||
+                (fixFilter.mask2 & FixBloomFilter::Bit2(vaddr)) == 0) {
+            return word;
+        }
         for (size_t index = 0; index < fixCount; ++index) {
             const GuestCodeFix &fix = fixes[index];
             if (vaddr != fix.address || word != fix.original) continue;
@@ -600,34 +622,47 @@ public:
      * directly: use the host pointer and a real atomic instead.
      */
     template <typename T>
-    T *DirectGuestPointer(u32 vaddr) {
-        if ((vaddr & (sizeof(T) - 1)) != 0 || page_table == nullptr ||
-                !cpu->IsExecuting()) {
+    T *DirectGuestPointerFromTable(void **table, u32 vaddr) {
+        if ((vaddr & (sizeof(T) - 1)) != 0 || table == nullptr ||
+                !CurrentThreadInGuestVmEpoch()) {
             return nullptr;
         }
         const u64 index = vaddr >> DYN_PAGE_BITS;
         if (index >= num_page_table_entries) {
             return nullptr;
         }
-        char *page = static_cast<char *>(
-            __atomic_load_n(&page_table[index], __ATOMIC_ACQUIRE));
-        return page != nullptr
-            ? reinterpret_cast<T *>(page + (vaddr & DYN_PAGE_MASK))
-            : nullptr;
+        const uintptr_t entry = reinterpret_cast<uintptr_t>(
+            __atomic_load_n(&table[index], __ATOMIC_ACQUIRE));
+        if (entry == 0 || GuestPageEverExternal(index)) {
+            return nullptr;
+        }
+        const uintptr_t hostAddr = entry + static_cast<uintptr_t>(vaddr);
+        if ((hostAddr & (sizeof(T) - 1)) != 0) {
+            return nullptr;
+        }
+        return reinterpret_cast<T *>(hostAddr);
+    }
+    template <typename T>
+    T *DirectGuestReadPointer(u32 vaddr) {
+        return DirectGuestPointerFromTable<T>(page_table, vaddr);
+    }
+    template <typename T>
+    T *DirectGuestWritePointer(u32 vaddr) {
+        return DirectGuestPointerFromTable<T>(write_page_table, vaddr);
     }
     template <typename T>
     bool DirectExclusiveWrite(u32 vaddr, T value, T expected, bool &committed) {
-        T *pointer = DirectGuestPointer<T>(vaddr);
+        T *pointer = DirectGuestWritePointer<T>(vaddr);
         if (pointer == nullptr) {
             return false;
         }
         committed = __atomic_compare_exchange_n(pointer, &expected, value,
-            false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
         return true;
     }
 
     u8 MemoryRead8(u32 vaddr) override {
-        if (u8 *direct = DirectGuestPointer<u8>(vaddr))
+        if (u8 *direct = DirectGuestReadPointer<u8>(vaddr))
             return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 1, 0, cpu->IsExecuting(), __builtin_return_address(0));
         u8 value = 0;
@@ -668,7 +703,7 @@ public:
         }
     }
     u16 MemoryRead16(u32 vaddr) override {
-        if (u16 *direct = DirectGuestPointer<u16>(vaddr))
+        if (u16 *direct = DirectGuestReadPointer<u16>(vaddr))
             return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 2, 0, cpu->IsExecuting(), __builtin_return_address(0));
         return MemoryRead16(vaddr, true);
@@ -698,13 +733,13 @@ public:
         }
     }
     u32 MemoryRead32(u32 vaddr) override {
-        if (u32 *direct = DirectGuestPointer<u32>(vaddr))
+        if (u32 *direct = DirectGuestReadPointer<u32>(vaddr))
             return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 4, 0, cpu->IsExecuting(), __builtin_return_address(0));
         return MemoryRead32(vaddr, true);
     }
     u64 MemoryRead64(u32 vaddr) override {
-        if (u64 *direct = DirectGuestPointer<u64>(vaddr))
+        if (u64 *direct = DirectGuestReadPointer<u64>(vaddr))
             return __atomic_load_n(direct, __ATOMIC_ACQUIRE);
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 8, 0, cpu->IsExecuting(), __builtin_return_address(0));
         u64 value = 0;
@@ -723,6 +758,12 @@ public:
     }
 
     void MemoryWrite8(u32 vaddr, u8 value) override {
+#ifndef LC32_GUEST_MEMORY_WATCH_ADDRESS
+        if (u8 *direct = DirectGuestWritePointer<u8>(vaddr)) {
+            __atomic_store_n(direct, value, __ATOMIC_RELEASE);
+            return;
+        }
+#endif
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 1, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
@@ -736,6 +777,12 @@ public:
         }
     }
     void MemoryWrite16(u32 vaddr, u16 value) override {
+#ifndef LC32_GUEST_MEMORY_WATCH_ADDRESS
+        if (u16 *direct = DirectGuestWritePointer<u16>(vaddr)) {
+            __atomic_store_n(direct, value, __ATOMIC_RELEASE);
+            return;
+        }
+#endif
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 2, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
@@ -749,6 +796,12 @@ public:
         }
     }
     void MemoryWrite32(u32 vaddr, u32 value) override {
+#ifndef LC32_GUEST_MEMORY_WATCH_ADDRESS
+        if (u32 *direct = DirectGuestWritePointer<u32>(vaddr)) {
+            __atomic_store_n(direct, value, __ATOMIC_RELEASE);
+            return;
+        }
+#endif
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 4, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
@@ -762,6 +815,12 @@ public:
         }
     }
     void MemoryWrite64(u32 vaddr, u64 value) override {
+#ifndef LC32_GUEST_MEMORY_WATCH_ADDRESS
+        if (u64 *direct = DirectGuestWritePointer<u64>(vaddr)) {
+            __atomic_store_n(direct, value, __ATOMIC_RELEASE);
+            return;
+        }
+#endif
         if (LC32ProfileActive) LC32ProfileAddSlowMemory(vaddr, 8, 1, cpu->IsExecuting(), __builtin_return_address(0));
         if (write_guest_memory_with_permissions(
                 vaddr, &value, sizeof(value),
@@ -3091,6 +3150,7 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
     khash_t(memory) *memory = NULL;
     size_t num_page_table_entries;
     void **page_table = NULL;
+    void **write_page_table = NULL;
     Dynarmic::A32::Jit *cpu;
     DynarmicCpsr *cpsr;
     std::shared_ptr<DynarmicCP15> cp15;
@@ -3121,12 +3181,13 @@ const std::shared_ptr<DynarmicCP15> &DynarmicCallbacks32CP15(
 
 void DynarmicCallbacks32SetPageTable(
         DynarmicCallbacks32 *callbacks, size_t entryCount,
-        void **pageTable) {
+        void **pageTable, void **writePageTable) {
     if (callbacks == nullptr) {
         return;
     }
     callbacks->num_page_table_entries = entryCount;
     callbacks->page_table = pageTable;
+    callbacks->write_page_table = writePageTable;
 }
 
 void DynarmicCallbacks32BindJit(

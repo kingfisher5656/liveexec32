@@ -160,7 +160,7 @@ bool Dynarmic_nativeInitialize() {
         config.global_monitor = sharedHandle.monitor;
         config.always_little_endian = false;
         config.wall_clock_cntpct = true;
-        config.check_halt_on_memory_access = true;
+        config.check_halt_on_memory_access = false;
         //    config.page_table_pointer_mask_bits = DYN_PAGE_BITS;
 
         LC32ApplyFastFP(config);
@@ -171,18 +171,30 @@ bool Dynarmic_nativeInitialize() {
         if(sharedHandle.page_table == MAP_FAILED) {
             fprintf(stderr, "nativeInitialize mmap failed[%s->%s:%d] size=0x%zx, errno=%d, msg=%s\n", __FILE__, __func__, __LINE__, size, errno, strerror(errno));
             sharedHandle.page_table = NULL;
+            sharedHandle.write_page_table = NULL;
         } else {
+            sharedHandle.write_page_table = (void **)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+            if(sharedHandle.write_page_table == MAP_FAILED) {
+                fprintf(stderr, "nativeInitialize write_page_table mmap failed[%s->%s:%d] size=0x%zx, errno=%d, msg=%s\n", __FILE__, __func__, __LINE__, size, errno, strerror(errno));
+                munmap(sharedHandle.page_table, size);
+                sharedHandle.page_table = NULL;
+                sharedHandle.write_page_table = NULL;
+            }
+        }
+        if (sharedHandle.page_table != NULL && sharedHandle.write_page_table != NULL) {
             DynarmicCallbacks32SetPageTable(
                 callbacks,
                 sharedHandle.num_page_table_entries,
-                sharedHandle.page_table);
+                sharedHandle.page_table,
+                sharedHandle.write_page_table);
 
             // Unpredictable instructions
             config.define_unpredictable_behaviour = true;
 
             // Memory
             config.page_table = reinterpret_cast<std::array<std::uint8_t*, Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES>*>(sharedHandle.page_table);
-            config.absolute_offset_page_table = false;
+            config.write_page_table = reinterpret_cast<std::array<std::uint8_t*, Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES>*>(sharedHandle.write_page_table);
+            config.absolute_offset_page_table = true;
             config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
             config.only_detect_misalignment_via_page_table_on_page_boundary = true;
         }
@@ -340,22 +352,38 @@ void Dynarmic_nativeDestroy() {
             sharedHandle.memory = nullptr;
         }
     }
-    if (sharedHandle.page_table != nullptr) {
+    if (sharedHandle.page_table != nullptr ||
+            sharedHandle.write_page_table != nullptr) {
         const size_t tableSize =
             sharedHandle.num_page_table_entries *
             sizeof(void *);
-        const int result = munmap(
-            sharedHandle.page_table, tableSize);
-        if (result != 0) {
-            fprintf(stderr,
-                "munmap failed[%s->%s:%d]: "
-                "page_table=%p, ret=%d\n",
-                __FILE__, __func__, __LINE__,
-                sharedHandle.page_table, result);
+        if (sharedHandle.write_page_table != nullptr) {
+            const int result = munmap(
+                sharedHandle.write_page_table, tableSize);
+            if (result != 0) {
+                fprintf(stderr,
+                    "munmap failed[%s->%s:%d]: "
+                    "write_page_table=%p, ret=%d\n",
+                    __FILE__, __func__, __LINE__,
+                    sharedHandle.write_page_table, result);
+            }
+            sharedHandle.write_page_table = nullptr;
         }
-        sharedHandle.page_table = nullptr;
+        if (sharedHandle.page_table != nullptr) {
+            const int result = munmap(
+                sharedHandle.page_table, tableSize);
+            if (result != 0) {
+                fprintf(stderr,
+                    "munmap failed[%s->%s:%d]: "
+                    "page_table=%p, ret=%d\n",
+                    __FILE__, __func__, __LINE__,
+                    sharedHandle.page_table, result);
+            }
+            sharedHandle.page_table = nullptr;
+        }
         sharedHandle.num_page_table_entries = 0;
     }
+    ResetGuestExternalPageBitmap();
     delete sharedHandle.monitor;
     sharedHandle.monitor = nullptr;
 
@@ -572,13 +600,8 @@ int Dynarmic_munmap(u64 address, u64 size) {
     InvalidateGuestMemoryLookupCaches();
     for(u64 vaddr = address; vaddr < end;
             vaddr += DYN_PAGE_SIZE) {
-        u64 idx = vaddr >> DYN_PAGE_BITS;
         khiter_t k = kh_get(memory, memory, vaddr);
-        if(sharedHandle.page_table && idx < sharedHandle.num_page_table_entries) {
-            __atomic_store_n(
-                &sharedHandle.page_table[idx], nullptr,
-                __ATOMIC_RELEASE);
-        }
+        ClearGuestPageTableEntries(vaddr);
         t_memory_page page = kh_value(memory, k);
         /*
          * Guest pages are 4 KiB while Apple Silicon host VM pages are
@@ -797,7 +820,8 @@ static u64 Dynarmic_mem_reserve(
 
 u32 Dynarmic_direct_mmap(
         u32 address, u64 size, int protection,
-        int flags, void *src, u64 off) {
+        int flags, void *src, u64 off,
+        bool volatileExternal) {
     std::unique_lock<std::recursive_mutex> lock(
         guestVmMutex);
     if(address & DYN_PAGE_MASK) {
@@ -832,8 +856,14 @@ u32 Dynarmic_direct_mmap(
     const u64 end = reservedAddress + size;
     for(u64 vaddr = reservedAddress; vaddr < end;
             vaddr += DYN_PAGE_SIZE) {
-        u64 idx = vaddr >> DYN_PAGE_BITS;
-
+        ClearGuestPageTableEntries(vaddr);
+        if (volatileExternal) {
+            MarkGuestPageEverExternal(vaddr);
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    for(u64 vaddr = reservedAddress; vaddr < end;
+            vaddr += DYN_PAGE_SIZE) {
         void *addr = reinterpret_cast<void *>(
             reinterpret_cast<u64>(src) + off +
                 vaddr - reservedAddress);
@@ -845,14 +875,7 @@ u32 Dynarmic_direct_mmap(
         page->enforceDataPermissions =
             (protection & PROT_READ) == 0;
         page->backing = nullptr;
-        if(sharedHandle.page_table && idx < sharedHandle.num_page_table_entries) {
-            __atomic_store_n(
-                &sharedHandle.page_table[idx],
-                GuestPageTablePointer(vaddr, page),
-                __ATOMIC_RELEASE);
-        } else {
-            // 0xffffff80001f0000ULL: 0x10000
-        }
+        UpdateGuestPageTableEntries(vaddr, page);
         ReleaseMemoryBackingReference(
             oldBacking);
     }
@@ -1000,8 +1023,11 @@ u32 Dynarmic_mmap(
     InvalidateGuestMemoryLookupCaches();
     for(u64 vaddr = reservedAddress; vaddr < end;
             vaddr += DYN_PAGE_SIZE) {
-        u64 idx = vaddr >> DYN_PAGE_BITS;
-
+        ClearGuestPageTableEntries(vaddr);
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    for(u64 vaddr = reservedAddress; vaddr < end;
+            vaddr += DYN_PAGE_SIZE) {
         t_memory_page page = kh_value(memory, kh_get(memory, memory, vaddr));
         t_memory_backing oldBacking =
             page->backing;
@@ -1016,14 +1042,7 @@ u32 Dynarmic_mmap(
         page->enforceDataPermissions =
             (guestProtection & PROT_READ) == 0;
         page->backing = backing;
-        if(sharedHandle.page_table && idx < sharedHandle.num_page_table_entries) {
-            __atomic_store_n(
-                &sharedHandle.page_table[idx],
-                GuestPageTablePointer(vaddr, page),
-                __ATOMIC_RELEASE);
-        } else {
-            // 0xffffff80001f0000ULL: 0x10000
-        }
+        UpdateGuestPageTableEntries(vaddr, page);
         ReleaseMemoryBackingReference(
             oldBacking);
 
@@ -1141,15 +1160,16 @@ kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
     for(const auto &page : pages) ++page.backing->references;
     InvalidateGuestMemoryLookupCaches();
     for(size_t index = 0; index < pages.size(); ++index) {
+        ClearGuestPageTableEntries(mapped + index * DYN_PAGE_SIZE);
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    for(size_t index = 0; index < pages.size(); ++index) {
         const u64 guestAddress = mapped + index * DYN_PAGE_SIZE;
         t_memory_page page = kh_value(memory, kh_get(memory, memory, guestAddress));
         t_memory_backing previous = page->backing;
         *page = pages[index];
         page->enforceDataPermissions = true;
-        const u64 tableIndex = guestAddress >> DYN_PAGE_BITS;
-        if(sharedHandle.page_table && tableIndex < sharedHandle.num_page_table_entries)
-            __atomic_store_n(&sharedHandle.page_table[tableIndex],
-                GuestPageTablePointer(guestAddress, page), __ATOMIC_RELEASE);
+        UpdateGuestPageTableEntries(guestAddress, page);
         ReleaseMemoryBackingReference(previous);
     }
     reservations.clear();
@@ -1251,15 +1271,7 @@ int Dynarmic_mprotect(u64 address, u64 size, int perms) {
     InvalidateGuestMemoryLookupCaches();
     for (const ProtectedPage &protectedPage :
             pages) {
-        const u64 index =
-            protectedPage.address >> DYN_PAGE_BITS;
-        if (sharedHandle.page_table != nullptr &&
-                index <
-                    sharedHandle.num_page_table_entries) {
-            __atomic_store_n(
-                &sharedHandle.page_table[index],
-                nullptr, __ATOMIC_RELEASE);
-        }
+        ClearGuestPageTableEntries(protectedPage.address);
     }
 
     /*
@@ -1283,21 +1295,9 @@ int Dynarmic_mprotect(u64 address, u64 size, int perms) {
             const int savedErrno = errno;
             for (const ProtectedPage &protectedPage :
                     pages) {
-                const u64 index =
-                    protectedPage.address >>
-                        DYN_PAGE_BITS;
-                if (sharedHandle.page_table != nullptr &&
-                        index <
-                            sharedHandle
-                                .num_page_table_entries) {
-                    __atomic_store_n(
-                        &sharedHandle
-                            .page_table[index],
-                        GuestPageTablePointer(
-                            protectedPage.address,
-                            protectedPage.page),
-                        __ATOMIC_RELEASE);
-                }
+                UpdateGuestPageTableEntries(
+                    protectedPage.address,
+                    protectedPage.page);
             }
             errno = savedErrno;
             return -1;
@@ -1311,18 +1311,9 @@ int Dynarmic_mprotect(u64 address, u64 size, int perms) {
         protectedPage.page->perms = perms;
         protectedPage.page->enforceDataPermissions =
             true;
-        const u64 index =
-            protectedPage.address >> DYN_PAGE_BITS;
-        if (sharedHandle.page_table != nullptr &&
-                index <
-                    sharedHandle.num_page_table_entries) {
-            __atomic_store_n(
-                &sharedHandle.page_table[index],
-                GuestPageTablePointer(
-                    protectedPage.address,
-                    protectedPage.page),
-                __ATOMIC_RELEASE);
-        }
+        UpdateGuestPageTableEntries(
+            protectedPage.address,
+            protectedPage.page);
     }
     lock.unlock();
     InvalidateAllGuestJits(
@@ -1429,6 +1420,26 @@ int Dynarmic_mem_1write(u64 address, u64 size, char* src) {
                 address, size)) {
         return 1;
     }
+#ifndef LC32_GUEST_MEMORY_WATCH_ADDRESS
+    if (CurrentThreadInGuestVmEpoch() &&
+            sharedHandle.write_page_table != nullptr) {
+        const u64 firstIdx = address >> DYN_PAGE_BITS;
+        const u64 lastIdx = (address + size - 1) >> DYN_PAGE_BITS;
+        if (firstIdx == lastIdx &&
+                firstIdx < sharedHandle.num_page_table_entries) {
+            const uintptr_t entry = reinterpret_cast<uintptr_t>(
+                __atomic_load_n(
+                    &sharedHandle.write_page_table[firstIdx],
+                    __ATOMIC_ACQUIRE));
+            if (entry != 0 && !GuestPageEverExternal(firstIdx)) {
+                memcpy(
+                    reinterpret_cast<char *>(entry + static_cast<uintptr_t>(address)),
+                    src, static_cast<size_t>(size));
+                return 0;
+            }
+        }
+    }
+#endif
     std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
 #ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
     const u64 originalAddress = address;
@@ -1569,15 +1580,7 @@ int ReplaceGuestMemoryRangeWithPrivateCopy(
      * already loaded an old direct pointer cannot observe freed memory. */
     InvalidateGuestMemoryLookupCaches();
     for(const ReplacedPage &entry : pages) {
-        const u64 pageTableIndex =
-            entry.address >> DYN_PAGE_BITS;
-        if(sharedHandle.page_table != nullptr &&
-                pageTableIndex <
-                    sharedHandle.num_page_table_entries) {
-            __atomic_store_n(
-                &sharedHandle.page_table[pageTableIndex],
-                nullptr, __ATOMIC_RELEASE);
-        }
+        ClearGuestPageTableEntries(entry.address);
     }
     for(size_t index = 0; index < pages.size(); ++index) {
         const ReplacedPage &entry = pages[index];
@@ -1587,16 +1590,7 @@ int ReplaceGuestMemoryRangeWithPrivateCopy(
         ReleaseMemoryBackingReference(oldBacking);
     }
     for(const ReplacedPage &entry : pages) {
-        const u64 pageTableIndex =
-            entry.address >> DYN_PAGE_BITS;
-        if(sharedHandle.page_table != nullptr &&
-                pageTableIndex <
-                    sharedHandle.num_page_table_entries) {
-            __atomic_store_n(
-                &sharedHandle.page_table[pageTableIndex],
-                GuestPageTablePointer(entry.address, entry.page),
-                __ATOMIC_RELEASE);
-        }
+        UpdateGuestPageTableEntries(entry.address, entry.page);
     }
     return 0;
 }
@@ -1614,6 +1608,25 @@ int Dynarmic_mem_1read(u64 address, u64 size, char* dest) {
             !GuestAddressRangeIsValid32(
                 address, size)) {
         return 1;
+    }
+    if (CurrentThreadInGuestVmEpoch() &&
+            sharedHandle.page_table != nullptr) {
+        const u64 firstIdx = address >> DYN_PAGE_BITS;
+        const u64 lastIdx = (address + size - 1) >> DYN_PAGE_BITS;
+        if (firstIdx == lastIdx &&
+                firstIdx < sharedHandle.num_page_table_entries) {
+            const uintptr_t entry = reinterpret_cast<uintptr_t>(
+                __atomic_load_n(
+                    &sharedHandle.page_table[firstIdx],
+                    __ATOMIC_ACQUIRE));
+            if (entry != 0 && !GuestPageEverExternal(firstIdx)) {
+                memcpy(
+                    dest,
+                    reinterpret_cast<const char *>(entry + static_cast<uintptr_t>(address)),
+                    static_cast<size_t>(size));
+                return 0;
+            }
+        }
     }
     std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
     u64 vaddr_end = address + size;

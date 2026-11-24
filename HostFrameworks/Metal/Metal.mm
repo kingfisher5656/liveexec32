@@ -225,7 +225,8 @@ uint32_t GuestContents(id<MTLBuffer> buffer) {
         const uint64_t end = (host + length + DYN_PAGE_MASK) & ~DYN_PAGE_MASK;
         const uint32_t guest = Dynarmic_direct_mmap(0, end - base,
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
-            reinterpret_cast<void *>(base), 0);
+            reinterpret_cast<void *>(base), 0,
+            /*volatileExternal=*/true);
         if(guest == UINT32_MAX || guest == 0) {
             fprintf(stderr, "LC32 Metal: could not map %llu-byte buffer "
                 "contents into the guest\n", (unsigned long long)length);

@@ -501,16 +501,27 @@ void symbolicate_call_stack(
     }
 }
 
+static inline uintptr_t EncodeGuestPageTableOffset(
+        u64 guestPageAddress, void *hostPageAddress) {
+    const uintptr_t encoded =
+        reinterpret_cast<uintptr_t>(hostPageAddress) -
+        static_cast<uintptr_t>(guestPageAddress);
+    return encoded;
+}
+
 char *get_memory_page(u64 vaddr) {
     size_t num_page_table_entries = sharedHandle.num_page_table_entries;
     void **page_table = sharedHandle.page_table;
     khash_t(memory) *memory = sharedHandle.memory;
     u64 idx = vaddr >> DYN_PAGE_BITS;
     if(page_table && idx < num_page_table_entries) {
-      char *fastPage = static_cast<char *>(
+      const uintptr_t fastEntry = reinterpret_cast<uintptr_t>(
           __atomic_load_n(
               &page_table[idx], __ATOMIC_ACQUIRE));
-      if (fastPage != nullptr) return fastPage;
+      if (fastEntry != 0) {
+          return reinterpret_cast<char *>(
+              fastEntry + static_cast<uintptr_t>(idx << DYN_PAGE_BITS));
+      }
     }
     std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
     u64 base = vaddr & ~DYN_PAGE_MASK;
@@ -542,7 +553,7 @@ int HostProtectionForGuestPermissions(
     return hostProtection;
 }
 
-void *GuestPageTablePointer(
+void *GuestReadPageTableEntry(
         u64 guestPageAddress,
         const t_memory_page page) {
     if (page == nullptr || page->addr == nullptr) {
@@ -553,13 +564,100 @@ void *GuestPageTablePointer(
         return nullptr;
     }
 #endif
-    if (page->enforceDataPermissions &&
-            (page->perms &
-                (PROT_READ | PROT_WRITE)) !=
-                (PROT_READ | PROT_WRITE)) {
+    if ((page->perms & PROT_READ) == 0) {
         return nullptr;
     }
-    return page->addr;
+    return reinterpret_cast<void *>(
+        EncodeGuestPageTableOffset(guestPageAddress, page->addr));
+}
+
+void *GuestWritePageTableEntry(
+        u64 guestPageAddress,
+        const t_memory_page page) {
+    if (page == nullptr || page->addr == nullptr) {
+        return nullptr;
+    }
+#ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
+    if (GuestMemoryWatchContainsPage(guestPageAddress)) {
+        return nullptr;
+    }
+#endif
+    /*
+     * Match real iOS write protection: any page lacking PROT_WRITE stays null
+     * in write_page_table so guest stores trap through MemoryWrite* -> SIGSEGV,
+     * including anonymous mmap(PROT_READ) pages whose host backing is RW.
+     */
+    if ((page->perms & (PROT_READ | PROT_WRITE)) !=
+            (PROT_READ | PROT_WRITE)) {
+        return nullptr;
+    }
+    return reinterpret_cast<void *>(
+        EncodeGuestPageTableOffset(guestPageAddress, page->addr));
+}
+
+void UpdateGuestPageTableEntries(
+        u64 guestPageAddress,
+        const t_memory_page page) {
+    const u64 index = guestPageAddress >> DYN_PAGE_BITS;
+    if (index >= sharedHandle.num_page_table_entries) {
+        return;
+    }
+    if (sharedHandle.write_page_table != nullptr) {
+        __atomic_store_n(
+            &sharedHandle.write_page_table[index],
+            GuestWritePageTableEntry(guestPageAddress, page),
+            __ATOMIC_RELEASE);
+    }
+    if (sharedHandle.page_table != nullptr) {
+        __atomic_store_n(
+            &sharedHandle.page_table[index],
+            GuestReadPageTableEntry(guestPageAddress, page),
+            __ATOMIC_RELEASE);
+    }
+}
+
+static std::atomic<uint64_t> externalBackingPageBitmap[
+    Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES / 64];
+
+void MarkGuestPageEverExternal(u64 guestPageAddress) {
+    const u64 index = guestPageAddress >> DYN_PAGE_BITS;
+    if (index >= Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES) {
+        return;
+    }
+    externalBackingPageBitmap[index >> 6].fetch_or(
+        UINT64_C(1) << (index & 63), std::memory_order_release);
+}
+
+bool GuestPageEverExternal(u64 pageIndex) {
+    if (pageIndex >= Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES) {
+        return true;
+    }
+    return (externalBackingPageBitmap[pageIndex >> 6].load(
+                std::memory_order_acquire) &
+            (UINT64_C(1) << (pageIndex & 63))) != 0;
+}
+
+void ResetGuestExternalPageBitmap() {
+    for (auto &word : externalBackingPageBitmap) {
+        word.store(0, std::memory_order_relaxed);
+    }
+}
+
+void ClearGuestPageTableEntries(u64 guestPageAddress) {
+    const u64 index = guestPageAddress >> DYN_PAGE_BITS;
+    if (index >= sharedHandle.num_page_table_entries) {
+        return;
+    }
+    if (sharedHandle.write_page_table != nullptr) {
+        __atomic_store_n(
+            &sharedHandle.write_page_table[index],
+            nullptr, __ATOMIC_RELEASE);
+    }
+    if (sharedHandle.page_table != nullptr) {
+        __atomic_store_n(
+            &sharedHandle.page_table[index],
+            nullptr, __ATOMIC_RELEASE);
+    }
 }
 
 #ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
@@ -607,9 +705,13 @@ void LogGuestMemoryWatchConsistencyLocked(
     void *pageTablePointer = nullptr;
     if (sharedHandle.page_table != nullptr &&
             pageIndex < sharedHandle.num_page_table_entries) {
-        pageTablePointer = __atomic_load_n(
+        const uintptr_t entry = reinterpret_cast<uintptr_t>(__atomic_load_n(
             &sharedHandle.page_table[pageIndex],
-            __ATOMIC_ACQUIRE);
+            __ATOMIC_ACQUIRE));
+        if (entry != 0) {
+            pageTablePointer = reinterpret_cast<void *>(
+                entry + static_cast<uintptr_t>(pageAddress));
+        }
     }
 
     t_memory_page page = nullptr;
@@ -705,10 +807,8 @@ void InvalidateGuestMemoryLookupCaches() {
         1, std::memory_order_relaxed);
 }
 
-char *get_memory_page_with_permissions(
+static char *get_memory_page_with_permissions_locked(
         u64 vaddr, int requiredPermissions) {
-    std::lock_guard<std::recursive_mutex> lock(
-        guestVmMutex);
     khash_t(memory) *memory = sharedHandle.memory;
     if (memory == nullptr) {
         return nullptr;
@@ -748,6 +848,14 @@ char *get_memory_page_with_permissions(
     return (cache.permissions & requiredPermissions) ==
             requiredPermissions
         ? cache.hostPageAddress : nullptr;
+}
+
+char *get_memory_page_with_permissions(
+        u64 vaddr, int requiredPermissions) {
+    std::lock_guard<std::recursive_mutex> lock(
+        guestVmMutex);
+    return get_memory_page_with_permissions_locked(
+        vaddr, requiredPermissions);
 }
 
 bool GuestAddressRangeIsValid32(
@@ -900,12 +1008,26 @@ bool read_guest_memory_with_permissions(
             address, size)) {
         return false;
     }
+    if (size == 0) {
+        return true;
+    }
     std::lock_guard<std::recursive_mutex> lock(
         guestVmMutex);
+    const size_t firstPageOffset = address & DYN_PAGE_MASK;
+    if (size <= static_cast<size_t>(DYN_PAGE_SIZE - firstPageOffset)) {
+        char *page = get_memory_page_with_permissions_locked(
+            address, requiredPermissions);
+        if (page == nullptr) {
+            return false;
+        }
+        memcpy(destination, page + firstPageOffset, size);
+        return true;
+    }
+
     u64 validationAddress = address;
     size_t validationSize = size;
     while (validationSize != 0) {
-        if (get_memory_page_with_permissions(
+        if (get_memory_page_with_permissions_locked(
                 validationAddress,
                 requiredPermissions) == nullptr) {
             return false;
@@ -924,7 +1046,7 @@ bool read_guest_memory_with_permissions(
         destination);
     while (size != 0) {
         char *page =
-            get_memory_page_with_permissions(
+            get_memory_page_with_permissions_locked(
                 address, requiredPermissions);
         if (page == nullptr) {
             return false;
@@ -961,7 +1083,7 @@ std::string CopyGuestCStringForCrash(
             DYN_PAGE_SIZE - (address & DYN_PAGE_MASK);
         const size_t chunkLength = std::min(
             maximumLength - result.size(), pageRemaining);
-        std::array<char, DYN_PAGE_SIZE> chunk{};
+        std::array<char, DYN_PAGE_SIZE> chunk;
         if (!read_guest_memory_with_permissions(
                 address, chunk.data(), chunkLength,
                 PROT_READ)) {
@@ -992,12 +1114,36 @@ bool write_guest_memory_with_permissions(
             address, size)) {
         return false;
     }
+    if (size == 0) {
+        return true;
+    }
     std::lock_guard<std::recursive_mutex> lock(
         guestVmMutex);
 #ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
     const u64 originalAddress = address;
     const size_t originalSize = size;
 #endif
+    const size_t firstPageOffset = address & DYN_PAGE_MASK;
+    if (size <= static_cast<size_t>(DYN_PAGE_SIZE - firstPageOffset)) {
+        char *page = get_memory_page_with_permissions_locked(
+            address, requiredPermissions);
+        if (page == nullptr) {
+            return false;
+        }
+#ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
+        u32 oldWatchedValue = 0;
+        const bool hadOldWatchedValue =
+            GuestMemoryWatchOverlaps(address, size) &&
+            SnapshotGuestMemoryWatchLocked(&oldWatchedValue);
+#endif
+        memcpy(page + firstPageOffset, source, size);
+#ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
+        LogGuestMemoryWatchWriteLocked(
+            "permissioned", originalAddress, originalSize,
+            hadOldWatchedValue, oldWatchedValue);
+#endif
+        return true;
+    }
     /*
      * Validate the complete range before modifying it. An unaligned scalar
      * store may span two guest pages; discovering a protected second page
@@ -1007,7 +1153,7 @@ bool write_guest_memory_with_permissions(
     u64 validationAddress = address;
     size_t validationSize = size;
     while (validationSize != 0) {
-        if (get_memory_page_with_permissions(
+        if (get_memory_page_with_permissions_locked(
                 validationAddress,
                 requiredPermissions) == nullptr) {
             return false;
@@ -1032,7 +1178,7 @@ bool write_guest_memory_with_permissions(
 #endif
     while (size != 0) {
         char *page =
-            get_memory_page_with_permissions(
+            get_memory_page_with_permissions_locked(
                 address, requiredPermissions);
         if (page == nullptr) {
             return false;
@@ -1235,22 +1381,29 @@ extern "C" void LC32DescribeGuestPageForProfile(
         uint32_t address, char *buffer, size_t size) {
     const u64 base = address & ~u64(DYN_PAGE_MASK);
     const u64 index = base >> DYN_PAGE_BITS;
-    void *pte = nullptr;
+    void *readPte = nullptr;
+    void *writePte = nullptr;
     if (sharedHandle.page_table != nullptr &&
             index < sharedHandle.num_page_table_entries) {
-        pte = __atomic_load_n(&sharedHandle.page_table[index], __ATOMIC_ACQUIRE);
+        readPte = __atomic_load_n(&sharedHandle.page_table[index], __ATOMIC_ACQUIRE);
+    }
+    if (sharedHandle.write_page_table != nullptr &&
+            index < sharedHandle.num_page_table_entries) {
+        writePte = __atomic_load_n(&sharedHandle.write_page_table[index], __ATOMIC_ACQUIRE);
     }
     std::lock_guard<std::recursive_mutex> lock(guestVmMutex);
     const khiter_t k = kh_get(memory, sharedHandle.memory, base);
     if (k == kh_end(sharedHandle.memory)) {
-        snprintf(buffer, size, "unmapped pte=%s", pte ? "set" : "null");
+        snprintf(buffer, size, "unmapped rpte=%s wpte=%s",
+            readPte ? "set" : "null", writePte ? "set" : "null");
         return;
     }
     const t_memory_page page = kh_value(sharedHandle.memory, k);
-    snprintf(buffer, size, "perms=%c%c%c%s%s pte=%s",
+    snprintf(buffer, size, "perms=%c%c%c%s%s rpte=%s wpte=%s",
         (page->perms & PROT_READ) ? 'r' : '-',
         (page->perms & PROT_WRITE) ? 'w' : '-',
         (page->perms & PROT_EXEC) ? 'x' : '-',
         page->enforceDataPermissions ? " strict" : "",
-        page->addr ? "" : " noaddr", pte ? "set" : "null");
+        page->addr ? "" : " noaddr",
+        readPte ? "set" : "null", writePte ? "set" : "null");
 }
