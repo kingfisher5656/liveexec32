@@ -5534,19 +5534,54 @@ extern "C" bool LC32UIKitGuestScreenIsLandscapeOnly(void) {
 #endif
 }
 
+/* Whether the guest's screen is landscape from launch: the full-screen rule
+ * above, or a landscape-only game on the SDK 8+ phone canvas, whose guest
+ * bounds ModernPhoneCanvas.mm (CanvasLandscape) keeps landscape from launch
+ * under the same LC32_LANDSCAPE_LAUNCH_BOUNDS switch. */
+static bool LC32GuestScreenLaunchesLandscape(void) {
+#if LC32_UIKIT_COMPATIBILITY
+    if(LC32UIKitGuestScreenIsLandscapeOnly()) return true;
+    static const bool disabled = [] {
+        const char *value = getenv("LC32_LANDSCAPE_LAUNCH_BOUNDS");
+        return value && value[0] == '0';
+    }();
+    if(disabled || LC32UIKitModernPhoneCanvasSize().width <= 0) return false;
+    const UIInterfaceOrientationMask declared =
+        LC32GuestInterfacePolicy().declaredOrientations;
+    return (declared & UIInterfaceOrientationMaskLandscape) &&
+        !(declared & (UIInterfaceOrientationMaskPortrait |
+                      UIInterfaceOrientationMaskPortraitUpsideDown));
+#else
+    return false;
+#endif
+}
+
 /*
- * The status bar side matching LC32LandscapeLaunchExtent: while the scene of
- * an SDK 8+ landscape-only guest is still the launcher's portrait, report the
- * landscape side iOS is about to turn it to (the held side, else
- * LandscapeRight like UIKit), so the guest does not decide it was launched in
- * portrait. Unreal Engine 4 reads this once at launch to pick and turn its
- * splash image and never looks again. 0 once the scene is landscape.
+ * The status bar side matching the landscape launch bounds
+ * (LC32LandscapeLaunchExtent, or the phone canvas's landscape axis): while
+ * the scene of an SDK 8+ landscape-only guest is still the launcher's
+ * portrait, report the landscape side iOS is about to turn it to (the held
+ * side, else LandscapeRight like UIKit), so the guest does not decide it was
+ * launched in portrait. Unreal Engine 4 reads this once at launch to pick
+ * and turn its splash image and never looks again. Gameloft's glitch engine
+ * (Gangstar Vegas -correctedBoundsFor:) swaps the screen bounds when the
+ * status bar is portrait, so landscape bounds with a portrait status bar
+ * gave it a portrait GL viewport on the landscape drawable. 0 once the
+ * scene is landscape.
  */
 extern "C" long LC32UIKitLandscapeLaunchStatusBarOrientation(void) {
-    if(!LC32UIKitGuestScreenIsLandscapeOnly()) return 0;
+    if(!LC32GuestScreenLaunchesLandscape()) return 0;
     /* Guest selector hooks do not apply to these native calls. */
-    const CGRect bounds = UIScreen.mainScreen.bounds;
-    if(bounds.size.width >= bounds.size.height) return 0;
+    if(LC32UIKitGuestScreenIsLandscapeOnly()) {
+        /* Full screen: in step with LC32LandscapeLaunchExtent. */
+        const CGRect bounds = UIScreen.mainScreen.bounds;
+        if(bounds.size.width >= bounds.size.height) return 0;
+    } else if(UIInterfaceOrientationIsLandscape(
+            UIApplication.sharedApplication.statusBarOrientation)) {
+        /* Phone canvas: the guest's bounds are landscape whatever the
+         * screen's shape, so only the scene's own side decides. */
+        return 0;
+    }
     const UIInterfaceOrientationMask declared =
         LC32GuestInterfacePolicy().declaredOrientations;
     UIInterfaceOrientation side = UIInterfaceOrientationUnknown;
