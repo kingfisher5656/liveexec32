@@ -40,6 +40,8 @@ typedef enum : uint32_t {
     LC32SecurityOpItemDelete = 3,
     LC32SecurityOpItemUpdate = 4,
     LC32SecurityOpTrustCopyInfo = 5,
+    LC32SecurityOpCertificateCreateWithData = 6,
+    LC32SecurityOpCertificateCopyData = 7,
 } LC32SecurityOpcode;
 
 #endif

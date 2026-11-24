@@ -28,11 +28,6 @@ SecAccessControlRef SecAccessControlCreateWithFlags(
     return NULL;
 }
 
-CFDataRef SecCertificateCopyData(SecCertificateRef certificate) {
-    (void)certificate;
-    return NULL;
-}
-
 CFStringRef SecCertificateCopySubjectSummary(
     SecCertificateRef certificate) {
     (void)certificate;

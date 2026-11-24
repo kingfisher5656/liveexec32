@@ -440,11 +440,42 @@ OSStatus SecTrustSetSignedCertificateTimestamps(SecTrustRef trust,
     return errSecUnimplemented;
 }
 
+/* Returns a Create/Copy result only when the host reported success. */
+static CFTypeRef LC32SecurityFinishOwnedResult(OSStatus status,
+                                               uint32_t guestResult) {
+    if(status == errSecSuccess) return (CFTypeRef)(uintptr_t)guestResult;
+    /* Balance a host Copy result if status copyout did not succeed. */
+    if(guestResult) CFRelease((CFTypeRef)(uintptr_t)guestResult);
+    return NULL;
+}
+
+/*
+ * Real native certificates: Crashlytics (Sky Gamblers: Cold War) builds its
+ * pinned-certificate array with @[SecCertificateCreateWithData(...), ...]
+ * during application:didFinishLaunchingWithOptions:, so a NULL result
+ * aborts the launch with an NSInvalidArgumentException.
+ */
 SecCertificateRef SecCertificateCreateWithData(CFAllocatorRef allocator,
                                                 CFDataRef data) {
     (void)allocator;
-    (void)data;
-    return NULL;
+    if(!data) return NULL;
+
+    OSStatus status = errSecUnimplemented;
+    const uint32_t guestResult = LC32_SECURITY_CALL(
+        LC32SecurityOpCertificateCreateWithData, &status,
+        LC32_SECURITY_HOST(data));
+    return (SecCertificateRef)LC32SecurityFinishOwnedResult(
+        status, guestResult);
+}
+
+CFDataRef SecCertificateCopyData(SecCertificateRef certificate) {
+    if(!certificate) return NULL;
+
+    OSStatus status = errSecUnimplemented;
+    const uint32_t guestResult = LC32_SECURITY_CALL(
+        LC32SecurityOpCertificateCopyData, &status,
+        LC32_SECURITY_HOST(certificate));
+    return (CFDataRef)LC32SecurityFinishOwnedResult(status, guestResult);
 }
 
 SecPolicyRef SecPolicyCreateBasicX509(void) {

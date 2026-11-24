@@ -351,6 +351,27 @@ u32 LC32_Security_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
                 guestResult = FinishOwnedResult(status, nativeResult);
                 break;
             }
+            case LC32SecurityOpCertificateCreateWithData: {
+                if(!RequireSlots(call, 1)) break;
+                CFDataRef data = SlotHostObject<CFDataRef>(call, 0);
+                if(!data || CFGetTypeID(data) != CFDataGetTypeID()) break;
+                status = errSecSuccess;
+                SecCertificateRef nativeResult =
+                    SecCertificateCreateWithData(kCFAllocatorDefault, data);
+                guestResult = FinishOwnedResult(status, nativeResult);
+                break;
+            }
+            case LC32SecurityOpCertificateCopyData: {
+                if(!RequireSlots(call, 1)) break;
+                SecCertificateRef certificate =
+                    SlotHostObject<SecCertificateRef>(call, 0);
+                if(!certificate || CFGetTypeID(certificate) !=
+                        SecCertificateGetTypeID()) break;
+                status = errSecSuccess;
+                CFDataRef nativeResult = SecCertificateCopyData(certificate);
+                guestResult = FinishOwnedResult(status, nativeResult);
+                break;
+            }
         }
     }
 
