@@ -4302,20 +4302,16 @@ static void LC32BlackenPhoneCanvasWindowBackdrop(
  * converted into the window, which is (201,437) for both launch sides (the
  * screen space and LC32LegacyViewportInView give (-35,201) here). Native
  * getters keep this refit path out of guest code. */
-static void LC32CenterPresentedViewsOnPhoneCanvas(UIWindow *window) {
-    LC32LegacyIPadContainerController *container =
-        LC32LegacyContainerForWindow(window);
-    UIWindowScene *scene = window.windowScene;
-    if(!container || !scene ||
-            !LC32GeometryModePreservesPhoneCanvas(container.geometryMode))
-        return;
-    const CGRect sceneBounds = scene.coordinateSpace.bounds;
-    if(!(sceneBounds.size.width > 0) || !(sceneBounds.size.height > 0)) return;
-    const CGPoint target = [window convertPoint:CGPointMake(
-            CGRectGetMidX(sceneBounds), CGRectGetMidY(sceneBounds))
-        fromCoordinateSpace:scene.coordinateSpace];
-    if(!isfinite(target.x) || !isfinite(target.y)) return;
+static bool LC32TransformIsQuarterTurn(CGAffineTransform transform) {
+    return LC32TransformNearlyEquals(transform,
+               CGAffineTransformMake(0, 1, -1, 0, 0, 0)) ||
+           LC32TransformNearlyEquals(transform,
+               CGAffineTransformMake(0, -1, 1, 0, 0, 0));
+}
 
+/* The controller that owns `child` (a direct subview of a window) when it
+ * is presented full screen and its presentation has settled; nil otherwise. */
+static id LC32SettledFullScreenPresentedController(UIView *child) {
     using ObjectGetter = id (*)(id, SEL);
     using FlagGetter = BOOL (*)(id, SEL);
     using StyleGetter = UIModalPresentationStyle (*)(id, SEL);
@@ -4333,25 +4329,38 @@ static void LC32CenterPresentedViewsOnPhoneCanvas(UIWindow *window) {
     static StyleGetter presentationStyle = reinterpret_cast<StyleGetter>(
         class_getMethodImplementation(UIViewController.class,
             @selector(modalPresentationStyle)));
-    const CGAffineTransform quarterTurns[] = {
-        CGAffineTransformMake(0, 1, -1, 0, 0, 0),
-        CGAffineTransformMake(0, -1, 1, 0, 0, 0),
-    };
+    id next = child ? nextResponder(child, @selector(nextResponder)) : nil;
+    if(!next || !LC32ClassIsUIViewController(object_getClass(next)) ||
+            !presenting(next, @selector(presentingViewController)) ||
+            beingPresented(next, @selector(isBeingPresented)) ||
+            beingDismissed(next, @selector(isBeingDismissed)) ||
+            presentationStyle(next, @selector(modalPresentationStyle)) !=
+                UIModalPresentationFullScreen)
+        return nil;
+    return next;
+}
+
+static void LC32CenterPresentedViewsOnPhoneCanvas(UIWindow *window) {
+    LC32LegacyIPadContainerController *container =
+        LC32LegacyContainerForWindow(window);
+    UIWindowScene *scene = window.windowScene;
+    if(!container || !scene ||
+            !LC32GeometryModePreservesPhoneCanvas(container.geometryMode))
+        return;
+    const CGRect sceneBounds = scene.coordinateSpace.bounds;
+    if(!(sceneBounds.size.width > 0) || !(sceneBounds.size.height > 0)) return;
+    const CGPoint target = [window convertPoint:CGPointMake(
+            CGRectGetMidX(sceneBounds), CGRectGetMidY(sceneBounds))
+        fromCoordinateSpace:scene.coordinateSpace];
+    if(!isfinite(target.x) || !isfinite(target.y)) return;
+
     UIView *containerView = container.isViewLoaded ? container.view : nil;
     for(UIView *child in LC32NativeViewSubviews(window)) {
-        if(child == containerView) continue;
-        const CGAffineTransform transform = LC32NativeViewTransform(child);
-        if(!LC32TransformNearlyEquals(transform, quarterTurns[0]) &&
-                !LC32TransformNearlyEquals(transform, quarterTurns[1]))
+        if(child == containerView ||
+                !LC32TransformIsQuarterTurn(LC32NativeViewTransform(child)))
             continue;
-        id next = nextResponder(child, @selector(nextResponder));
-        if(!next || !LC32ClassIsUIViewController(object_getClass(next)) ||
-                !presenting(next, @selector(presentingViewController)) ||
-                beingPresented(next, @selector(isBeingPresented)) ||
-                beingDismissed(next, @selector(isBeingDismissed)) ||
-                presentationStyle(next, @selector(modalPresentationStyle)) !=
-                    UIModalPresentationFullScreen)
-            continue;
+        id next = LC32SettledFullScreenPresentedController(child);
+        if(!next) continue;
         const CGPoint center = LC32NativeViewCenter(child);
         if(fabs(center.x - target.x) < 0.5 && fabs(center.y - target.y) < 0.5)
             continue;
@@ -4359,6 +4368,154 @@ static void LC32CenterPresentedViewsOnPhoneCanvas(UIWindow *window) {
         fprintf(stderr, "LC32: presented %s centred on the phone canvas "
             "(%.0f,%.0f -> %.0f,%.0f)\n", object_getClassName(next),
             center.x, center.y, target.x, target.y);
+    }
+}
+
+/* LegacyRotation.mm's -[UIWindow _setRotatableClient:toOrientation:...]
+ * hook. When the scene turns, UIKit rotates the window's rotation client (the
+ * canvas container, which presented the controller) and lays out a
+ * full-screen controller it presented as a window-sized view for the new
+ * side: -[UIViewController window:willAnimateRotationToInterfaceOrientation:
+ * duration:] sets the window's bounds and the rotation block the transform,
+ * upright for the portrait pass UIKit makes while the scene turns landscape.
+ * On a fixed phone canvas such a view keeps the quarter turn the legacy
+ * presentation gave it, like the canvas root, and the size the app gave it.
+ * RAGE HD launched with the phone upright and turned island-left in its first
+ * seconds (iOS 27; the iOS 26 simulator too when turned that early): its
+ * intro movie view became upright 402x874 and the app's 480x320 movie in its
+ * corner played sideways on the island side, or, after a second pass, turned
+ * 874x402 with the movie in its top left corner. When UIKit leaves such a
+ * view window-sized, put back the bounds it had before the call, and its
+ * quarter turn unless UIKit gave it one itself (the other landscape side).
+ * Sizes a guest sets from its own rotation callbacks stay. The centre is
+ * re-fitted afterwards. */
+namespace {
+struct LC32SavedPresentedGeometry {
+    UIView *view;
+    id controller;
+    CGRect bounds;
+    CGPoint center;
+    CGAffineTransform transform;
+    NSDictionary<NSString *, CAAnimation *> *animations;
+};
+
+bool LC32SizeMatchesWindow(CGSize size, CGSize window) {
+    auto near = [](CGFloat a, CGFloat b) { return fabs(a - b) < 0.5; };
+    return (near(size.width, window.width) && near(size.height, window.height)) ||
+           (near(size.width, window.height) && near(size.height, window.width));
+}
+
+void LC32RestorePresentedPhoneCanvasGeometry(
+        const LC32SavedPresentedGeometry &saved, bool keepTransform) {
+    UIView *view = saved.view;
+    const CGAffineTransform transform = keepTransform
+        ? LC32NativeViewTransform(view) : saved.transform;
+    [UIView performWithoutAnimation:^{
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        LC32NativeSetViewTransform(view, CGAffineTransformIdentity);
+        LC32NativeSetViewBounds(view, saved.bounds);
+        LC32NativeSetViewCenter(view, saved.center);
+        LC32NativeSetViewTransform(view, transform);
+        /* Drop what the rotation animates toward its window-sized layout:
+         * only animations it added or replaced, and its turn only when that
+         * turn is undone here. */
+        CALayer *layer = LC32NativeViewLayer(view);
+        for(NSString *key in layer.animationKeys) {
+            const bool geometry = [key hasPrefix:@"bounds"] ||
+                [key hasPrefix:@"position"] ||
+                (!keepTransform && [key hasPrefix:@"transform"]);
+            if(geometry && [layer animationForKey:key] !=
+                    [saved.animations objectForKey:key])
+                [layer removeAnimationForKey:key];
+        }
+        [CATransaction commit];
+    }];
+}
+}  // namespace
+
+extern "C" void LC32UIKitKeepPresentedPhoneCanvasTurn(
+        UIWindow *window, UIViewController *client, void (^rotate)(void)) {
+    LC32SavedPresentedGeometry saved[4];
+    int count = 0;
+    LC32LegacyIPadContainerController *container =
+        window && client && LC32NativeLegacyRotationEnabled()
+            ? LC32LegacyContainerForWindow(window) : nil;
+    if(container &&
+            LC32GeometryModePreservesPhoneCanvas(container.geometryMode)) {
+        UIView *containerView = container.viewIfLoaded;
+        for(UIView *child in LC32NativeViewSubviews(window)) {
+            if(count == 4) break;
+            const CGAffineTransform transform = LC32NativeViewTransform(child);
+            if(child == containerView || !LC32TransformIsQuarterTurn(transform))
+                continue;
+            id controller = LC32SettledFullScreenPresentedController(child);
+            // UIKit lays the view out when rotating it or its presenter.
+            if(!controller || (client != container && client != controller))
+                continue;
+            CALayer *layer = LC32NativeViewLayer(child);
+            NSMutableDictionary<NSString *, CAAnimation *> *animations =
+                [NSMutableDictionary dictionary];
+            for(NSString *key in layer.animationKeys) {
+                CAAnimation *animation = [layer animationForKey:key];
+                if(animation) animations[key] = animation;
+            }
+#if !__has_feature(objc_arc)
+            [child retain];
+            [controller retain];
+            [animations retain];
+#endif
+            saved[count++] = {child, controller, LC32NativeViewBounds(child),
+                LC32NativeViewCenter(child), transform, animations};
+        }
+    }
+    bool recenter = false;
+    @try {
+        rotate();
+        for(int i = 0; i < count; i++) {
+            UIView *view = saved[i].view;
+            if(LC32NativeViewSuperview(view) != window ||
+                    LC32LegacyContainerForWindow(window) != container ||
+                    LC32SettledFullScreenPresentedController(view) !=
+                        saved[i].controller)
+                continue;
+            const CGRect laidOut = LC32NativeViewBounds(view);
+            const bool turnedByUIKit =
+                LC32TransformIsQuarterTurn(LC32NativeViewTransform(view));
+            const CGPoint center = LC32NativeViewCenter(view);
+            if(fabs(center.x - saved[i].center.x) > 0.5 ||
+                    fabs(center.y - saved[i].center.y) > 0.5)
+                recenter = true;
+            if(CGSizeEqualToSize(laidOut.size, saved[i].bounds.size) &&
+                    turnedByUIKit)
+                continue;
+            // Only UIKit's own window-sized layout is undone.
+            if(!LC32SizeMatchesWindow(laidOut.size,
+                    LC32NativeViewBounds(window).size))
+                continue;
+            LC32RestorePresentedPhoneCanvasGeometry(saved[i], turnedByUIKit);
+            recenter = true;
+            fprintf(stderr, "LC32: kept the presented view of %s on the phone "
+                "canvas (UIKit laid it out %.0fx%.0f %s; back to %.0fx%.0f, "
+                "turned)\n", object_getClassName(saved[i].controller),
+                laidOut.size.width, laidOut.size.height,
+                turnedByUIKit ? "turned" : "upright",
+                saved[i].bounds.size.width, saved[i].bounds.size.height);
+        }
+    } @finally {
+#if !__has_feature(objc_arc)
+        for(int i = 0; i < count; i++) {
+            [saved[i].view release];
+            [saved[i].controller release];
+            [saved[i].animations release];
+        }
+#endif
+    }
+    if(recenter) {
+        // After the scene turn has updated the window.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LC32CenterPresentedViewsOnPhoneCanvas(window);
+        });
     }
 }
 
@@ -5787,10 +5944,60 @@ extern "C" bool LC32UIKitGetViewDuringGuestLoad(
 @property(nonatomic) BOOL passesTouchesThrough;
 @end
 
+@interface UIView (LC32LegacyCanvasAutoresizing)
+- (void)_resizeWithOldSuperviewSize:(CGSize)oldSize;
+@end
+
+/* Legacy rotation turns a phone canvas container's root view a quarter in a
+ * window whose extent flips between the scene's two shapes: UIKit's backing
+ * setup (_configureRootLayer:) makes it portrait, the phone canvas refit
+ * landscape. Flexible autoresizing applies such a flip to the turned view's
+ * frame, and a root that did not cover the window at that moment goes
+ * negative and is clamped to zero: RAGE HD's 852x393 root, put back still
+ * turned into the landscape window when its skipped intro movie was
+ * dismissed, became 1311x0 when the window went portrait (black screen, the
+ * game running behind it). iOS 26 UIKit's legacy rotation re-sized the root
+ * right afterwards; on an iOS 27 iPhone nothing did. A root view of a turned
+ * canvas covers its window instead, as LC32CoverLegacyWindowWithRootView
+ * does at each refit. */
+static bool LC32CoverWindowWithTurnedCanvasRoot(UIView *rootView) {
+    if(!LC32NativeLegacyRotationEnabled()) return false;
+    UIView *superview = LC32NativeViewSuperview(rootView);
+    if(![superview isKindOfClass:UIWindow.class]) return false;
+    UIWindow *window = (UIWindow *)superview;
+    LC32LegacyIPadContainerController *container =
+        LC32LegacyContainerForWindow(window);
+    // Only an exact quarter turn has the window's size swapped.
+    const CGAffineTransform transform = LC32NativeViewTransform(rootView);
+    if(!container || container.viewIfLoaded != rootView ||
+            !LC32GeometryModePreservesPhoneCanvas(container.geometryMode) ||
+            (!LC32TransformNearlyEquals(transform,
+                CGAffineTransformMake(0, 1, -1, 0, 0, 0)) &&
+             !LC32TransformNearlyEquals(transform,
+                CGAffineTransformMake(0, -1, 1, 0, 0, 0)))) return false;
+    const CGRect windowBounds = LC32NativeViewBounds(window);
+    const CGRect bounds = CGRectMake(0, 0,
+        windowBounds.size.height, windowBounds.size.width);
+    const CGPoint center = CGPointMake(
+        CGRectGetMidX(windowBounds), CGRectGetMidY(windowBounds));
+    if(!CGRectEqualToRect(LC32NativeViewBounds(rootView), bounds))
+        LC32NativeSetViewBounds(rootView, bounds);
+    const CGPoint oldCenter = LC32NativeViewCenter(rootView);
+    if(fabs(oldCenter.x - center.x) > 0.01 ||
+            fabs(oldCenter.y - center.y) > 0.01)
+        LC32NativeSetViewCenter(rootView, center);
+    return true;
+}
+
 @implementation LC32LegacyCanvasWrapperView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     return self.passesTouchesThrough && hit == self ? nil : hit;
+}
+
+- (void)_resizeWithOldSuperviewSize:(CGSize)oldSize {
+    if(LC32CoverWindowWithTurnedCanvasRoot(self)) return;
+    [super _resizeWithOldSuperviewSize:oldSize];
 }
 @end
 

@@ -38,6 +38,8 @@ enum class InitialBacking { Unseen, Provisional, Ready };
 struct LC32RotationBuildVersion { uint32_t platform, version; };
 extern "C" bool LC32FullScreenRootlessHostingActive(void);
 extern "C" bool LC32UIKitKeepsLegacyScenePortrait(void);
+extern "C" void LC32UIKitKeepPresentedPhoneCanvasTurn(
+    UIWindow *window, UIViewController *client, void (^rotate)(void));
 extern "C" void LC32UIKitPortraitHostedSideChanged(UIInterfaceOrientation side);
 extern "C" NSInteger LC32UIKitPortraitHostedStatusBarOrientation(void);
 extern "C" bool LC32UIKitWindowIsPortraitHosted(UIWindow *window);
@@ -892,6 +894,9 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 - (void)lc32_rotationSetRootViewController:(UIViewController *)controller;
 - (void)lc32_updateToInterfaceOrientation:(UIInterfaceOrientation)orientation
     duration:(NSTimeInterval)duration force:(BOOL)force;
+- (void)lc32_setRotatableClient:(UIViewController *)client
+    toOrientation:(UIInterfaceOrientation)orientation updateStatusBar:(BOOL)updateStatusBar
+    duration:(NSTimeInterval)duration force:(BOOL)force isRotating:(BOOL)rotating;
 - (void)lc32_configureRootLayer:(CALayer *)root sceneTransformLayer:(CALayer *)scene
     transformLayer:(CALayer *)transform;
 - (BOOL)lc32_windowOwnsInterfaceOrientation;
@@ -1006,6 +1011,17 @@ void AdoptRootSwallowedByGuestWindow(UIWindow *window, UIViewController *root) {
     // deferred guest-startup boundary or the next automatic CA commit.
     if(legacy && !startupFinished) [CATransaction flush];
 }
+// A full-screen view presented on a fixed phone canvas keeps its quarter turn
+// and size through UIKit's client rotation (UIKit.mm,
+// LC32UIKitKeepPresentedPhoneCanvasTurn).
+- (void)lc32_setRotatableClient:(UIViewController *)client
+        toOrientation:(UIInterfaceOrientation)orientation updateStatusBar:(BOOL)updateStatusBar
+        duration:(NSTimeInterval)duration force:(BOOL)force isRotating:(BOOL)rotating {
+    LC32UIKitKeepPresentedPhoneCanvasTurn(self, client, ^{
+        [self lc32_setRotatableClient:client toOrientation:orientation
+            updateStatusBar:updateStatusBar duration:duration force:force isRotating:rotating];
+    });
+}
 - (void)lc32_configureRootLayer:(CALayer *)root sceneTransformLayer:(CALayer *)scene
         transformLayer:(CALayer *)transform {
     // A presented overlay suspends the renderer's rotation queries, not the
@@ -1090,6 +1106,8 @@ void AdoptRootSwallowedByGuestWindow(UIWindow *window, UIViewController *root) {
         @selector(lc32_applicationFrameForInterfaceOrientation:usingStatusbarHeight:ignoreStatusBar:));
     Swizzle(self, sel_registerName("_updateToInterfaceOrientation:duration:force:"),
         @selector(lc32_updateToInterfaceOrientation:duration:force:));
+    Swizzle(self, @selector(_setRotatableClient:toOrientation:updateStatusBar:duration:force:isRotating:),
+        @selector(lc32_setRotatableClient:toOrientation:updateStatusBar:duration:force:isRotating:));
     Swizzle(self, sel_registerName("_configureRootLayer:sceneTransformLayer:transformLayer:"),
         @selector(lc32_configureRootLayer:sceneTransformLayer:transformLayer:));
     Swizzle(self, sel_registerName("_windowOwnsInterfaceOrientation"),

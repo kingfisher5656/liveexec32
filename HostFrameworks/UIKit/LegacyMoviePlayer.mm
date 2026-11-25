@@ -208,10 +208,40 @@ void LC32RunMovieAutoDismiss(id player) {
 
 void LC32RemoveMovieOverlay(id player);
 
+/*
+ * iPhone OS's -stop stopped playback. Current MediaPlayer's only detaches its
+ * AVPlayer (playerViewController.player = nil) and leaves it playing, which
+ * is silent only once nothing else keeps that AVPlayer alive. RAGE HD sends
+ * its movie controller -dealloc directly when the intro is skipped, so that
+ * controller's native peer is deliberately leaked with its movie view
+ * (LC32ForgetDirectlyDeallocatedGuest), and the intro's sound went on under
+ * the menu. Pause the detached AVPlayer after the native -stop (before it,
+ * MediaPlayer would still report the pause as a state change). One the
+ * controller holds again (a replay started from a DidFinish observer inside
+ * -stop) is MediaPlayer's to run.
+ */
+id LC32MoviePlayerAVPlayer(id player) {
+    id playback = [player respondsToSelector:@selector(playerViewController)]
+        ? ((id (*)(id, SEL))objc_msgSend)(player,
+            @selector(playerViewController)) : nil;
+    return [playback respondsToSelector:@selector(player)]
+        ? ((id (*)(id, SEL))objc_msgSend)(playback, @selector(player)) : nil;
+}
+
+void LC32StopMoviePlayerNatively(id player) {
+    id avPlayer = LC32MoviePlayerAVPlayer(player);
+    // A DidFinish posted from inside -stop is delivered as before.
+    ((void (*)(id, SEL))LC32OriginalMoviePlayerStop)(player, @selector(stop));
+    if(avPlayer && LC32MoviePlayerAVPlayer(player) != avPlayer &&
+            [avPlayer respondsToSelector:@selector(rate)] &&
+            [avPlayer respondsToSelector:@selector(pause)] &&
+            ((float (*)(id, SEL))objc_msgSend)(avPlayer, @selector(rate)) != 0)
+        ((void (*)(id, SEL))objc_msgSend)(avPlayer, @selector(pause));
+}
+
 void LC32LegacyMoviePlayerStop(id self, SEL cmd) {
     LC32RemoveMovieOverlay(self);
-    // A DidFinish posted from inside -stop is delivered as before.
-    ((void (*)(id, SEL))LC32OriginalMoviePlayerStop)(self, cmd);
+    LC32StopMoviePlayerNatively(self);
     // iOS 5 MediaPlayer started posting DidFinish after -stop; keep that for
     // guests built against it. (The guest SDK is not known yet when the hooks
     // are installed.)
@@ -284,7 +314,7 @@ void LC32PostMovieDidFinish(id player, NSInteger reason);
     fprintf(stderr, "LC32: legacy movie skipped by tap\n");
     // The app's own -stop path is not involved: stop natively, then post the
     // DidFinish the old player sent when the user ended a movie.
-    ((void (*)(id, SEL))LC32OriginalMoviePlayerStop)(player, @selector(stop));
+    LC32StopMoviePlayerNatively(player);
     LC32PostMovieDidFinish(player, 2 /* MPMovieFinishReasonUserExited */);
 }
 @end
@@ -312,7 +342,7 @@ void LC32PostMovieDidFinish(id player, NSInteger reason);
     objc_setAssociatedObject(player, LC32MoviePlayerFinishedKey, @YES,
         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     fprintf(stderr, "LC32: legacy movie skipped by tap\n");
-    ((void (*)(id, SEL))LC32OriginalMoviePlayerStop)(player, @selector(stop));
+    LC32StopMoviePlayerNatively(player);
     LC32PostMovieDidFinish(player, 2 /* MPMovieFinishReasonUserExited */);
 }
 @end
@@ -1470,8 +1500,7 @@ void LC32ReportDismissedMovieFinished(UIViewController *presenter,
     dispatch_async(dispatch_get_main_queue(), ^{
         fprintf(stderr, "LC32: dismissed movie reports DidFinish "
             "(user exited, after %d ms)\n", attempt * 50);
-        ((void (*)(id, SEL))LC32OriginalMoviePlayerStop)(
-            player, @selector(stop));
+        LC32StopMoviePlayerNatively(player);
         LC32PostMovieDidFinish(player, 2 /* MPMovieFinishReasonUserExited */);
         // Drop the late native DidFinish this -stop may still post.
         LC32SetMoviePlayerStopped(player, true);
