@@ -483,6 +483,7 @@ static bool BuildNativeGuestJitParts(
     config.check_halt_on_memory_access = false;
     config.define_unpredictable_behaviour = true;
     LC32ApplyFastFP(config);
+    LC32ApplyJitOptimizations(config);
     config.code_cache_size = NativeGuestJitCacheSize();
 
     DynarmicCallbacks32SetPageTable(

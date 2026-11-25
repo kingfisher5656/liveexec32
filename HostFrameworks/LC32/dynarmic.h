@@ -284,6 +284,8 @@ bool Dynarmic_nativeInitialize();
 // Faster floating point, on unless LC32_FAST_FP=0 (environment or LiveExec32.env).
 bool LC32FastFPEnabled();
 void LC32ApplyFastFP(Dynarmic::A32::UserConfig &config);
+// JIT fast paths (Track B), on unless LC32_JIT_OPT=0 / LC32_JIT_OPT_OFF=<names>.
+void LC32ApplyJitOptimizations(Dynarmic::A32::UserConfig &config);
 // FPSCR a fresh guest thread starts with.
 std::uint32_t LC32GuestInitialFpscr();
 void Dynarmic_nativeDestroy();

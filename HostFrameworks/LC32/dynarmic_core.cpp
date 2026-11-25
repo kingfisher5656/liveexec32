@@ -92,6 +92,68 @@ void LC32ApplyFastFP(Dynarmic::A32::UserConfig &config) {
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreFPExceptionFlags;
 }
 
+/*
+ * JIT fast paths from the 2026-11 "Track B" work, all on by default. To track
+ * down a game problem, LC32_JIT_OPT=0 turns them all off and
+ * LC32_JIT_OPT_OFF=<comma list> turns off single ones:
+ *   fusion     one page-table check for a whole LDM/STM, PUSH/POP, VLDM/VSTM,
+ *              VPUSH/VPOP or VLD1/VST1
+ *   widevec    one 64-bit access per D register for VFP/NEON loads/stores
+ *   exclusive  LDREX/STREX inline instead of through the exclusive monitor
+ *   flags      conditional branches and conditional instructions use the host
+ *              flags directly instead of reloading the guest flags
+ */
+static Dynarmic::OptimizationFlag LC32DisabledJitOptimizations() {
+    static const Dynarmic::OptimizationFlag disabled = [] {
+        using Flag = Dynarmic::OptimizationFlag;
+        static constexpr struct {
+            const char *name;
+            Flag flag;
+        } options[] = {
+            {"fusion", Flag::MemoryRangeFusion},
+            {"widevec", Flag::WideVectorMemory},
+            {"exclusive", Flag::InlineExclusiveMemory},
+            {"flags", Flag::HostFlagForwarding},
+        };
+        Flag result = Dynarmic::no_optimizations;
+        const char *all = getenv("LC32_JIT_OPT");
+        if (all != nullptr && all[0] == '0') {
+            for (const auto &option : options)
+                result |= option.flag;
+        }
+        if (const char *list = getenv("LC32_JIT_OPT_OFF")) {
+            for (const auto &option : options) {
+                const size_t length = strlen(option.name);
+                for (const char *p = list; (p = strstr(p, option.name)) != nullptr; p += length) {
+                    const bool start = p == list || p[-1] == ',' || p[-1] == ' ';
+                    const char end = p[length];
+                    if (start && (end == '\0' || end == ',' || end == ' ')) {
+                        result |= option.flag;
+                        break;
+                    }
+                }
+            }
+        }
+        std::string off;
+        for (const auto &option : options) {
+            if ((result & option.flag) != Dynarmic::no_optimizations) {
+                if (!off.empty())
+                    off += ", ";
+                off += option.name;
+            }
+        }
+        fprintf(stderr, "LC32: JIT fast paths %s%s\n",
+            off.empty() ? "all on (LC32_JIT_OPT=0 turns them off)" : "off: ",
+            off.c_str());
+        return result;
+    }();
+    return disabled;
+}
+
+void LC32ApplyJitOptimizations(Dynarmic::A32::UserConfig &config) {
+    config.optimizations &= ~LC32DisabledJitOptimizations();
+}
+
 std::uint32_t LC32GuestInitialFpscr() {
     return LC32FastFPEnabled() ? 0x03000000u /* DN | FZ */ : 0u;
 }
@@ -164,6 +226,7 @@ bool Dynarmic_nativeInitialize() {
         //    config.page_table_pointer_mask_bits = DYN_PAGE_BITS;
 
         LC32ApplyFastFP(config);
+        LC32ApplyJitOptimizations(config);
 
         sharedHandle.num_page_table_entries = Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES;
         size_t size = sharedHandle.num_page_table_entries * sizeof(void*);

@@ -182,6 +182,11 @@ static NSArray<LC32SettingsSection *> *LC32GlobalSettingSections(void) {
                 @"Starts game threads in the float mode real 32-bit iOS used. "
                 "Much faster and cooler; turn off only if a game misbehaves.",
                 YES, NO, @"1", @"0"),
+            LC32SwitchSetting(@"LC32_JIT_OPT", @"JIT Fast Paths",
+                @"Faster translated game code for atomics, NEON/VFP, "
+                "register pushes and branches. Turn off only if a game "
+                "misbehaves.",
+                YES, NO, @"1", @"0"),
             LC32ChoiceSetting(@"LC32_MAX_FPS", @"Frame Rate Cap",
                 @"The biggest lever against heat: 30 roughly halves the work "
                 "in games that otherwise run at 60.",
@@ -227,6 +232,9 @@ static NSArray<LC32SettingsSection *> *LC32GameSettingSections(void) {
                   @[@"120 fps", @"120"], @[@"No Cap", @"0"]]),
             LC32ChoiceSetting(@"LC32_FAST_FP", @"Fast Floating Point",
                 @"Turn off only if this game misbehaves with it.",
+                @[inherit, @[@"On", @"1"], @[@"Off", @"0"]]),
+            LC32ChoiceSetting(@"LC32_JIT_OPT", @"JIT Fast Paths",
+                @"Turn off only if this game misbehaves with them.",
                 @[inherit, @[@"On", @"1"], @[@"Off", @"0"]]),
             LC32ChoiceSetting(@"LC32_JIT_CACHE_MB", @"JIT Cache per Thread",
                 @"A bigger cache can reduce stutter in large games.",
@@ -279,6 +287,8 @@ static NSString *LC32SummaryForGameValue(NSString *key, NSString *value) {
             : [value stringByAppendingString:@" fps"];
     if([key isEqualToString:@"LC32_FAST_FP"])
         return [value hasPrefix:@"0"] ? @"Fast FP off" : @"Fast FP on";
+    if([key isEqualToString:@"LC32_JIT_OPT"])
+        return [value hasPrefix:@"0"] ? @"JIT fast paths off" : @"JIT fast paths on";
     if([key isEqualToString:@"LC32_JIT_CACHE_MB"])
         return [NSString stringWithFormat:@"JIT %@ MB", value];
     if([key isEqualToString:@"LC32_GUEST_MACHINE"])
