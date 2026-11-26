@@ -308,6 +308,15 @@ int Dynarmic_mremap_encrypted(u32 start, u32 length, u32 cryptid,
                               const void *host_source = nullptr);
 int Dynarmic_mem_1write(u64 address, u64 size, char* src);
 int Dynarmic_mem_1read(u64 address, u64 size, char* dest);
+// Returns a direct read-only pointer into an ordinary (non-volatile-external)
+// guest page while the current thread is inside an active guest VM epoch,
+// setting *availableBytes to the remaining bytes in that page. Returns nullptr
+// otherwise.
+const char *Dynarmic_direct_read_page_span(u32 guestAddress, size_t *availableBytes);
+// Permission-checked (PROT_READ) bulk read across one or more guest pages,
+// taking at most one guestVmMutex lock (or zero locks when in an active epoch
+// on a single ordinary page).
+bool Dynarmic_read_guest_memory_checked(u64 address, void *destination, size_t size);
 int Dynarmic_debugger_mem_read(u64 address, u64 size, char* dest);
 int Dynarmic_debugger_mem_write(u64 address, u64 size, char* src);
 bool Dynarmic_debugger_set_breakpoint(u64 address, size_t kind);

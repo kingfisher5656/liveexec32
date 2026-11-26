@@ -43,10 +43,9 @@ static uint32_t LC32OpenGLESDispatch(LC32OpenGLESOpcode opcode,
     uint64_t dispatcher = LC32OpenGLESDispatcher();
     if(!dispatcher) return 0;
 
-    LC32OpenGLESCall call = {
-        .version = LC32OpenGLESABIVersion,
-        .slotCount = slotCount,
-    };
+    LC32OpenGLESCall call;
+    call.version = LC32OpenGLESABIVersion;
+    call.slotCount = slotCount;
     if(slotCount) memcpy(call.slots, slots, slotCount * sizeof(*slots));
 
     /*

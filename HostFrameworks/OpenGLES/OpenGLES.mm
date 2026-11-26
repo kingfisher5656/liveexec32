@@ -24,6 +24,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -44,6 +45,7 @@
 @interface LC32EAGLContextStateLifetime : NSObject {
 @public
     uintptr_t _contextKey;
+    GLint _maxVertexAttribs;
 }
 @end
 
@@ -77,29 +79,61 @@ bool GuestRangeValid(uint32_t guestAddress, size_t byteCount) {
 }
 
 bool ReadCall(uint32_t guestAddress, LC32OpenGLESCall &call) {
+    constexpr uint32_t slotsOffset =
+        static_cast<uint32_t>(offsetof(LC32OpenGLESCall, slots));
+    static_assert(slotsOffset == 8, "unexpected LC32OpenGLESCall header size");
+    if(!guestAddress) {
+        SetBridgeError(GL_INVALID_OPERATION);
+        return false;
+    }
+
+    // Fast path: single epoch-protected ordinary page lookup. Check header
+    // bounds BEFORE reading header, then check payload bounds against the
+    // validated slotCount so a 0-slot packet at the end of a page never faults.
+    size_t spanBytes = 0;
+    if(const char *span = Dynarmic_direct_read_page_span(guestAddress, &spanBytes)) {
+        if(spanBytes >= slotsOffset) {
+            uint32_t version = 0;
+            uint32_t slotCount = 0;
+            memcpy(&version, span, sizeof(version));
+            memcpy(&slotCount, span + sizeof(version), sizeof(slotCount));
+            if(version != LC32OpenGLESABIVersion ||
+               slotCount > LC32OpenGLESMaxSlots) {
+                SetBridgeError(GL_INVALID_OPERATION);
+                return false;
+            }
+            const size_t byteCount = slotCount * sizeof(call.slots[0]);
+            if(spanBytes >= slotsOffset + byteCount) {
+                call.version = version;
+                call.slotCount = slotCount;
+                if(byteCount) {
+                    memcpy(call.slots, span + slotsOffset, byteCount);
+                }
+                return true;
+            }
+        }
+    }
+
     struct {
         uint32_t version;
         uint32_t slotCount;
     } header = {};
-    if(!guestAddress || !GuestRangeValid(guestAddress, sizeof(header)) ||
-       Dynarmic_mem_1read(guestAddress, sizeof(header),
-                          reinterpret_cast<char *>(&header)) != 0 ||
+    if(!GuestRangeValid(guestAddress, sizeof(header)) ||
+       !Dynarmic_read_guest_memory_checked(guestAddress, &header, sizeof(header)) ||
        header.version != LC32OpenGLESABIVersion ||
        header.slotCount > LC32OpenGLESMaxSlots) {
         SetBridgeError(GL_INVALID_OPERATION);
         return false;
     }
 
-    call = {};
     call.version = header.version;
     call.slotCount = header.slotCount;
     const size_t byteCount = header.slotCount * sizeof(call.slots[0]);
-    constexpr uint32_t slotsOffset =
-        static_cast<uint32_t>(offsetof(LC32OpenGLESCall, slots));
     if(byteCount &&
        (!GuestRangeValid(guestAddress, slotsOffset + byteCount) ||
-        Dynarmic_mem_1read(guestAddress + slotsOffset, byteCount,
-            reinterpret_cast<char *>(call.slots)) != 0)) {
+        !Dynarmic_read_guest_memory_checked(
+            static_cast<uint64_t>(guestAddress) + slotsOffset,
+            call.slots, byteCount))) {
         SetBridgeError(GL_INVALID_OPERATION);
         return false;
     }
@@ -136,6 +170,78 @@ bool CheckedByteCount(size_t count, size_t elementSize, size_t &bytes) {
     if(elementSize && count > kMaximumTransfer / elementSize) return false;
     bytes = count * elementSize;
     return bytes <= kMaximumTransfer;
+}
+
+template<typename T, size_t InlineCapacity>
+struct SmallBuffer {
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "SmallBuffer requires trivially copyable elements");
+    alignas(T) T inlineStorage[InlineCapacity];
+    std::vector<T> heapStorage;
+    size_t count = 0;
+
+    bool ResizeUninitialized(size_t n) {
+        count = n;
+        if(n <= InlineCapacity) {
+            heapStorage.clear();
+            return true;
+        }
+        try {
+            heapStorage.resize(n);
+            return true;
+        } catch(const std::bad_alloc &) {
+            count = 0;
+            return false;
+        }
+    }
+
+    bool ResizeZeroed(size_t n) {
+        count = n;
+        if(n <= InlineCapacity) {
+            heapStorage.clear();
+            if(n) memset(inlineStorage, 0, n * sizeof(T));
+            return true;
+        }
+        try {
+            heapStorage.assign(n, T{});
+            return true;
+        } catch(const std::bad_alloc &) {
+            count = 0;
+            return false;
+        }
+    }
+
+    T *Data() {
+        if(!count) return nullptr;
+        return count <= InlineCapacity ? inlineStorage : heapStorage.data();
+    }
+    const T *Data() const {
+        if(!count) return nullptr;
+        return count <= InlineCapacity ? inlineStorage : heapStorage.data();
+    }
+};
+
+template<typename T, size_t InlineCapacity>
+bool ReadGuestArray(uint32_t guestAddress, size_t count,
+                    SmallBuffer<T, InlineCapacity> &values) {
+    size_t byteCount;
+    if(!CheckedByteCount(count, sizeof(T), byteCount) ||
+       !GuestRangeValid(guestAddress, byteCount) ||
+       (byteCount && !guestAddress)) {
+        SetBridgeError(GL_INVALID_VALUE);
+        return false;
+    }
+    if(!values.ResizeUninitialized(count)) {
+        SetBridgeError(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    if(byteCount &&
+       !Dynarmic_read_guest_memory_checked(guestAddress, values.Data(),
+                                           byteCount)) {
+        SetBridgeError(GL_INVALID_OPERATION);
+        return false;
+    }
+    return true;
 }
 
 template<typename T>
@@ -1035,20 +1141,35 @@ void RemoveClientArrayState(uintptr_t contextKey) {
     clientArrayStates.erase(contextKey);
 }
 
+LC32EAGLContextStateLifetime *ContextStateLifetimeForContext(
+        EAGLContext *context) {
+    if(!context) return nil;
+    LC32EAGLContextStateLifetime *lifetime = objc_getAssociatedObject(
+        context, clientArrayStateLifetimeKey);
+    if(!lifetime) {
+        static std::mutex lifetimeInstallMutex;
+        std::lock_guard<std::mutex> lock(lifetimeInstallMutex);
+        lifetime = objc_getAssociatedObject(
+            context, clientArrayStateLifetimeKey);
+        if(!lifetime) {
+            lifetime = [LC32EAGLContextStateLifetime new];
+            lifetime->_contextKey =
+                reinterpret_cast<uintptr_t>((__bridge void *)context);
+            // Installed at most once under lifetimeInstallMutex and never
+            // replaced or removed until context deallocs, so NONATOMIC is safe
+            // while avoiding per-call retain+autorelease in objc_getAssociatedObject.
+            objc_setAssociatedObject(context, clientArrayStateLifetimeKey,
+                lifetime, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [lifetime release];
+        }
+    }
+    return lifetime;
+}
+
 uintptr_t CurrentGLContextKey() {
     EAGLContext *context = EAGLContext.currentContext;
-    const uintptr_t contextKey = reinterpret_cast<uintptr_t>(
-        (__bridge void *)context);
-    if(context && !objc_getAssociatedObject(
-            context, clientArrayStateLifetimeKey)) {
-        LC32EAGLContextStateLifetime *lifetime =
-            [LC32EAGLContextStateLifetime new];
-        lifetime->_contextKey = contextKey;
-        objc_setAssociatedObject(context, clientArrayStateLifetimeKey,
-            lifetime, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [lifetime release];
-    }
-    return contextKey;
+    (void)ContextStateLifetimeForContext(context);
+    return reinterpret_cast<uintptr_t>((__bridge void *)context);
 }
 
 bool CurrentContextIsES3() {
@@ -1773,8 +1894,24 @@ size_t ClientArrayScalarSize(GLenum type) {
 }
 
 bool VertexAttribIndexValid(GLuint index) {
-    GLint maximum = 0;
-    glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maximum);
+    // Cache unclamped GL_MAX_VERTEX_ATTRIBS per EAGLContext (separate from
+    // MaximumTrackedVertexAttribs, which clamps to 32). A nil or ES1 context
+    // has no generic vertex attributes and returns false without querying GL.
+    EAGLContext *context = EAGLContext.currentContext;
+    if(!context) return false;
+    const EAGLRenderingAPI api = context.API;
+    if(api != kEAGLRenderingAPIOpenGLES2 && api != kEAGLRenderingAPIOpenGLES3)
+        return false;
+    LC32EAGLContextStateLifetime *lifetime =
+        ContextStateLifetimeForContext(context);
+    GLint maximum = __atomic_load_n(&lifetime->_maxVertexAttribs,
+                                    __ATOMIC_RELAXED);
+    if(maximum <= 0) {
+        glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maximum);
+        if(maximum > 0)
+            __atomic_store_n(&lifetime->_maxVertexAttribs, maximum,
+                             __ATOMIC_RELAXED);
+    }
     return maximum > 0 && index < static_cast<GLuint>(maximum);
 }
 
@@ -2636,20 +2773,62 @@ bool ReadCount(int32_t signedCount, size_t multiplier, size_t &count) {
     return true;
 }
 
+// LC32_PROFILE: GL calls per opcode, objects named in Gen*/Delete*-style calls,
+// and exact total vs native-driver timing split on every call (zero overhead
+// when LC32_PROFILE is off). LC32_GL_TIME_NATIVE times only the guest-requested
+// native GL driver call(s); bridge-inserted glGetIntegerv queries and tracking
+// bookkeeping remain outside so bridge = total - native reflects all
+// bridge-attributable overhead.
+constexpr uint32_t kProfileOpcodeCount = 512;
+std::atomic<uint64_t> profileOpObjects[kProfileOpcodeCount];
+
+struct ProfileOpTiming {
+    uint64_t calls = 0;              // all calls for this opcode
+    uint64_t totalTicks = 0;         // exact total ticks across calls
+    uint64_t nativeCalls = 0;        // calls that reached LC32_GL_TIME_NATIVE
+    uint64_t nativeDriverTicks = 0;  // exact native GL ticks across nativeCalls
+};
+std::mutex profileTimingMutex;
+ProfileOpTiming profileOpTiming[kProfileOpcodeCount];
+
+struct GLProfileSample {
+    uint64_t nativeTicks = 0;
+    bool nativeRecorded = false;
+};
+
+#define LC32_GL_TIME_NATIVE(stmt) do { \
+    if(__builtin_expect(profileSample != nullptr, 0)) { \
+        const uint64_t _lc32NatStart = mach_absolute_time(); \
+        stmt; \
+        profileSample->nativeTicks += mach_absolute_time() - _lc32NatStart; \
+        profileSample->nativeRecorded = true; \
+    } else { \
+        stmt; \
+    } \
+} while(0)
+
+void ProfileCountObjects(int32_t count) {
+    if(LC32ProfileActive && count > 0 && bridgeOpcode < kProfileOpcodeCount)
+        profileOpObjects[bridgeOpcode].fetch_add(count, std::memory_order_relaxed);
+}
+
 template<typename T, typename Function>
 uint32_t DispatchInputArray(const LC32OpenGLESCall &call,
-                            size_t multiplier, Function function) {
+                            size_t multiplier,
+                            GLProfileSample *profileSample,
+                            Function function) {
     if(!RequireSlots(call, 3)) return 0;
     size_t count;
     if(!ReadCount(SlotI32(call, 1), multiplier, count)) return 0;
-    std::vector<T> values;
+    SmallBuffer<T, 64> values;
     if(!ReadGuestArray(SlotU32(call, 2), count, values)) return 0;
-    function(SlotI32(call, 0), SlotI32(call, 1), values.data());
+    LC32_GL_TIME_NATIVE(function(SlotI32(call, 0), SlotI32(call, 1), values.Data()));
     return 0;
 }
 
 template<typename T, typename Function>
 uint32_t DispatchStateGetter(const LC32OpenGLESCall &call,
+                             GLProfileSample *profileSample,
                              Function function) {
     if(!RequireSlots(call, 2)) return 0;
     GLenum pname = SlotU32(call, 0);
@@ -2658,21 +2837,14 @@ uint32_t DispatchStateGetter(const LC32OpenGLESCall &call,
         SetBridgeError(GL_INVALID_ENUM);
         return 0;
     }
-    std::vector<T> values(std::max<size_t>(count, 1));
-    function(pname, values.data());
-    WriteGuestArray(SlotU32(call, 1), values.data(), count);
+    SmallBuffer<T, 32> values;
+    if(!values.ResizeZeroed(std::max<size_t>(count, 1))) {
+        SetBridgeError(GL_OUT_OF_MEMORY);
+        return 0;
+    }
+    LC32_GL_TIME_NATIVE(function(pname, values.Data()));
+    WriteGuestArray(SlotU32(call, 1), values.Data(), count);
     return 0;
-}
-
-// LC32_PROFILE: GL calls per opcode, and objects named in Gen*/Delete*-style
-// calls (both cumulative; the report prints rates and running totals).
-constexpr uint32_t kProfileOpcodeCount = 512;
-std::atomic<uint64_t> profileOpCalls[kProfileOpcodeCount];
-std::atomic<uint64_t> profileOpObjects[kProfileOpcodeCount];
-
-void ProfileCountObjects(int32_t count) {
-    if(LC32ProfileActive && count > 0 && bridgeOpcode < kProfileOpcodeCount)
-        profileOpObjects[bridgeOpcode].fetch_add(count, std::memory_order_relaxed);
 }
 
 template<typename Function>
@@ -2682,24 +2854,29 @@ uint32_t DispatchObjectInputArray(const LC32OpenGLESCall &call,
     int32_t signedCount = SlotI32(call, 0);
     size_t count;
     if(!ReadCount(signedCount, 1, count)) return 0;
-    std::vector<GLuint> values;
+    SmallBuffer<GLuint, 32> values;
     if(!ReadGuestArray(SlotU32(call, 1), count, values)) return 0;
     ProfileCountObjects(signedCount);
-    function(signedCount, values.data());
+    function(signedCount, values.Data());
     return 0;
 }
 
 template<typename Function>
 uint32_t DispatchObjectOutputArray(const LC32OpenGLESCall &call,
+                                   GLProfileSample *profileSample,
                                    Function function) {
     if(!RequireSlots(call, 2)) return 0;
     int32_t signedCount = SlotI32(call, 0);
     size_t count;
     if(!ReadCount(signedCount, 1, count)) return 0;
-    std::vector<GLuint> values(count);
-    function(signedCount, values.data());
+    SmallBuffer<GLuint, 32> values;
+    if(!values.ResizeZeroed(count)) {
+        SetBridgeError(GL_OUT_OF_MEMORY);
+        return 0;
+    }
+    LC32_GL_TIME_NATIVE(function(signedCount, values.Data()));
     ProfileCountObjects(signedCount);
-    WriteGuestArray(SlotU32(call, 1), values.data(), count);
+    WriteGuestArray(SlotU32(call, 1), values.Data(), count);
     return 0;
 }
 
@@ -2852,14 +3029,16 @@ uint32_t DispatchOutputString(const LC32OpenGLESCall &call,
 
 template<typename T, typename Function>
 uint32_t DispatchProgramUniformArray(const LC32OpenGLESCall &call,
-                                     size_t width, Function function) {
+                                     size_t width,
+                                     GLProfileSample *profileSample,
+                                     Function function) {
     if(!RequireSlots(call, 4)) return 0;
     size_t elementCount;
     if(!ReadCount(SlotI32(call, 2), width, elementCount)) return 0;
-    std::vector<T> values;
+    SmallBuffer<T, 64> values;
     if(!ReadGuestArray(SlotU32(call, 3), elementCount, values)) return 0;
-    function(SlotU32(call, 0), SlotI32(call, 1), SlotI32(call, 2),
-        values.data());
+    LC32_GL_TIME_NATIVE(function(SlotU32(call, 0), SlotI32(call, 1),
+        SlotI32(call, 2), values.Data()));
     return 0;
 }
 
@@ -3315,7 +3494,8 @@ size_t VertexAttribElementCount(GLenum pname) {
 
 @end
 
-static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall);
+static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
+                                     GLProfileSample *profileSample);
 
 /*
  * Inline dispatch from inside the guest JIT (see dispatchingInline). Only
@@ -3333,23 +3513,118 @@ extern "C" uint32_t LC32_OpenGLES_Dispatch(uint32_t opcode,
 // Printed by the LC32_PROFILE reporter every few seconds. Opcodes are the
 // LC32OpenGLESOp values in GuestFrameworks/OpenGLES/LC32OpenGLESBridge.h.
 extern "C" void LC32_OpenGLES_ProfileReport(double seconds) {
-    static uint64_t lastCalls[kProfileOpcodeCount];
-    std::vector<std::pair<uint64_t, uint32_t>> rates;
+    static ProfileOpTiming lastTiming[kProfileOpcodeCount];
+    static double ticksToNs = 0.0;
+    static double timerPairNs = 0.0;
+    if(ticksToNs == 0.0) {
+        mach_timebase_info_data_t tb = {};
+        mach_timebase_info(&tb);
+        ticksToNs = tb.denom ? ((double)tb.numer / tb.denom) : 1.0;
+        uint64_t t0 = mach_absolute_time();
+        uint64_t acc = 0;
+        for(int i = 0; i < 64; i++) {
+            uint64_t a = mach_absolute_time();
+            acc += mach_absolute_time() - a;
+        }
+        (void)acc;
+        timerPairNs = (double)(mach_absolute_time() - t0) * ticksToNs / 64.0;
+    }
+
+    ProfileOpTiming curTiming[kProfileOpcodeCount];
+    {
+        std::lock_guard<std::mutex> lock(profileTimingMutex);
+        memcpy(curTiming, profileOpTiming, sizeof(curTiming));
+    }
+
+    struct OpWindow {
+        uint64_t calls;
+        uint32_t op;
+        uint64_t totalTicks;
+        uint64_t nativeCalls;
+        uint64_t nativeDriverTicks;
+    };
+    std::vector<OpWindow> rates;
     std::string objects;
+    uint64_t windowAllCalls = 0;
+    uint64_t windowSplitOpCalls = 0;
+    double exactAllTotalNs = 0.0;
+    double exactSplitTotalNs = 0.0;
+    double exactSplitNativeNs = 0.0;
     for(uint32_t op = 0; op < kProfileOpcodeCount; op++) {
-        const uint64_t calls = profileOpCalls[op].load(std::memory_order_relaxed);
-        if(calls != lastCalls[op]) rates.push_back({calls - lastCalls[op], op});
-        lastCalls[op] = calls;
+        const uint64_t dCalls = curTiming[op].calls - lastTiming[op].calls;
+        const uint64_t dTotal =
+            curTiming[op].totalTicks - lastTiming[op].totalTicks;
+        const uint64_t dNativeCalls =
+            curTiming[op].nativeCalls - lastTiming[op].nativeCalls;
+        const uint64_t dNativeDriver =
+            curTiming[op].nativeDriverTicks - lastTiming[op].nativeDriverTicks;
+        lastTiming[op] = curTiming[op];
+        if(dCalls) {
+            const double opTotalNs = (double)dTotal * ticksToNs;
+            windowAllCalls += dCalls;
+            exactAllTotalNs += opTotalNs;
+            rates.push_back({dCalls, op, dTotal, dNativeCalls, dNativeDriver});
+            if(dNativeCalls) {
+                const double opNativeNs =
+                    std::min(opTotalNs, (double)dNativeDriver * ticksToNs);
+                windowSplitOpCalls += dCalls;
+                exactSplitTotalNs += opTotalNs;
+                exactSplitNativeNs += opNativeNs;
+            }
+        }
         const uint64_t named = profileOpObjects[op].load(std::memory_order_relaxed);
         if(named) objects += " #" + std::to_string(op) + "=" + std::to_string(named);
     }
-    std::sort(rates.begin(), rates.end(), std::greater<>());
+    std::sort(rates.begin(), rates.end(), [](const OpWindow &a, const OpWindow &b) {
+        return a.calls > b.calls;
+    });
     std::string top;
     for(size_t i = 0; i < rates.size() && i < 14; i++)
-        top += " #" + std::to_string(rates[i].second) + " " +
-            std::to_string((uint64_t)(rates[i].first / seconds)) + "/s";
+        top += " #" + std::to_string(rates[i].op) + " " +
+            std::to_string((uint64_t)(rates[i].calls / seconds)) + "/s";
     fprintf(stderr, "LC32PROF   GL calls:%s\n", top.c_str());
     fprintf(stderr, "LC32PROF   GL objects named since launch:%s\n", objects.c_str());
+    if(windowAllCalls && seconds > 0.0) {
+        const double splitOpPct =
+            100.0 * (double)windowSplitOpCalls / (double)windowAllCalls;
+        const double splitBridgeNs =
+            std::max(0.0, exactSplitTotalNs - exactSplitNativeNs);
+        const double bridgeNsPerCall = windowSplitOpCalls
+            ? (splitBridgeNs / (double)windowSplitOpCalls) : 0.0;
+        fprintf(stderr,
+            "LC32PROF   GL split (split-ops %.0f%% of %.0f/s): "
+            "all-tot %.1fms/s; split tot %.1fms/s, nat %.1fms/s, "
+            "bridge %.1fms/s (%.0f ns/call; timer ~%.0fns)\n",
+            splitOpPct, windowAllCalls / seconds,
+            exactAllTotalNs / 1e6 / seconds,
+            exactSplitTotalNs / 1e6 / seconds,
+            exactSplitNativeNs / 1e6 / seconds,
+            splitBridgeNs / 1e6 / seconds,
+            bridgeNsPerCall,
+            timerPairNs);
+        std::string breakdown;
+        size_t printed = 0;
+        for(const OpWindow &w : rates) {
+            const double totNs =
+                (double)w.totalTicks * ticksToNs / (double)w.calls;
+            char item[96];
+            if(w.nativeCalls) {
+                const double natNs = std::min(totNs,
+                    (double)w.nativeDriverTicks * ticksToNs / (double)w.calls);
+                const double brNs = std::max(0.0, totNs - natNs);
+                snprintf(item, sizeof(item), " #%u %.0f=%.0f+%.0f",
+                    w.op, totNs, natNs, brNs);
+            } else {
+                snprintf(item, sizeof(item), " #%u %.0f(tot)", w.op, totNs);
+            }
+            breakdown += item;
+            if(++printed >= 8) break;
+        }
+        if(!breakdown.empty()) {
+            fprintf(stderr,
+                "LC32PROF   GL ns/call (tot=nat+br):%s\n", breakdown.c_str());
+        }
+    }
 }
 
 extern "C" uint32_t LC32_OpenGLES_DispatchInline(uint32_t opcode,
@@ -3368,20 +3643,44 @@ extern "C" uint32_t LC32_OpenGLES_Dispatch(uint32_t opcode,
     // pool that is only drained when the thread exits, so anything the GL
     // driver autoreleases would pile up for the whole session. GL calls
     // return no objects, so drain per call.
-    @autoreleasepool {
-        if(!LC32ProfileActive) return DispatchOpenGLESCall(opcode, guestCall);
-        const uint64_t start = mach_absolute_time();
-        const uint32_t result = DispatchOpenGLESCall(opcode, guestCall);
-        LC32ProfileAddGL(mach_absolute_time() - start);
-        return result;
+    if(__builtin_expect(!LC32ProfileActive, 1)) {
+        @autoreleasepool {
+            return DispatchOpenGLESCall(opcode, guestCall, nullptr);
+        }
     }
+    GLProfileSample sample;
+    const uint64_t start = mach_absolute_time();
+    uint32_t result = 0;
+    @autoreleasepool {
+        result = DispatchOpenGLESCall(opcode, guestCall, &sample);
+    }
+    const uint64_t totalTicks = mach_absolute_time() - start;
+    LC32ProfileAddGL(totalTicks);
+    if(opcode < kProfileOpcodeCount) {
+        const uint64_t clampedNative = sample.nativeRecorded
+            ? std::min(sample.nativeTicks, totalTicks) : 0;
+        std::lock_guard<std::mutex> lock(profileTimingMutex);
+        ProfileOpTiming &slot = profileOpTiming[opcode];
+        slot.calls++;
+        slot.totalTicks += totalTicks;
+        if(sample.nativeRecorded) {
+            slot.nativeCalls++;
+            slot.nativeDriverTicks += clampedNative;
+        }
+    }
+    return result;
 }
 
-static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
+static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
+                                     GLProfileSample *profileSample) {
+    struct BridgeOpcodeScope {
+        uint32_t previous;
+        explicit BridgeOpcodeScope(uint32_t current) : previous(bridgeOpcode) {
+            bridgeOpcode = current;
+        }
+        ~BridgeOpcodeScope() { bridgeOpcode = previous; }
+    } opcodeScope(opcode);
     LC32OpenGLESCall call;
-    bridgeOpcode = opcode;
-    if(LC32ProfileActive && opcode < kProfileOpcodeCount)
-        profileOpCalls[opcode].fetch_add(1, std::memory_order_relaxed);
     if(!ReadCall(guestCall, call)) return 0;
     DrainDeferredGuestMappingFrees();
 
@@ -3426,18 +3725,18 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             return glGetError();
         }
         case LC32OpenGLESOpGetIntegerv:
-            return DispatchStateGetter<GLint>(call,
+            return DispatchStateGetter<GLint>(call, profileSample,
                 [](GLenum pname, GLint *values) { glGetIntegerv(pname, values); });
         case LC32OpenGLESOpGetBooleanv:
-            return DispatchStateGetter<GLboolean>(call,
+            return DispatchStateGetter<GLboolean>(call, profileSample,
                 [](GLenum pname, GLboolean *values) { glGetBooleanv(pname, values); });
         case LC32OpenGLESOpGetFloatv:
-            return DispatchStateGetter<GLfloat>(call,
+            return DispatchStateGetter<GLfloat>(call, profileSample,
                 [](GLenum pname, GLfloat *values) { glGetFloatv(pname, values); });
         case LC32OpenGLESOpGetFixedv:
-            return DispatchStateGetter<GLfixed>(call,
+            return DispatchStateGetter<GLfixed>(call, profileSample,
                 [](GLenum pname, GLfixed *values) { glGetFixedv(pname, values); });
-        case LC32OpenGLESOpActiveTexture: REQUIRE(1); glActiveTexture(U(0)); return 0;
+        case LC32OpenGLESOpActiveTexture: REQUIRE(1); LC32_GL_TIME_NATIVE(glActiveTexture(U(0))); return 0;
         case LC32OpenGLESOpActiveShaderProgramEXT:
             REQUIRE(2); glActiveShaderProgramEXT(U(0), U(1)); return 0;
         case LC32OpenGLESOpAttachShader: REQUIRE(2); glAttachShader(U(0), U(1)); return 0;
@@ -3445,7 +3744,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(2); glBeginQueryEXT(U(0), U(1)); return 0;
         case LC32OpenGLESOpBeginTransformFeedback:
             REQUIRE(1); glBeginTransformFeedback(U(0)); return 0;
-        case LC32OpenGLESOpBindBuffer: REQUIRE(2); glBindBuffer(U(0), U(1)); return 0;
+        case LC32OpenGLESOpBindBuffer: REQUIRE(2); LC32_GL_TIME_NATIVE(glBindBuffer(U(0), U(1))); return 0;
         case LC32OpenGLESOpBindBufferBase:
             REQUIRE(3); glBindBufferBase(U(0), U(1), U(2)); return 0;
         case LC32OpenGLESOpBindBufferRange:
@@ -3453,18 +3752,18 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         case LC32OpenGLESOpBindFramebuffer:
             REQUIRE(2);
             if(CurrentContextIsES1())
-                glBindFramebufferOES(U(0), U(1));
+                LC32_GL_TIME_NATIVE(glBindFramebufferOES(U(0), U(1)));
             else
-                glBindFramebuffer(U(0), U(1));
+                LC32_GL_TIME_NATIVE(glBindFramebuffer(U(0), U(1)));
             return 0;
         case LC32OpenGLESOpBindRenderbuffer:
             REQUIRE(2);
             if(CurrentContextIsES1())
-                glBindRenderbufferOES(U(0), U(1));
+                LC32_GL_TIME_NATIVE(glBindRenderbufferOES(U(0), U(1)));
             else
-                glBindRenderbuffer(U(0), U(1));
+                LC32_GL_TIME_NATIVE(glBindRenderbuffer(U(0), U(1)));
             return 0;
-        case LC32OpenGLESOpBindTexture: REQUIRE(2); glBindTexture(U(0), U(1)); return 0;
+        case LC32OpenGLESOpBindTexture: REQUIRE(2); LC32_GL_TIME_NATIVE(glBindTexture(U(0), U(1))); return 0;
         case LC32OpenGLESOpBindProgramPipelineEXT:
             REQUIRE(1); glBindProgramPipelineEXT(U(0)); return 0;
         case LC32OpenGLESOpBindSampler:
@@ -3473,7 +3772,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(2); glBindTransformFeedback(U(0), U(1)); return 0;
         case LC32OpenGLESOpBindVertexArrayOES:
             REQUIRE(1);
-            glBindVertexArrayOES(U(0));
+            LC32_GL_TIME_NATIVE(glBindVertexArrayOES(U(0)));
             {
                 GLint bound = 0;
                 glGetIntegerv(GL_VERTEX_ARRAY_BINDING_OES, &bound);
@@ -3496,18 +3795,18 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             else
                 glBlendEquationSeparate(U(0), U(1));
             return 0;
-        case LC32OpenGLESOpBlendFunc: REQUIRE(2); glBlendFunc(U(0), U(1)); return 0;
+        case LC32OpenGLESOpBlendFunc: REQUIRE(2); LC32_GL_TIME_NATIVE(glBlendFunc(U(0), U(1))); return 0;
         case LC32OpenGLESOpBlendFuncSeparate:
             REQUIRE(4);
             if(CurrentContextIsES1())
-                glBlendFuncSeparateOES(U(0), U(1), U(2), U(3));
+                LC32_GL_TIME_NATIVE(glBlendFuncSeparateOES(U(0), U(1), U(2), U(3)));
             else
-                glBlendFuncSeparate(U(0), U(1), U(2), U(3));
+                LC32_GL_TIME_NATIVE(glBlendFuncSeparate(U(0), U(1), U(2), U(3)));
             return 0;
         case LC32OpenGLESOpBlitFramebuffer:
             REQUIRE(10);
-            glBlitFramebuffer(I(0), I(1), I(2), I(3), I(4), I(5), I(6),
-                I(7), U(8), U(9));
+            LC32_GL_TIME_NATIVE(glBlitFramebuffer(I(0), I(1), I(2), I(3), I(4), I(5), I(6),
+                I(7), U(8), U(9)));
             return 0;
         case LC32OpenGLESOpCheckFramebufferStatus:
             REQUIRE(1);
@@ -3521,22 +3820,25 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 SetBridgeError(GL_INVALID_VALUE);
                 return GL_WAIT_FAILED_APPLE;
             }
-            return glClientWaitSyncAPPLE(sync, U(1), Q(2));
+            GLenum waitResult = GL_WAIT_FAILED_APPLE;
+            LC32_GL_TIME_NATIVE(
+                waitResult = glClientWaitSyncAPPLE(sync, U(1), Q(2)));
+            return waitResult;
         }
-        case LC32OpenGLESOpClear: REQUIRE(1); glClear(U(0)); return 0;
+        case LC32OpenGLESOpClear: REQUIRE(1); LC32_GL_TIME_NATIVE(glClear(U(0))); return 0;
         case LC32OpenGLESOpClearBufferfi:
             REQUIRE(4); glClearBufferfi(U(0), I(1), F(2), I(3)); return 0;
         case LC32OpenGLESOpClearColor: REQUIRE(4); glClearColor(F(0), F(1), F(2), F(3)); return 0;
         case LC32OpenGLESOpClearDepthf: REQUIRE(1); glClearDepthf(F(0)); return 0;
         case LC32OpenGLESOpClearStencil: REQUIRE(1); glClearStencil(I(0)); return 0;
-        case LC32OpenGLESOpColorMask: REQUIRE(4); glColorMask(U(0), U(1), U(2), U(3)); return 0;
-        case LC32OpenGLESOpCompileShader: REQUIRE(1); glCompileShader(U(0)); return 0;
+        case LC32OpenGLESOpColorMask: REQUIRE(4); LC32_GL_TIME_NATIVE(glColorMask(U(0), U(1), U(2), U(3))); return 0;
+        case LC32OpenGLESOpCompileShader: REQUIRE(1); LC32_GL_TIME_NATIVE(glCompileShader(U(0))); return 0;
         case LC32OpenGLESOpCopyTexImage2D:
             REQUIRE(8);
-            glCopyTexImage2D(U(0), I(1), U(2), I(3), I(4), I(5), I(6), I(7));
+            LC32_GL_TIME_NATIVE(glCopyTexImage2D(U(0), I(1), U(2), I(3), I(4), I(5), I(6), I(7)));
             NoteTexture2DSize(U(0), I(1), I(5), I(6));
             return 0;
-        case LC32OpenGLESOpCopyTexSubImage2D: REQUIRE(8); glCopyTexSubImage2D(U(0), I(1), I(2), I(3), I(4), I(5), I(6), I(7)); return 0;
+        case LC32OpenGLESOpCopyTexSubImage2D: REQUIRE(8); LC32_GL_TIME_NATIVE(glCopyTexSubImage2D(U(0), I(1), I(2), I(3), I(4), I(5), I(6), I(7))); return 0;
         case LC32OpenGLESOpCopyBufferSubData:
             REQUIRE(5);
             ForgetElementRangesForTarget(U(1));
@@ -3552,7 +3854,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         case LC32OpenGLESOpCullFace: REQUIRE(1); glCullFace(U(0)); return 0;
         case LC32OpenGLESOpDeleteBuffers:
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *values) {
+                [profileSample](GLsizei n, const GLuint *values) {
                     const uintptr_t sharegroupKey =
                         CurrentGLSharegroupKey();
                     for(GLsizei index = 0; index < n; ++index) {
@@ -3562,7 +3864,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                                 mappedBufferMutex);
                             GLAttribCheckNoteDelete(values[index]);
                             RememberDetachedVertexAttribs(values[index]);
-                            glDeleteBuffers(1, values + index);
+                            LC32_GL_TIME_NATIVE(
+                                glDeleteBuffers(1, values + index));
                             ForgetElementRanges(sharegroupKey, values[index]);
                             guestPointer = RetireMappedBufferLocked(
                                 sharegroupKey, values[index]);
@@ -3573,49 +3876,56 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         case LC32OpenGLESOpDeleteFramebuffers:
             if(CurrentContextIsES1()) {
                 return DispatchObjectInputArray(call,
-                    [](GLsizei n, const GLuint *v) {
-                        glDeleteFramebuffersOES(n, v);
+                    [profileSample](GLsizei n, const GLuint *v) {
+                        LC32_GL_TIME_NATIVE(glDeleteFramebuffersOES(n, v));
                     });
             }
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *v) {
-                    glDeleteFramebuffers(n, v);
+                [profileSample](GLsizei n, const GLuint *v) {
+                    LC32_GL_TIME_NATIVE(glDeleteFramebuffers(n, v));
                 });
         case LC32OpenGLESOpDeleteRenderbuffers:
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *v) {
+                [profileSample](GLsizei n, const GLuint *v) {
                     ForgetDrawableRenderbuffers(n, v);
-                    if(CurrentContextIsES1()) glDeleteRenderbuffersOES(n, v);
-                    else glDeleteRenderbuffers(n, v);
+                    if(CurrentContextIsES1())
+                        LC32_GL_TIME_NATIVE(glDeleteRenderbuffersOES(n, v));
+                    else
+                        LC32_GL_TIME_NATIVE(glDeleteRenderbuffers(n, v));
                 });
         case LC32OpenGLESOpDeleteTextures:
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *v) {
-                    glDeleteTextures(n, v);
+                [profileSample](GLsizei n, const GLuint *v) {
+                    LC32_GL_TIME_NATIVE(glDeleteTextures(n, v));
                     ForgetNpotTextures(CurrentGLSharegroupKey(), n, v);
                 });
         case LC32OpenGLESOpDeleteProgramPipelinesEXT:
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *v) {
-                    glDeleteProgramPipelinesEXT(n, v);
+                [profileSample](GLsizei n, const GLuint *v) {
+                    LC32_GL_TIME_NATIVE(glDeleteProgramPipelinesEXT(n, v));
                 });
         case LC32OpenGLESOpDeleteQueriesEXT:
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *v) { glDeleteQueriesEXT(n, v); });
+                [profileSample](GLsizei n, const GLuint *v) {
+                    LC32_GL_TIME_NATIVE(glDeleteQueriesEXT(n, v));
+                });
         case LC32OpenGLESOpDeleteSamplers:
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *v) { glDeleteSamplers(n, v); });
+                [profileSample](GLsizei n, const GLuint *v) {
+                    LC32_GL_TIME_NATIVE(glDeleteSamplers(n, v));
+                });
         case LC32OpenGLESOpDeleteTransformFeedbacks:
             return DispatchObjectInputArray(call,
-                [](GLsizei n, const GLuint *v) {
-                    glDeleteTransformFeedbacks(n, v);
+                [profileSample](GLsizei n, const GLuint *v) {
+                    LC32_GL_TIME_NATIVE(glDeleteTransformFeedbacks(n, v));
                 });
         case LC32OpenGLESOpDeleteVertexArraysOES:
-            return DispatchObjectInputArray(call, [](GLsizei n, const GLuint *v) {
-                glDeleteVertexArraysOES(n, v);
-                ForgetDetachedVertexAttribs(CurrentGLContextKey(), n, v);
-                ForgetVertexArrayStates(n, v);
-            });
+            return DispatchObjectInputArray(call,
+                [profileSample](GLsizei n, const GLuint *v) {
+                    LC32_GL_TIME_NATIVE(glDeleteVertexArraysOES(n, v));
+                    ForgetDetachedVertexAttribs(CurrentGLContextKey(), n, v);
+                    ForgetVertexArrayStates(n, v);
+                });
         case LC32OpenGLESOpDeleteProgram:
             REQUIRE(1);
             ForgetProgramAttributes(U(0));
@@ -3634,13 +3944,13 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             return 0;
         }
         case LC32OpenGLESOpDepthFunc: REQUIRE(1); glDepthFunc(U(0)); return 0;
-        case LC32OpenGLESOpDepthMask: REQUIRE(1); glDepthMask(U(0)); return 0;
+        case LC32OpenGLESOpDepthMask: REQUIRE(1); LC32_GL_TIME_NATIVE(glDepthMask(U(0))); return 0;
         case LC32OpenGLESOpDepthRangef: REQUIRE(2); glDepthRangef(F(0), F(1)); return 0;
         case LC32OpenGLESOpDetachShader: REQUIRE(2); glDetachShader(U(0), U(1)); return 0;
-        case LC32OpenGLESOpDisable: REQUIRE(1); glDisable(U(0)); return 0;
+        case LC32OpenGLESOpDisable: REQUIRE(1); LC32_GL_TIME_NATIVE(glDisable(U(0))); return 0;
         case LC32OpenGLESOpDisableVertexAttribArray:
             REQUIRE(1);
-            glDisableVertexAttribArray(U(0));
+            LC32_GL_TIME_NATIVE(glDisableVertexAttribArray(U(0)));
             if(VertexAttribIndexValid(U(0)))
                 SetVertexAttribArrayEnabled(U(0), false);
             return 0;
@@ -3654,7 +3964,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 return 0;
             }
             if(count == 0) {
-                glDrawArrays(U(0), first, count);
+                LC32_GL_TIME_NATIVE(glDrawArrays(U(0), first, count));
                 return 0;
             }
             const size_t maximumIndex = static_cast<size_t>(first) +
@@ -3662,7 +3972,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             std::vector<StagedClientArray> staged;
             if(!StageClientArrays(maximumIndex, staged)) return 0;
             if(GLAttribCheckSkipsDraw("DrawArrays")) return 0;
-            glDrawArrays(U(0), first, count);
+            LC32_GL_TIME_NATIVE(glDrawArrays(U(0), first, count));
             return 0;
         }
         case LC32OpenGLESOpDrawArraysInstancedEXT: {
@@ -3676,7 +3986,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 return 0;
             }
             if(!count || !instanceCount) {
-                glDrawArraysInstancedEXT(U(0), first, count, instanceCount);
+                LC32_GL_TIME_NATIVE(glDrawArraysInstancedEXT(U(0), first, count, instanceCount));
                 return 0;
             }
             const size_t maximumIndex = static_cast<size_t>(first) +
@@ -3684,13 +3994,13 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             std::vector<StagedClientArray> staged;
             if(!StageClientArrays(maximumIndex,
                     static_cast<size_t>(instanceCount), staged)) return 0;
-            glDrawArraysInstancedEXT(U(0), first, count, instanceCount);
+            LC32_GL_TIME_NATIVE(glDrawArraysInstancedEXT(U(0), first, count, instanceCount));
             return 0;
         }
-        case LC32OpenGLESOpEnable: REQUIRE(1); glEnable(U(0)); return 0;
+        case LC32OpenGLESOpEnable: REQUIRE(1); LC32_GL_TIME_NATIVE(glEnable(U(0))); return 0;
         case LC32OpenGLESOpEnableVertexAttribArray:
             REQUIRE(1);
-            glEnableVertexAttribArray(U(0));
+            LC32_GL_TIME_NATIVE(glEnableVertexAttribArray(U(0)));
             if(VertexAttribIndexValid(U(0)))
                 SetVertexAttribArrayEnabled(U(0), true);
             return 0;
@@ -3698,7 +4008,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(1); glEndQueryEXT(U(0)); return 0;
         case LC32OpenGLESOpEndTransformFeedback:
             REQUIRE(0); glEndTransformFeedback(); return 0;
-        case LC32OpenGLESOpFinish: REQUIRE(0); glFinish(); return 0;
+        case LC32OpenGLESOpFinish: REQUIRE(0); LC32_GL_TIME_NATIVE(glFinish()); return 0;
         case LC32OpenGLESOpFenceSyncAPPLE: {
             REQUIRE(2);
             GLsync sync = glFenceSyncAPPLE(U(0), U(1));
@@ -3710,70 +4020,70 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             }
             return token;
         }
-        case LC32OpenGLESOpFlush: REQUIRE(0); glFlush(); return 0;
+        case LC32OpenGLESOpFlush: REQUIRE(0); LC32_GL_TIME_NATIVE(glFlush()); return 0;
         case LC32OpenGLESOpFramebufferRenderbuffer:
             REQUIRE(4);
             if(CurrentContextIsES1())
-                glFramebufferRenderbufferOES(
-                    U(0), U(1), U(2), U(3));
+                LC32_GL_TIME_NATIVE(glFramebufferRenderbufferOES(
+                    U(0), U(1), U(2), U(3)));
             else
-                glFramebufferRenderbuffer(U(0), U(1), U(2), U(3));
+                LC32_GL_TIME_NATIVE(glFramebufferRenderbuffer(U(0), U(1), U(2), U(3)));
             return 0;
         case LC32OpenGLESOpFramebufferTexture2D:
             REQUIRE(5);
             if(CurrentContextIsES1())
-                glFramebufferTexture2DOES(
-                    U(0), U(1), U(2), U(3), I(4));
+                LC32_GL_TIME_NATIVE(glFramebufferTexture2DOES(
+                    U(0), U(1), U(2), U(3), I(4)));
             else
-                glFramebufferTexture2D(
-                    U(0), U(1), U(2), U(3), I(4));
+                LC32_GL_TIME_NATIVE(glFramebufferTexture2D(
+                    U(0), U(1), U(2), U(3), I(4)));
             return 0;
         case LC32OpenGLESOpFramebufferTextureLayer:
             REQUIRE(5); glFramebufferTextureLayer(U(0), U(1), U(2), I(3),
                 I(4)); return 0;
         case LC32OpenGLESOpFrontFace: REQUIRE(1); glFrontFace(U(0)); return 0;
         case LC32OpenGLESOpGenBuffers:
-            return DispatchObjectOutputArray(call, [](GLsizei n, GLuint *v) { glGenBuffers(n, v); });
+            return DispatchObjectOutputArray(call, profileSample, [](GLsizei n, GLuint *v) { glGenBuffers(n, v); });
         case LC32OpenGLESOpGenFramebuffers:
             if(CurrentContextIsES1()) {
-                return DispatchObjectOutputArray(call,
+                return DispatchObjectOutputArray(call, profileSample,
                     [](GLsizei n, GLuint *v) {
                         glGenFramebuffersOES(n, v);
                     });
             }
-            return DispatchObjectOutputArray(call,
+            return DispatchObjectOutputArray(call, profileSample,
                 [](GLsizei n, GLuint *v) { glGenFramebuffers(n, v); });
         case LC32OpenGLESOpGenRenderbuffers:
             if(CurrentContextIsES1()) {
-                return DispatchObjectOutputArray(call,
+                return DispatchObjectOutputArray(call, profileSample,
                     [](GLsizei n, GLuint *v) {
                         glGenRenderbuffersOES(n, v);
                     });
             }
-            return DispatchObjectOutputArray(call,
+            return DispatchObjectOutputArray(call, profileSample,
                 [](GLsizei n, GLuint *v) { glGenRenderbuffers(n, v); });
         case LC32OpenGLESOpGenTextures:
-            return DispatchObjectOutputArray(call, [](GLsizei n, GLuint *v) { glGenTextures(n, v); });
+            return DispatchObjectOutputArray(call, profileSample, [](GLsizei n, GLuint *v) { glGenTextures(n, v); });
         case LC32OpenGLESOpGenProgramPipelinesEXT:
-            return DispatchObjectOutputArray(call,
+            return DispatchObjectOutputArray(call, profileSample,
                 [](GLsizei n, GLuint *v) { glGenProgramPipelinesEXT(n, v); });
         case LC32OpenGLESOpGenQueriesEXT:
-            return DispatchObjectOutputArray(call,
+            return DispatchObjectOutputArray(call, profileSample,
                 [](GLsizei n, GLuint *v) { glGenQueriesEXT(n, v); });
         case LC32OpenGLESOpGenSamplers:
-            return DispatchObjectOutputArray(call,
+            return DispatchObjectOutputArray(call, profileSample,
                 [](GLsizei n, GLuint *v) { glGenSamplers(n, v); });
         case LC32OpenGLESOpGenTransformFeedbacks:
-            return DispatchObjectOutputArray(call,
+            return DispatchObjectOutputArray(call, profileSample,
                 [](GLsizei n, GLuint *v) { glGenTransformFeedbacks(n, v); });
         case LC32OpenGLESOpGenVertexArraysOES:
-            return DispatchObjectOutputArray(call, [](GLsizei n, GLuint *v) { glGenVertexArraysOES(n, v); });
+            return DispatchObjectOutputArray(call, profileSample, [](GLsizei n, GLuint *v) { glGenVertexArraysOES(n, v); });
         case LC32OpenGLESOpGenerateMipmap:
             REQUIRE(1);
             if(CurrentContextIsES1())
-                glGenerateMipmapOES(U(0));
+                LC32_GL_TIME_NATIVE(glGenerateMipmapOES(U(0)));
             else
-                glGenerateMipmap(U(0));
+                LC32_GL_TIME_NATIVE(glGenerateMipmap(U(0)));
             return 0;
         case LC32OpenGLESOpHint: REQUIRE(2); glHint(U(0), U(1)); return 0;
         case LC32OpenGLESOpIsBuffer: REQUIRE(1); return glIsBuffer(U(0));
@@ -3808,7 +4118,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         case LC32OpenGLESOpLinkProgram:
             REQUIRE(1);
             ForgetProgramAttributes(U(0));
-            glLinkProgram(U(0));
+            LC32_GL_TIME_NATIVE(glLinkProgram(U(0)));
             return 0;
         case LC32OpenGLESOpPixelStorei: REQUIRE(2); glPixelStorei(U(0), I(1)); return 0;
         case LC32OpenGLESOpPauseTransformFeedback:
@@ -3849,16 +4159,16 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(4);
             ForgetBoundDrawableRenderbuffer(U(0));
             if(CurrentContextIsES1())
-                glRenderbufferStorageOES(U(0), U(1), I(2), I(3));
+                LC32_GL_TIME_NATIVE(glRenderbufferStorageOES(U(0), U(1), I(2), I(3)));
             else
-                glRenderbufferStorage(U(0), U(1), I(2), I(3));
+                LC32_GL_TIME_NATIVE(glRenderbufferStorage(U(0), U(1), I(2), I(3)));
             return 0;
         case LC32OpenGLESOpRenderbufferStorageMultisampleAPPLE:
             REQUIRE(5);
             ForgetBoundDrawableRenderbuffer(U(0));
-            glRenderbufferStorageMultisampleAPPLE(U(0), I(1), U(2), I(3), I(4));
+            LC32_GL_TIME_NATIVE(glRenderbufferStorageMultisampleAPPLE(U(0), I(1), U(2), I(3), I(4)));
             return 0;
-        case LC32OpenGLESOpResolveMultisampleFramebufferAPPLE: REQUIRE(0); glResolveMultisampleFramebufferAPPLE(); return 0;
+        case LC32OpenGLESOpResolveMultisampleFramebufferAPPLE: REQUIRE(0); LC32_GL_TIME_NATIVE(glResolveMultisampleFramebufferAPPLE()); return 0;
         case LC32OpenGLESOpResumeTransformFeedback:
             REQUIRE(0); glResumeTransformFeedback(); return 0;
         case LC32OpenGLESOpSampleCoverage: REQUIRE(2); glSampleCoverage(F(0), U(1)); return 0;
@@ -3866,7 +4176,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(3); glSamplerParameterf(U(0), U(1), F(2)); return 0;
         case LC32OpenGLESOpSamplerParameteri:
             REQUIRE(3); glSamplerParameteri(U(0), U(1), I(2)); return 0;
-        case LC32OpenGLESOpScissor: REQUIRE(4); glScissor(I(0), I(1), I(2), I(3)); return 0;
+        case LC32OpenGLESOpScissor: REQUIRE(4); LC32_GL_TIME_NATIVE(glScissor(I(0), I(1), I(2), I(3))); return 0;
         case LC32OpenGLESOpStencilFunc: REQUIRE(3); glStencilFunc(U(0), I(1), U(2)); return 0;
         case LC32OpenGLESOpStencilFuncSeparate: REQUIRE(4); glStencilFuncSeparate(U(0), U(1), I(2), U(3)); return 0;
         case LC32OpenGLESOpStencilMask: REQUIRE(1); glStencilMask(U(0)); return 0;
@@ -3893,25 +4203,25 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             return 0;
         case LC32OpenGLESOpTexStorage3D:
             REQUIRE(6); glTexStorage3D(U(0), I(1), U(2), I(3), I(4), I(5)); return 0;
-        case LC32OpenGLESOpUniform1f: REQUIRE(2); glUniform1f(I(0), F(1)); return 0;
-        case LC32OpenGLESOpUniform1i: REQUIRE(2); glUniform1i(I(0), I(1)); return 0;
-        case LC32OpenGLESOpUniform2f: REQUIRE(3); glUniform2f(I(0), F(1), F(2)); return 0;
-        case LC32OpenGLESOpUniform2i: REQUIRE(3); glUniform2i(I(0), I(1), I(2)); return 0;
-        case LC32OpenGLESOpUniform3f: REQUIRE(4); glUniform3f(I(0), F(1), F(2), F(3)); return 0;
-        case LC32OpenGLESOpUniform3i: REQUIRE(4); glUniform3i(I(0), I(1), I(2), I(3)); return 0;
-        case LC32OpenGLESOpUniform4f: REQUIRE(5); glUniform4f(I(0), F(1), F(2), F(3), F(4)); return 0;
-        case LC32OpenGLESOpUniform4i: REQUIRE(5); glUniform4i(I(0), I(1), I(2), I(3), I(4)); return 0;
+        case LC32OpenGLESOpUniform1f: REQUIRE(2); LC32_GL_TIME_NATIVE(glUniform1f(I(0), F(1))); return 0;
+        case LC32OpenGLESOpUniform1i: REQUIRE(2); LC32_GL_TIME_NATIVE(glUniform1i(I(0), I(1))); return 0;
+        case LC32OpenGLESOpUniform2f: REQUIRE(3); LC32_GL_TIME_NATIVE(glUniform2f(I(0), F(1), F(2))); return 0;
+        case LC32OpenGLESOpUniform2i: REQUIRE(3); LC32_GL_TIME_NATIVE(glUniform2i(I(0), I(1), I(2))); return 0;
+        case LC32OpenGLESOpUniform3f: REQUIRE(4); LC32_GL_TIME_NATIVE(glUniform3f(I(0), F(1), F(2), F(3))); return 0;
+        case LC32OpenGLESOpUniform3i: REQUIRE(4); LC32_GL_TIME_NATIVE(glUniform3i(I(0), I(1), I(2), I(3))); return 0;
+        case LC32OpenGLESOpUniform4f: REQUIRE(5); LC32_GL_TIME_NATIVE(glUniform4f(I(0), F(1), F(2), F(3), F(4))); return 0;
+        case LC32OpenGLESOpUniform4i: REQUIRE(5); LC32_GL_TIME_NATIVE(glUniform4i(I(0), I(1), I(2), I(3), I(4))); return 0;
         case LC32OpenGLESOpUniform1ui:
-            REQUIRE(2); glUniform1ui(I(0), U(1)); return 0;
+            REQUIRE(2); LC32_GL_TIME_NATIVE(glUniform1ui(I(0), U(1))); return 0;
         case LC32OpenGLESOpUniform2ui:
-            REQUIRE(3); glUniform2ui(I(0), U(1), U(2)); return 0;
+            REQUIRE(3); LC32_GL_TIME_NATIVE(glUniform2ui(I(0), U(1), U(2))); return 0;
         case LC32OpenGLESOpUniform3ui:
-            REQUIRE(4); glUniform3ui(I(0), U(1), U(2), U(3)); return 0;
+            REQUIRE(4); LC32_GL_TIME_NATIVE(glUniform3ui(I(0), U(1), U(2), U(3))); return 0;
         case LC32OpenGLESOpUniform4ui:
-            REQUIRE(5); glUniform4ui(I(0), U(1), U(2), U(3), U(4)); return 0;
+            REQUIRE(5); LC32_GL_TIME_NATIVE(glUniform4ui(I(0), U(1), U(2), U(3), U(4))); return 0;
         case LC32OpenGLESOpUniformBlockBinding:
             REQUIRE(3); glUniformBlockBinding(U(0), U(1), U(2)); return 0;
-        case LC32OpenGLESOpUseProgram: REQUIRE(1); glUseProgram(U(0)); return 0;
+        case LC32OpenGLESOpUseProgram: REQUIRE(1); LC32_GL_TIME_NATIVE(glUseProgram(U(0))); return 0;
         case LC32OpenGLESOpValidateProgram: REQUIRE(1); glValidateProgram(U(0)); return 0;
         case LC32OpenGLESOpUseProgramStagesEXT:
             REQUIRE(3); glUseProgramStagesEXT(U(0), U(1), U(2)); return 0;
@@ -3941,23 +4251,23 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(5); glVertexAttribI4i(U(0), I(1), I(2), I(3), I(4)); return 0;
         case LC32OpenGLESOpVertexAttribI4ui:
             REQUIRE(5); glVertexAttribI4ui(U(0), U(1), U(2), U(3), U(4)); return 0;
-        case LC32OpenGLESOpViewport: REQUIRE(4); glViewport(I(0), I(1), I(2), I(3)); return 0;
+        case LC32OpenGLESOpViewport: REQUIRE(4); LC32_GL_TIME_NATIVE(glViewport(I(0), I(1), I(2), I(3))); return 0;
         case LC32OpenGLESOpAlphaFunc: REQUIRE(2); glAlphaFunc(U(0), F(1)); return 0;
         case LC32OpenGLESOpAlphaFuncx: REQUIRE(2); glAlphaFuncx(U(0), I(1)); return 0;
         case LC32OpenGLESOpClearColorx: REQUIRE(4); glClearColorx(I(0), I(1), I(2), I(3)); return 0;
         case LC32OpenGLESOpClearDepthx: REQUIRE(1); glClearDepthx(I(0)); return 0;
-        case LC32OpenGLESOpColor4f: REQUIRE(4); glColor4f(F(0), F(1), F(2), F(3)); return 0;
-        case LC32OpenGLESOpColor4ub: REQUIRE(4); glColor4ub(U(0), U(1), U(2), U(3)); return 0;
+        case LC32OpenGLESOpColor4f: REQUIRE(4); LC32_GL_TIME_NATIVE(glColor4f(F(0), F(1), F(2), F(3))); return 0;
+        case LC32OpenGLESOpColor4ub: REQUIRE(4); LC32_GL_TIME_NATIVE(glColor4ub(U(0), U(1), U(2), U(3))); return 0;
         case LC32OpenGLESOpColor4x: REQUIRE(4); glColor4x(I(0), I(1), I(2), I(3)); return 0;
         case LC32OpenGLESOpDepthRangex: REQUIRE(2); glDepthRangex(I(0), I(1)); return 0;
         case LC32OpenGLESOpDisableClientState:
             REQUIRE(1);
-            glDisableClientState(U(0));
+            LC32_GL_TIME_NATIVE(glDisableClientState(U(0)));
             SetClientStateEnabled(U(0), false);
             return 0;
         case LC32OpenGLESOpEnableClientState:
             REQUIRE(1);
-            glEnableClientState(U(0));
+            LC32_GL_TIME_NATIVE(glEnableClientState(U(0)));
             SetClientStateEnabled(U(0), true);
             return 0;
         case LC32OpenGLESOpFogf: REQUIRE(2); glFogf(U(0), F(1)); return 0;
@@ -3969,11 +4279,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         case LC32OpenGLESOpLightf: REQUIRE(3); glLightf(U(0), U(1), F(2)); return 0;
         case LC32OpenGLESOpLightx: REQUIRE(3); glLightx(U(0), U(1), I(2)); return 0;
         case LC32OpenGLESOpLineWidthx: REQUIRE(1); glLineWidthx(I(0)); return 0;
-        case LC32OpenGLESOpLoadIdentity: REQUIRE(0); glLoadIdentity(); return 0;
+        case LC32OpenGLESOpLoadIdentity: REQUIRE(0); LC32_GL_TIME_NATIVE(glLoadIdentity()); return 0;
         case LC32OpenGLESOpLogicOp: REQUIRE(1); glLogicOp(U(0)); return 0;
         case LC32OpenGLESOpMaterialf: REQUIRE(3); glMaterialf(U(0), U(1), F(2)); return 0;
         case LC32OpenGLESOpMaterialx: REQUIRE(3); glMaterialx(U(0), U(1), I(2)); return 0;
-        case LC32OpenGLESOpMatrixMode: REQUIRE(1); glMatrixMode(U(0)); return 0;
+        case LC32OpenGLESOpMatrixMode: REQUIRE(1); LC32_GL_TIME_NATIVE(glMatrixMode(U(0))); return 0;
         case LC32OpenGLESOpMultiTexCoord4f: REQUIRE(5); glMultiTexCoord4f(U(0), F(1), F(2), F(3), F(4)); return 0;
         case LC32OpenGLESOpMultiTexCoord4x: REQUIRE(5); glMultiTexCoord4x(U(0), I(1), I(2), I(3), I(4)); return 0;
         case LC32OpenGLESOpNormal3f: REQUIRE(3); glNormal3f(F(0), F(1), F(2)); return 0;
@@ -3985,12 +4295,12 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         case LC32OpenGLESOpPointSize: REQUIRE(1); glPointSize(F(0)); return 0;
         case LC32OpenGLESOpPointSizex: REQUIRE(1); glPointSizex(I(0)); return 0;
         case LC32OpenGLESOpPolygonOffsetx: REQUIRE(2); glPolygonOffsetx(I(0), I(1)); return 0;
-        case LC32OpenGLESOpPopMatrix: REQUIRE(0); glPopMatrix(); return 0;
-        case LC32OpenGLESOpPushMatrix: REQUIRE(0); glPushMatrix(); return 0;
-        case LC32OpenGLESOpRotatef: REQUIRE(4); glRotatef(F(0), F(1), F(2), F(3)); return 0;
+        case LC32OpenGLESOpPopMatrix: REQUIRE(0); LC32_GL_TIME_NATIVE(glPopMatrix()); return 0;
+        case LC32OpenGLESOpPushMatrix: REQUIRE(0); LC32_GL_TIME_NATIVE(glPushMatrix()); return 0;
+        case LC32OpenGLESOpRotatef: REQUIRE(4); LC32_GL_TIME_NATIVE(glRotatef(F(0), F(1), F(2), F(3))); return 0;
         case LC32OpenGLESOpRotatex: REQUIRE(4); glRotatex(I(0), I(1), I(2), I(3)); return 0;
         case LC32OpenGLESOpSampleCoveragex: REQUIRE(2); glSampleCoveragex(I(0), U(1)); return 0;
-        case LC32OpenGLESOpScalef: REQUIRE(3); glScalef(F(0), F(1), F(2)); return 0;
+        case LC32OpenGLESOpScalef: REQUIRE(3); LC32_GL_TIME_NATIVE(glScalef(F(0), F(1), F(2))); return 0;
         case LC32OpenGLESOpScalex: REQUIRE(3); glScalex(I(0), I(1), I(2)); return 0;
         case LC32OpenGLESOpShadeModel: REQUIRE(1); glShadeModel(U(0)); return 0;
         case LC32OpenGLESOpTexEnvx: REQUIRE(3); glTexEnvx(U(0), U(1), I(2)); return 0;
@@ -3998,7 +4308,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(3);
             glTexParameterx(U(0), U(1), HostTextureWrap(U(0), U(1), I(2)));
             return 0;
-        case LC32OpenGLESOpTranslatef: REQUIRE(3); glTranslatef(F(0), F(1), F(2)); return 0;
+        case LC32OpenGLESOpTranslatef: REQUIRE(3); LC32_GL_TIME_NATIVE(glTranslatef(F(0), F(1), F(2))); return 0;
         case LC32OpenGLESOpTranslatex: REQUIRE(3); glTranslatex(I(0), I(1), I(2)); return 0;
         case LC32OpenGLESOpCurrentPaletteMatrixOES:
             REQUIRE(1); glCurrentPaletteMatrixOES(U(0)); return 0;
@@ -4015,7 +4325,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         case LC32OpenGLESOpBindRenderbufferOES: REQUIRE(2); glBindRenderbufferOES(U(0), U(1)); return 0;
         case LC32OpenGLESOpFramebufferRenderbufferOES: REQUIRE(4); glFramebufferRenderbufferOES(U(0), U(1), U(2), U(3)); return 0;
         case LC32OpenGLESOpGenRenderbuffersOES:
-            return DispatchObjectOutputArray(call, [](GLsizei n, GLuint *v) { glGenRenderbuffersOES(n, v); });
+            return DispatchObjectOutputArray(call, profileSample, [](GLsizei n, GLuint *v) { glGenRenderbuffersOES(n, v); });
         case LC32OpenGLESOpRenderbufferStorageOES:
             REQUIRE(4);
             ForgetBoundDrawableRenderbuffer(U(0));
@@ -4085,11 +4395,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 return 0;
             }
             if(image) {
-                glCompressedTexImage3D(U(0), I(1), U(2), I(3), I(4), I(5),
-                    I(6), signedSize, data);
+                LC32_GL_TIME_NATIVE(glCompressedTexImage3D(U(0), I(1), U(2), I(3), I(4), I(5),
+                    I(6), signedSize, data));
             } else {
-                glCompressedTexSubImage3D(U(0), I(1), I(2), I(3), I(4),
-                    I(5), I(6), I(7), U(8), signedSize, data);
+                LC32_GL_TIME_NATIVE(glCompressedTexSubImage3D(U(0), I(1), I(2), I(3), I(4),
+                    I(5), I(6), I(7), U(8), signedSize, data));
             }
             return 0;
         }
@@ -4386,11 +4696,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 return 0;
             }
             if(image) {
-                glCompressedTexImage2D(U(0), I(1), U(2), I(3), I(4), I(5),
-                    signedSize, data);
+                LC32_GL_TIME_NATIVE(glCompressedTexImage2D(U(0), I(1), U(2), I(3), I(4), I(5),
+                    signedSize, data));
             } else {
-                glCompressedTexSubImage2D(U(0), I(1), I(2), I(3), I(4),
-                    I(5), U(6), signedSize, data);
+                LC32_GL_TIME_NATIVE(glCompressedTexSubImage2D(U(0), I(1), I(2), I(3), I(4),
+                    I(5), U(6), signedSize, data));
             }
             return 0;
         }
@@ -4425,7 +4735,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             }
             GLuint buffer = 0;
             if(!BoundBuffer(U(0), buffer)) {
-                glBufferData(U(0), signedSize, data, U(3));
+                LC32_GL_TIME_NATIVE(glBufferData(U(0), signedSize, data, U(3)));
                 return 0;
             }
             const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
@@ -4436,7 +4746,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 std::lock_guard<std::mutex> lock(mappedBufferMutex);
                 auto mapped = FindMappedBufferLocked(sharegroupKey, U(0),
                     buffer);
-                glBufferData(U(0), signedSize, data, U(3));
+                LC32_GL_TIME_NATIVE(glBufferData(U(0), signedSize, data, U(3)));
                 if(mapped != mappedBuffers.end()) {
                     GLint stillMapped = GL_TRUE;
                     glGetBufferParameteriv(U(0), GL_BUFFER_MAPPED_OES,
@@ -4460,8 +4770,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             std::vector<uint8_t> bytes;
             if(!ReadGuestBytes(U(3), signedSize, bytes)) return 0;
             RecordBufferSubData(U(0), static_cast<size_t>(signedOffset), bytes);
-            glBufferSubData(U(0), signedOffset, signedSize,
-                signedSize ? bytes.data() : nullptr);
+            LC32_GL_TIME_NATIVE(glBufferSubData(U(0), signedOffset, signedSize,
+                signedSize ? bytes.data() : nullptr));
             return 0;
         }
         case LC32OpenGLESOpGetBufferParameteriv:
@@ -4937,9 +5247,9 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             if(CurrentContextIsES3())
                 glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
             if(packBuffer) {
-                glReadPixels(I(0), I(1), I(2), I(3), U(4), U(5),
+                LC32_GL_TIME_NATIVE(glReadPixels(I(0), I(1), I(2), I(3), U(4), U(5),
                     reinterpret_cast<void *>(
-                        static_cast<uintptr_t>(U(6))));
+                        static_cast<uintptr_t>(U(6)))));
                 return 0;
             }
             GLint alignment = 4;
@@ -4962,8 +5272,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 return 0;
             }
             std::vector<uint8_t> pixels(byteCount);
-            glReadPixels(I(0), I(1), I(2), I(3), U(4), U(5),
-                byteCount ? pixels.data() : nullptr);
+            LC32_GL_TIME_NATIVE(glReadPixels(I(0), I(1), I(2), I(3), U(4), U(5),
+                byteCount ? pixels.data() : nullptr));
             if(rowBytes) {
                 for(GLsizei row = 0; row < I(3); ++row) {
                     const size_t rowOffset = dataOffset +
@@ -5022,12 +5332,12 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 return 0;
             }
             if(image) {
-                glTexImage2D(U(0), I(1), I(2), I(3), I(4), I(5),
-                    U(6), U(7), data);
+                LC32_GL_TIME_NATIVE(glTexImage2D(U(0), I(1), I(2), I(3), I(4), I(5),
+                    U(6), U(7), data));
                 NoteTexture2DSize(U(0), I(1), I(3), I(4));
             } else {
-                glTexSubImage2D(U(0), I(1), I(2), I(3), I(4), I(5),
-                    U(6), U(7), data);
+                LC32_GL_TIME_NATIVE(glTexSubImage2D(U(0), I(1), I(2), I(3), I(4), I(5),
+                    U(6), U(7), data));
             }
             return 0;
         }
@@ -5218,11 +5528,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 return 0;
             }
             if(image) {
-                glTexImage3D(U(0), I(1), I(2), I(3), I(4), I(5), I(6),
-                    U(7), U(8), data);
+                LC32_GL_TIME_NATIVE(glTexImage3D(U(0), I(1), I(2), I(3), I(4), I(5), I(6),
+                    U(7), U(8), data));
             } else {
-                glTexSubImage3D(U(0), I(1), I(2), I(3), I(4), I(5), I(6),
-                    I(7), U(8), U(9), data);
+                LC32_GL_TIME_NATIVE(glTexSubImage3D(U(0), I(1), I(2), I(3), I(4), I(5), I(6),
+                    I(7), U(8), U(9), data));
             }
             return 0;
         }
@@ -5301,98 +5611,98 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             return 0;
         }
         case LC32OpenGLESOpUniform1fv:
-            return DispatchInputArray<GLfloat>(call, 1,
+            return DispatchInputArray<GLfloat>(call, 1, profileSample,
                 [](GLint l, GLsizei c, const GLfloat *v) { glUniform1fv(l, c, v); });
         case LC32OpenGLESOpUniform2fv:
-            return DispatchInputArray<GLfloat>(call, 2,
+            return DispatchInputArray<GLfloat>(call, 2, profileSample,
                 [](GLint l, GLsizei c, const GLfloat *v) { glUniform2fv(l, c, v); });
         case LC32OpenGLESOpUniform3fv:
-            return DispatchInputArray<GLfloat>(call, 3,
+            return DispatchInputArray<GLfloat>(call, 3, profileSample,
                 [](GLint l, GLsizei c, const GLfloat *v) { glUniform3fv(l, c, v); });
         case LC32OpenGLESOpUniform4fv:
-            return DispatchInputArray<GLfloat>(call, 4,
+            return DispatchInputArray<GLfloat>(call, 4, profileSample,
                 [](GLint l, GLsizei c, const GLfloat *v) { glUniform4fv(l, c, v); });
         case LC32OpenGLESOpUniform1iv:
-            return DispatchInputArray<GLint>(call, 1,
+            return DispatchInputArray<GLint>(call, 1, profileSample,
                 [](GLint l, GLsizei c, const GLint *v) { glUniform1iv(l, c, v); });
         case LC32OpenGLESOpUniform2iv:
-            return DispatchInputArray<GLint>(call, 2,
+            return DispatchInputArray<GLint>(call, 2, profileSample,
                 [](GLint l, GLsizei c, const GLint *v) { glUniform2iv(l, c, v); });
         case LC32OpenGLESOpUniform3iv:
-            return DispatchInputArray<GLint>(call, 3,
+            return DispatchInputArray<GLint>(call, 3, profileSample,
                 [](GLint l, GLsizei c, const GLint *v) { glUniform3iv(l, c, v); });
         case LC32OpenGLESOpUniform4iv:
-            return DispatchInputArray<GLint>(call, 4,
+            return DispatchInputArray<GLint>(call, 4, profileSample,
                 [](GLint l, GLsizei c, const GLint *v) { glUniform4iv(l, c, v); });
         case LC32OpenGLESOpUniform1uiv:
-            return DispatchInputArray<GLuint>(call, 1,
+            return DispatchInputArray<GLuint>(call, 1, profileSample,
                 [](GLint l, GLsizei c, const GLuint *v) { glUniform1uiv(l, c, v); });
         case LC32OpenGLESOpUniform2uiv:
-            return DispatchInputArray<GLuint>(call, 2,
+            return DispatchInputArray<GLuint>(call, 2, profileSample,
                 [](GLint l, GLsizei c, const GLuint *v) { glUniform2uiv(l, c, v); });
         case LC32OpenGLESOpUniform3uiv:
-            return DispatchInputArray<GLuint>(call, 3,
+            return DispatchInputArray<GLuint>(call, 3, profileSample,
                 [](GLint l, GLsizei c, const GLuint *v) { glUniform3uiv(l, c, v); });
         case LC32OpenGLESOpUniform4uiv:
-            return DispatchInputArray<GLuint>(call, 4,
+            return DispatchInputArray<GLuint>(call, 4, profileSample,
                 [](GLint l, GLsizei c, const GLuint *v) { glUniform4uiv(l, c, v); });
         case LC32OpenGLESOpProgramUniform1fvEXT:
-            return DispatchProgramUniformArray<GLfloat>(call, 1,
+            return DispatchProgramUniformArray<GLfloat>(call, 1, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLfloat *v) {
                     glProgramUniform1fvEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform2fvEXT:
-            return DispatchProgramUniformArray<GLfloat>(call, 2,
+            return DispatchProgramUniformArray<GLfloat>(call, 2, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLfloat *v) {
                     glProgramUniform2fvEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform3fvEXT:
-            return DispatchProgramUniformArray<GLfloat>(call, 3,
+            return DispatchProgramUniformArray<GLfloat>(call, 3, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLfloat *v) {
                     glProgramUniform3fvEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform4fvEXT:
-            return DispatchProgramUniformArray<GLfloat>(call, 4,
+            return DispatchProgramUniformArray<GLfloat>(call, 4, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLfloat *v) {
                     glProgramUniform4fvEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform1ivEXT:
-            return DispatchProgramUniformArray<GLint>(call, 1,
+            return DispatchProgramUniformArray<GLint>(call, 1, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLint *v) {
                     glProgramUniform1ivEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform2ivEXT:
-            return DispatchProgramUniformArray<GLint>(call, 2,
+            return DispatchProgramUniformArray<GLint>(call, 2, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLint *v) {
                     glProgramUniform2ivEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform3ivEXT:
-            return DispatchProgramUniformArray<GLint>(call, 3,
+            return DispatchProgramUniformArray<GLint>(call, 3, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLint *v) {
                     glProgramUniform3ivEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform4ivEXT:
-            return DispatchProgramUniformArray<GLint>(call, 4,
+            return DispatchProgramUniformArray<GLint>(call, 4, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLint *v) {
                     glProgramUniform4ivEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform1uivEXT:
-            return DispatchProgramUniformArray<GLuint>(call, 1,
+            return DispatchProgramUniformArray<GLuint>(call, 1, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLuint *v) {
                     glProgramUniform1uivEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform2uivEXT:
-            return DispatchProgramUniformArray<GLuint>(call, 2,
+            return DispatchProgramUniformArray<GLuint>(call, 2, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLuint *v) {
                     glProgramUniform2uivEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform3uivEXT:
-            return DispatchProgramUniformArray<GLuint>(call, 3,
+            return DispatchProgramUniformArray<GLuint>(call, 3, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLuint *v) {
                     glProgramUniform3uivEXT(p, l, c, v);
                 });
         case LC32OpenGLESOpProgramUniform4uivEXT:
-            return DispatchProgramUniformArray<GLuint>(call, 4,
+            return DispatchProgramUniformArray<GLuint>(call, 4, profileSample,
                 [](GLuint p, GLint l, GLsizei c, const GLuint *v) {
                     glProgramUniform4uivEXT(p, l, c, v);
                 });
@@ -5404,11 +5714,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                           opcode == LC32OpenGLESOpUniformMatrix3fv ? 3 : 4;
             size_t count;
             if(!ReadCount(I(1), side * side, count)) return 0;
-            std::vector<GLfloat> values;
+            SmallBuffer<GLfloat, 64> values;
             if(!ReadGuestArray(U(3), count, values)) return 0;
-            if(side == 2) glUniformMatrix2fv(I(0), I(1), U(2), values.data());
-            else if(side == 3) glUniformMatrix3fv(I(0), I(1), U(2), values.data());
-            else glUniformMatrix4fv(I(0), I(1), U(2), values.data());
+            if(side == 2) LC32_GL_TIME_NATIVE(glUniformMatrix2fv(I(0), I(1), U(2), values.Data()));
+            else if(side == 3) LC32_GL_TIME_NATIVE(glUniformMatrix3fv(I(0), I(1), U(2), values.Data()));
+            else LC32_GL_TIME_NATIVE(glUniformMatrix4fv(I(0), I(1), U(2), values.Data()));
             return 0;
         }
         case LC32OpenGLESOpProgramUniformMatrix2fvEXT:
@@ -5420,17 +5730,17 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 opcode == LC32OpenGLESOpProgramUniformMatrix3fvEXT ? 3 : 4;
             size_t elementCount;
             if(!ReadCount(I(2), side * side, elementCount)) return 0;
-            std::vector<GLfloat> values;
+            SmallBuffer<GLfloat, 64> values;
             if(!ReadGuestArray(U(4), elementCount, values)) return 0;
             if(side == 2)
                 glProgramUniformMatrix2fvEXT(U(0), I(1), I(2), U(3),
-                    values.data());
+                    values.Data());
             else if(side == 3)
                 glProgramUniformMatrix3fvEXT(U(0), I(1), I(2), U(3),
-                    values.data());
+                    values.Data());
             else
                 glProgramUniformMatrix4fvEXT(U(0), I(1), I(2), U(3),
-                    values.data());
+                    values.Data());
             return 0;
         }
         case LC32OpenGLESOpUniformMatrix2x3fv:
@@ -5456,20 +5766,20 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             }
             size_t elementCount;
             if(!ReadCount(I(1), width * height, elementCount)) return 0;
-            std::vector<GLfloat> values;
+            SmallBuffer<GLfloat, 64> values;
             if(!ReadGuestArray(U(3), elementCount, values)) return 0;
             if(width == 2 && height == 3)
-                glUniformMatrix2x3fv(I(0), I(1), U(2), values.data());
+                glUniformMatrix2x3fv(I(0), I(1), U(2), values.Data());
             else if(width == 2 && height == 4)
-                glUniformMatrix2x4fv(I(0), I(1), U(2), values.data());
+                glUniformMatrix2x4fv(I(0), I(1), U(2), values.Data());
             else if(width == 3 && height == 2)
-                glUniformMatrix3x2fv(I(0), I(1), U(2), values.data());
+                glUniformMatrix3x2fv(I(0), I(1), U(2), values.Data());
             else if(width == 3 && height == 4)
-                glUniformMatrix3x4fv(I(0), I(1), U(2), values.data());
+                glUniformMatrix3x4fv(I(0), I(1), U(2), values.Data());
             else if(width == 4 && height == 2)
-                glUniformMatrix4x2fv(I(0), I(1), U(2), values.data());
+                glUniformMatrix4x2fv(I(0), I(1), U(2), values.Data());
             else
-                glUniformMatrix4x3fv(I(0), I(1), U(2), values.data());
+                glUniformMatrix4x3fv(I(0), I(1), U(2), values.Data());
             return 0;
         }
         case LC32OpenGLESOpProgramUniformMatrix2x3fvEXT:
@@ -5499,20 +5809,20 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             }
             size_t elementCount;
             if(!ReadCount(I(2), width * height, elementCount)) return 0;
-            std::vector<GLfloat> values;
+            SmallBuffer<GLfloat, 64> values;
             if(!ReadGuestArray(U(4), elementCount, values)) return 0;
             if(width == 2 && height == 3)
-                glProgramUniformMatrix2x3fvEXT(U(0), I(1), I(2), U(3), values.data());
+                glProgramUniformMatrix2x3fvEXT(U(0), I(1), I(2), U(3), values.Data());
             else if(width == 2 && height == 4)
-                glProgramUniformMatrix2x4fvEXT(U(0), I(1), I(2), U(3), values.data());
+                glProgramUniformMatrix2x4fvEXT(U(0), I(1), I(2), U(3), values.Data());
             else if(width == 3 && height == 2)
-                glProgramUniformMatrix3x2fvEXT(U(0), I(1), I(2), U(3), values.data());
+                glProgramUniformMatrix3x2fvEXT(U(0), I(1), I(2), U(3), values.Data());
             else if(width == 3 && height == 4)
-                glProgramUniformMatrix3x4fvEXT(U(0), I(1), I(2), U(3), values.data());
+                glProgramUniformMatrix3x4fvEXT(U(0), I(1), I(2), U(3), values.Data());
             else if(width == 4 && height == 2)
-                glProgramUniformMatrix4x2fvEXT(U(0), I(1), I(2), U(3), values.data());
+                glProgramUniformMatrix4x2fvEXT(U(0), I(1), I(2), U(3), values.Data());
             else
-                glProgramUniformMatrix4x3fvEXT(U(0), I(1), I(2), U(3), values.data());
+                glProgramUniformMatrix4x3fvEXT(U(0), I(1), I(2), U(3), values.Data());
             return 0;
         }
         case LC32OpenGLESOpDrawRangeElements: {
@@ -5530,9 +5840,9 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 if(!EnabledClientArrays().empty() &&
                    !StageClientArraysForElementBuffer(U(4), count, U(5), 1,
                         staged)) return 0;
-                glDrawRangeElements(U(0), U(1), U(2), count, U(4),
+                LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4),
                     reinterpret_cast<const void *>(
-                        static_cast<uintptr_t>(U(5))));
+                        static_cast<uintptr_t>(U(5)))));
                 return 0;
             }
             const size_t elementSize = IndexElementSize(U(4));
@@ -5544,7 +5854,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             std::vector<uint8_t> indices;
             if(!ReadGuestBytes(U(5), byteCount, indices)) return 0;
             if(!count) {
-                glDrawRangeElements(U(0), U(1), U(2), count, U(4), nullptr);
+                LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4), nullptr));
                 return 0;
             }
             size_t maximumIndex;
@@ -5555,8 +5865,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             }
             std::vector<StagedClientArray> staged;
             if(hasIndex && !StageClientArrays(maximumIndex, staged)) return 0;
-            glDrawRangeElements(U(0), U(1), U(2), count, U(4),
-                indices.data());
+            LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4),
+                indices.data()));
             return 0;
         }
         case LC32OpenGLESOpDrawElements: {
@@ -5571,8 +5881,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                         staged)) return 0;
                 if(GLAttribCheckSkipsDraw("DrawElements, element buffer"))
                     return 0;
-                glDrawElements(U(0), I(1), U(2),
-                    reinterpret_cast<const void *>(static_cast<uintptr_t>(U(3))));
+                LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2),
+                    reinterpret_cast<const void *>(static_cast<uintptr_t>(U(3)))));
                 return 0;
             }
             size_t elementSize = IndexElementSize(U(2));
@@ -5584,7 +5894,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             std::vector<uint8_t> indices;
             if(!ReadGuestBytes(U(3), count, indices)) return 0;
             if(I(1) == 0) {
-                glDrawElements(U(0), I(1), U(2), nullptr);
+                LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2), nullptr));
                 return 0;
             }
             size_t maximumIndex;
@@ -5597,7 +5907,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             if(hasIndex && !StageClientArrays(maximumIndex, staged)) return 0;
             if(GLAttribCheckSkipsDraw("DrawElements, client indices"))
                 return 0;
-            glDrawElements(U(0), I(1), U(2), indices.data());
+            LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2), indices.data()));
             return 0;
         }
         case LC32OpenGLESOpDrawElementsInstancedEXT: {
@@ -5616,8 +5926,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                     ? reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(3)))
                     : nullptr;
-                glDrawElementsInstancedEXT(U(0), count, U(2), indices,
-                    instanceCount);
+                LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2), indices,
+                    instanceCount));
                 return 0;
             }
             if(binding) {
@@ -5625,9 +5935,9 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 if(!EnabledClientArrays().empty() &&
                    !StageClientArraysForElementBuffer(U(2), count, U(3),
                         static_cast<size_t>(instanceCount), staged)) return 0;
-                glDrawElementsInstancedEXT(U(0), count, U(2),
+                LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2),
                     reinterpret_cast<const void *>(
-                        static_cast<uintptr_t>(U(3))), instanceCount);
+                        static_cast<uintptr_t>(U(3))), instanceCount));
                 return 0;
             }
             const size_t elementSize = IndexElementSize(U(2));
@@ -5647,8 +5957,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             std::vector<StagedClientArray> staged;
             if(hasIndex && !StageClientArrays(maximumIndex,
                     static_cast<size_t>(instanceCount), staged)) return 0;
-            glDrawElementsInstancedEXT(U(0), count, U(2), indices.data(),
-                instanceCount);
+            LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2), indices.data(),
+                instanceCount));
             return 0;
         }
         case LC32OpenGLESOpVertexAttribPointer: {
@@ -5667,10 +5977,10 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                     "%d, 0x%x) ARRAY_BUFFER %d valid %d\n", U(0), I(1), U(2),
                     U(3), I(4), U(5), binding, valid);
             if(!valid) {
-                glVertexAttribPointer(U(0), I(1), U(2), U(3), I(4), binding
+                LC32_GL_TIME_NATIVE(glVertexAttribPointer(U(0), I(1), U(2), U(3), I(4), binding
                     ? reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(5)))
-                    : nullptr);
+                    : nullptr));
                 return 0;
             }
             if(!binding) {
@@ -5686,15 +5996,15 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 RememberVertexAttribPointer(&descriptor, descriptor.index);
                 /* Preserve the host-side metadata without retaining a guest
                  * address that is meaningless in the host address space. */
-                glVertexAttribPointer(descriptor.index, descriptor.size,
+                LC32_GL_TIME_NATIVE(glVertexAttribPointer(descriptor.index, descriptor.size,
                     descriptor.type, descriptor.normalized,
-                    descriptor.stride, nullptr);
+                    descriptor.stride, nullptr));
                 return 0;
             }
             RememberVertexAttribPointer(nullptr, U(0));
             GLAttribCheckNotePointer(U(0), binding, U(5));
-            glVertexAttribPointer(U(0), I(1), U(2), U(3), I(4),
-                reinterpret_cast<const void *>(static_cast<uintptr_t>(U(5))));
+            LC32_GL_TIME_NATIVE(glVertexAttribPointer(U(0), I(1), U(2), U(3), I(4),
+                reinterpret_cast<const void *>(static_cast<uintptr_t>(U(5)))));
             return 0;
         }
         case LC32OpenGLESOpVertexAttrib1fv:
@@ -5961,27 +6271,27 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
         }
         case LC32OpenGLESOpMultMatrixf: {
             REQUIRE(1);
-            std::vector<GLfloat> matrix;
+            SmallBuffer<GLfloat, 16> matrix;
             if(!ReadGuestArray(U(0), 16, matrix)) return 0;
-            glMultMatrixf(matrix.data());
+            LC32_GL_TIME_NATIVE(glMultMatrixf(matrix.Data()));
             return 0;
         }
         case LC32OpenGLESOpLoadMatrixf: {
             REQUIRE(1);
-            std::vector<GLfloat> matrix;
+            SmallBuffer<GLfloat, 16> matrix;
             if(!ReadGuestArray(U(0), 16, matrix)) return 0;
-            glLoadMatrixf(matrix.data());
+            LC32_GL_TIME_NATIVE(glLoadMatrixf(matrix.Data()));
             return 0;
         }
         case LC32OpenGLESOpMultMatrixx:
         case LC32OpenGLESOpLoadMatrixx: {
             REQUIRE(1);
-            std::vector<GLfixed> matrix;
+            SmallBuffer<GLfixed, 16> matrix;
             if(!ReadGuestArray(U(0), 16, matrix)) return 0;
             if(opcode == LC32OpenGLESOpMultMatrixx)
-                glMultMatrixx(matrix.data());
+                glMultMatrixx(matrix.Data());
             else
-                glLoadMatrixx(matrix.data());
+                glLoadMatrixx(matrix.Data());
             return 0;
         }
         case LC32OpenGLESOpDrawTexfvOES:
@@ -6095,9 +6405,9 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
             REQUIRE(3);
             size_t count;
             if(!ReadCount(I(1), 1, count)) return 0;
-            std::vector<GLenum> attachments;
+            SmallBuffer<GLenum, 16> attachments;
             if(!ReadGuestArray(U(2), count, attachments)) return 0;
-            glDiscardFramebufferEXT(U(0), I(1), attachments.data());
+            LC32_GL_TIME_NATIVE(glDiscardFramebufferEXT(U(0), I(1), attachments.Data()));
             return 0;
         }
         case LC32OpenGLESOpColorPointer:
@@ -6120,11 +6430,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                         static_cast<uintptr_t>(U(3)))
                     : nullptr;
                 if(kind == ClientArrayKind::Color)
-                    glColorPointer(I(0), U(1), I(2), pointer);
+                    LC32_GL_TIME_NATIVE(glColorPointer(I(0), U(1), I(2), pointer));
                 else if(kind == ClientArrayKind::TexCoord)
-                    glTexCoordPointer(I(0), U(1), I(2), pointer);
+                    LC32_GL_TIME_NATIVE(glTexCoordPointer(I(0), U(1), I(2), pointer));
                 else
-                    glVertexPointer(I(0), U(1), I(2), pointer);
+                    LC32_GL_TIME_NATIVE(glVertexPointer(I(0), U(1), I(2), pointer));
                 return 0;
             }
             if(!binding) {
@@ -6137,22 +6447,22 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall) {
                 descriptor.valid = true;
                 RememberClientPointer(&descriptor, kind);
                 if(kind == ClientArrayKind::Color)
-                    glColorPointer(I(0), U(1), I(2), nullptr);
+                    LC32_GL_TIME_NATIVE(glColorPointer(I(0), U(1), I(2), nullptr));
                 else if(kind == ClientArrayKind::TexCoord)
-                    glTexCoordPointer(I(0), U(1), I(2), nullptr);
+                    LC32_GL_TIME_NATIVE(glTexCoordPointer(I(0), U(1), I(2), nullptr));
                 else
-                    glVertexPointer(I(0), U(1), I(2), nullptr);
+                    LC32_GL_TIME_NATIVE(glVertexPointer(I(0), U(1), I(2), nullptr));
                 return 0;
             }
             RememberClientPointer(nullptr, kind);
             const GLvoid *pointer = reinterpret_cast<const GLvoid *>(
                 static_cast<uintptr_t>(U(3)));
             if(kind == ClientArrayKind::Color)
-                glColorPointer(I(0), U(1), I(2), pointer);
+                LC32_GL_TIME_NATIVE(glColorPointer(I(0), U(1), I(2), pointer));
             else if(kind == ClientArrayKind::TexCoord)
-                glTexCoordPointer(I(0), U(1), I(2), pointer);
+                LC32_GL_TIME_NATIVE(glTexCoordPointer(I(0), U(1), I(2), pointer));
             else
-                glVertexPointer(I(0), U(1), I(2), pointer);
+                LC32_GL_TIME_NATIVE(glVertexPointer(I(0), U(1), I(2), pointer));
             return 0;
         }
         default:

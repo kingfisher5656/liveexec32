@@ -1658,6 +1658,56 @@ int ReplaceGuestMemoryRangeWithPrivateCopy(
     return 0;
 }
 
+const char *Dynarmic_direct_read_page_span(
+        u32 guestAddress, size_t *availableBytes) {
+    if (availableBytes != nullptr) {
+        *availableBytes = 0;
+    }
+    if (!guestAddress || availableBytes == nullptr ||
+            !CurrentThreadInGuestVmEpoch() ||
+            sharedHandle.page_table == nullptr) {
+        return nullptr;
+    }
+    const u64 pageIdx = static_cast<u64>(guestAddress) >> DYN_PAGE_BITS;
+    if (pageIdx >= sharedHandle.num_page_table_entries) {
+        return nullptr;
+    }
+    const uintptr_t entry = reinterpret_cast<uintptr_t>(
+        __atomic_load_n(
+            &sharedHandle.page_table[pageIdx],
+            __ATOMIC_ACQUIRE));
+    if (entry == 0 || GuestPageEverExternal(pageIdx)) {
+        return nullptr;
+    }
+    const size_t pageOffset = guestAddress & DYN_PAGE_MASK;
+    *availableBytes = DYN_PAGE_SIZE - pageOffset;
+    return reinterpret_cast<const char *>(
+        entry + static_cast<uintptr_t>(guestAddress));
+}
+
+bool Dynarmic_read_guest_memory_checked(
+        u64 address, void *destination, size_t size) {
+    if (!GuestAddressRangeIsValid32(address, size)) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    if (destination == nullptr) {
+        return false;
+    }
+    size_t spanBytes = 0;
+    if (const char *span = Dynarmic_direct_read_page_span(
+            static_cast<u32>(address), &spanBytes)) {
+        if (spanBytes >= size) {
+            memcpy(destination, span, size);
+            return true;
+        }
+    }
+    return read_guest_memory_with_permissions(
+        address, destination, size, PROT_READ);
+}
+
 /*
  * Class:     com_github_unidbg_arm_backend_dynarmic_Dynarmic
  * Method:    mem_read

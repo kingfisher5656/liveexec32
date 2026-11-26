@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -2581,51 +2582,29 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
     }
     if(host_cmd & SEL_RETURN_STRUCT) {
         host_cmd &= ~SEL_RETURN_STRUCT;
-        structPtr = Dynarmic_current_user_callbacks()->MemoryRead32(va_args);
-        structLen = Dynarmic_current_user_callbacks()->MemoryRead32(va_args += sizeof(u32));
-        va_args += sizeof(u32);
+        u32 header[2] = {};
+        if(Dynarmic_read_guest_memory_checked(va_args, header, sizeof(header))) {
+            structPtr = header[0];
+            structLen = header[1];
+        } else {
+            if(va_args > UINT32_MAX - (sizeof(header) - 1)) {
+                fprintf(stderr,
+                    "LC32: overflowing struct-return header address 0x%llx\n",
+                    (unsigned long long)va_args);
+                return 0;
+            }
+            structPtr = Dynarmic_current_user_callbacks()->MemoryRead32(
+                static_cast<u32>(va_args));
+            structLen = Dynarmic_current_user_callbacks()->MemoryRead32(
+                static_cast<u32>(va_args + sizeof(u32)));
+        }
+        va_args += sizeof(header);
     }
     host_cmd &= ~SEL_RETURN_GUEST_OBJECT;
     host_cmd &= ~SEL_ALLOW_UNMAPPED_RECEIVER;
 
-    // FIXME: how to read number of args for variadic methods and translate its values?
-    u64 args[9] = {
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64)),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64)),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64)),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64)),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64)),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64)),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64)),
-        Dynarmic_current_user_callbacks()->MemoryRead64(va_args += sizeof(u64))
-    };
-
-    /*
-     * A guest pointer cannot be handed to an ARM64 Objective-C method. Shim
-     * sources tag pointers to 64-bit guest temporaries; substitute native
-     * stack storage for objc_msgSend and copy the result back afterwards.
-     * Looking at the method encoding prevents a negative scalar or floating
-     * bit pattern from ever being mistaken for an indirect argument.
-     */
-    u32 indirectGuestStorage[9] = {};
-    u64 indirectHostStorage[9] = {};
-    u32 sizedIndirectGuestStorage[9] = {};
-    u32 sizedIndirectSize[9] = {};
-    alignas(16) std::array<u8,
-        LC32_HOST_SIZED_INDIRECT_MAX_SIZE> sizedIndirectHostStorage[9] = {};
-    enum class LC32FloatingIndirectType : u8 {
-        None,
-        Float,
-        Double,
-    };
-    LC32FloatingIndirectType floatingIndirectType[9] = {};
-    float floatingIndirectFloatStorage[9] = {};
-    double floatingIndirectDoubleStorage[9] = {};
-    alignas(16) std::array<u8, 64> aggregateHostStorage[9] = {};
-    size_t aggregateHostSize[9] = {};
-    std::unique_ptr<u64[]> objectArrayHostStorage[9];
     SEL selector = (SEL)host_cmd;
+    const SEL originalSelector = selector;
     LC32HostInvocationReceiverGuard receiverGuard;
     id receiver = nil;
     if(!LC32AcquireHostInvocationReceiver(
@@ -2638,12 +2617,6 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
             (unsigned long long)host_self);
         return 0;
     }
-    /*
-     * Diagnostics may inspect the native retain count. Keep them after the
-     * registry's weak promotion so a stale receiver is never dereferenced by
-     * tracing before the dispatch path has rejected it.
-    */
-    LC32OperationTraceRawSelector(receiver, selector, args[0]);
     Class dispatchClass = object_getClass(receiver);
     const bool invokeSuper = [(id)dispatchClass isGuestClass];
     if(invokeSuper && !class_isMetaClass(dispatchClass)) {
@@ -2665,6 +2638,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
             dispatchClass, selector);
         if(retainMethod && method_getImplementation(retainMethod) ==
                 (IMP)&LC32GuestMirrorRetain) {
+            LC32OperationTraceRawSelector(receiver, originalSelector, 0);
             /* objc_msgSendSuper to NSObject's retain does not reliably add a
              * root reference when the receiver's class implements custom RR.
              * This is the native half of an ordinary guest retain, so invoke
@@ -2678,6 +2652,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
             dispatchClass, selector);
         if(releaseMethod && method_getImplementation(releaseMethod) ==
                 (IMP)&LC32GuestMirrorRelease) {
+            LC32OperationTraceRawSelector(receiver, originalSelector, 0);
             /* Ordinary guest-to-host sends deliberately start at the first
              * native superclass, avoiding recursion into guest methods. The
              * synthesized mirror's release override is host-only, however,
@@ -2721,6 +2696,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
         }
     }
     if(!method && invokeSuper) {
+        LC32OperationTraceRawSelector(receiver, originalSelector, 0);
         /*
          * A guest-backed mirror forwarded this message to the host, but the
          * host class chain has no implementation for it.  The guest framework
@@ -2760,6 +2736,94 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
         : [forwardingSignature numberOfArguments];
     const bool hasMethodSignature =
         (method || forwardingSignature) && methodArgumentCount >= 2;
+
+    // Read all 9 guest argument slots in ONE permission-checked copy (one
+    // guestVmMutex lock while the VM epoch is parked, rather than nine).
+    // Fixed 0-arg methods skip reading guest stack memory entirely. If the
+    // 72-byte bulk read fails (e.g. a guard page within 72 bytes of SP), fall
+    // back to reading readable slots one by one up to the first unreadable
+    // slot, faulting via MemoryRead64 only if a required argument slot itself
+    // is unreadable.
+    const bool usesHostStackVarargs =
+        LC32SelectorUsesHostStackVarargs(selector);
+    u64 args[9] = {};
+    size_t slotsRead = 0;
+    auto faultGuestArgSlot = [&](size_t slotIndex) {
+        const u64 faultAddr = va_args + slotIndex * sizeof(u64);
+        if(faultAddr > UINT32_MAX - (sizeof(u64) - 1)) {
+            fprintf(stderr,
+                "LC32: overflowing selector argument address 0x%llx for %s\n",
+                (unsigned long long)faultAddr,
+                selector ? sel_getName(selector) : "<null selector>");
+            return;
+        }
+        (void)Dynarmic_current_user_callbacks()->MemoryRead64(
+            static_cast<u32>(faultAddr));
+    };
+    const bool isZeroArgFixedMethod =
+        hasMethodSignature && !usesHostStackVarargs && methodArgumentCount == 2;
+    if(!isZeroArgFixedMethod) {
+        if(Dynarmic_read_guest_memory_checked(va_args, args, sizeof(args))) {
+            slotsRead = 9;
+        } else {
+            for(size_t i = 0; i < 9; i++) {
+                const u64 slotAddr = va_args + i * sizeof(u64);
+                if(!Dynarmic_read_guest_memory_checked(slotAddr, &args[i],
+                                                       sizeof(u64))) {
+                    break;
+                }
+                slotsRead = i + 1;
+            }
+            const size_t minRequiredSlots = hasMethodSignature
+                ? (size_t)MIN(methodArgumentCount - 2, (NSUInteger)9)
+                : 1u;
+            if(slotsRead < minRequiredSlots) {
+                faultGuestArgSlot(slotsRead);
+                return 0;
+            }
+        }
+    }
+    /*
+     * Diagnostics may inspect the native retain count. Keep them after the
+     * registry's weak promotion and argument read so a stale receiver or
+     * absent first argument is never dereferenced.
+     */
+    LC32OperationTraceRawSelector(receiver, originalSelector,
+                                  slotsRead ? args[0] : 0);
+
+    /*
+     * A guest pointer cannot be handed to an ARM64 Objective-C method. Shim
+     * sources tag pointers to 64-bit guest temporaries; substitute native
+     * stack storage for objc_msgSend and copy the result back afterwards.
+     * Instantiate this ~2 KiB scratch block lazily only when a tagged indirect,
+     * aggregate, or object-array argument is present (invocation-local so
+     * recursive callbacks remain isolated).
+     */
+    enum class LC32FloatingIndirectType : u8 {
+        None,
+        Float,
+        Double,
+    };
+    struct LC32HostSelectorScratch {
+        u32 indirectGuestStorage[9] = {};
+        u64 indirectHostStorage[9] = {};
+        u32 sizedIndirectGuestStorage[9] = {};
+        u32 sizedIndirectSize[9] = {};
+        alignas(16) std::array<u8, LC32_HOST_SIZED_INDIRECT_MAX_SIZE>
+            sizedIndirectHostStorage[9];
+        LC32FloatingIndirectType floatingIndirectType[9] = {};
+        float floatingIndirectFloatStorage[9] = {};
+        double floatingIndirectDoubleStorage[9] = {};
+        alignas(16) std::array<u8, 64> aggregateHostStorage[9];
+        size_t aggregateHostSize[9] = {};
+        std::unique_ptr<u64[]> objectArrayHostStorage[9];
+        bool hasIndirectWriteback = false;
+    };
+    std::optional<LC32HostSelectorScratch> scratch;
+    auto ensureScratch = [&]() -> LC32HostSelectorScratch & {
+        if(!scratch.has_value()) scratch.emplace();
+        return *scratch;
+    };
     auto copyArgumentType = [&](NSUInteger index) -> char * {
         if(method) return method_copyArgumentType(method, (unsigned int)index);
         if(!forwardingSignature || index >= methodArgumentCount) return nullptr;
@@ -2773,6 +2837,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
         return type ? strdup(type) : nullptr;
     };
 
+    bool hasTaggedAggregate = false;
     if(hasMethodSignature) {
         const unsigned int argumentCount =
             (unsigned int)MIN(methodArgumentCount - 2, (NSUInteger)9);
@@ -2951,29 +3016,30 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                 }
 
                 if(descriptor.count) {
-                    objectArrayHostStorage[index].reset(
+                    auto &s = ensureScratch();
+                    s.objectArrayHostStorage[index].reset(
                         new(std::nothrow) u64[descriptor.count]);
-                    if(!objectArrayHostStorage[index]) {
+                    if(!s.objectArrayHostStorage[index]) {
                         printf("LC32: cannot allocate object-array argument "
                                "%u of %s\n", index,
                                sel_getName(selector));
                         free(argumentType);
                         return 0;
                     }
+                    if(objectBytes && Dynarmic_mem_1read(
+                            (u32)objectAddress, (size_t)objectBytes,
+                            reinterpret_cast<char *>(
+                                s.objectArrayHostStorage[index].get())) != 0) {
+                        printf("LC32: unreadable object-array descriptor for "
+                               "argument %u of %s\n", index,
+                               sel_getName(selector));
+                        free(argumentType);
+                        return 0;
+                    }
+                    args[index] = (u64)s.objectArrayHostStorage[index].get();
+                } else {
+                    args[index] = 0;
                 }
-                if(objectBytes && Dynarmic_mem_1read(
-                        (u32)objectAddress, (size_t)objectBytes,
-                        reinterpret_cast<char *>(
-                            objectArrayHostStorage[index].get())) != 0) {
-                    printf("LC32: unreadable object-array descriptor for "
-                           "argument %u of %s\n", index,
-                           sel_getName(selector));
-                    free(argumentType);
-                    return 0;
-                }
-                args[index] = descriptor.count
-                    ? (u64)objectArrayHostStorage[index].get()
-                    : 0;
                 free(argumentType);
                 continue;
             }
@@ -2991,11 +3057,15 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     NSGetSizeAndAlignment(unqualifiedType, &nativeSize,
                                           &nativeAlignment);
                 }
+                auto &s = ensureScratch();
+                if(nativeSize && nativeSize <= s.aggregateHostStorage[index].size()) {
+                    s.aggregateHostStorage[index].fill(0);
+                }
                 if(!nativeSize || nativeSize >
-                        aggregateHostStorage[index].size() ||
+                        s.aggregateHostStorage[index].size() ||
                    Dynarmic_mem_1read((u32)args[index], nativeSize,
                        reinterpret_cast<char *>(
-                           aggregateHostStorage[index].data())) != 0) {
+                           s.aggregateHostStorage[index].data())) != 0) {
                     printf("LC32: invalid aggregate argument %u of %s "
                            "(size=%lu alignment=%lu)\n", index,
                            sel_getName(selector), (unsigned long)nativeSize,
@@ -3003,14 +3073,16 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     free(argumentType);
                     return 0;
                 }
-                aggregateHostSize[index] = nativeSize;
+                s.aggregateHostSize[index] = nativeSize;
+                hasTaggedAggregate = true;
                 free(argumentType);
                 continue;
             }
             if(isTaggedSizedPointer) {
                 LC32HostSizedIndirectDescriptor descriptor = {};
                 const u32 descriptorAddress = (u32)args[index];
-                const bool validDescriptor =
+                auto &s = ensureScratch();
+                const bool validDescriptorHeader =
                     Dynarmic_mem_1read(descriptorAddress,
                         sizeof(descriptor), reinterpret_cast<char *>(
                             &descriptor)) == 0 &&
@@ -3020,19 +3092,25 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     descriptor.size <=
                         LC32_HOST_SIZED_INDIRECT_MAX_SIZE &&
                     (u64)descriptor.storage + descriptor.size <=
-                        UINT64_C(0x100000000) &&
+                        UINT64_C(0x100000000);
+                if(validDescriptorHeader) {
+                    s.sizedIndirectHostStorage[index].fill(0);
+                }
+                const bool validDescriptor =
+                    validDescriptorHeader &&
                     Dynarmic_mem_1read(descriptor.storage, descriptor.size,
                         reinterpret_cast<char *>(
-                            sizedIndirectHostStorage[index].data())) == 0;
+                            s.sizedIndirectHostStorage[index].data())) == 0;
                 if(!validDescriptor) {
                     printf("LC32: invalid sized-indirect argument %u of %s\n",
                            index, sel_getName(selector));
                     free(argumentType);
                     return 0;
                 }
-                sizedIndirectGuestStorage[index] = descriptor.storage;
-                sizedIndirectSize[index] = descriptor.size;
-                args[index] = (u64)sizedIndirectHostStorage[index].data();
+                s.sizedIndirectGuestStorage[index] = descriptor.storage;
+                s.sizedIndirectSize[index] = descriptor.size;
+                s.hasIndirectWriteback = true;
+                args[index] = (u64)s.sizedIndirectHostStorage[index].data();
                 free(argumentType);
                 continue;
             }
@@ -3046,20 +3124,22 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     free(argumentType);
                     continue;
                 }
-                indirectGuestStorage[index] = guestStorage;
+                auto &s = ensureScratch();
+                s.indirectGuestStorage[index] = guestStorage;
+                s.hasIndirectWriteback = true;
                 if(*unqualifiedPointeeType == 'f') {
-                    floatingIndirectType[index] =
+                    s.floatingIndirectType[index] =
                         LC32FloatingIndirectType::Float;
-                    floatingIndirectFloatStorage[index] =
+                    s.floatingIndirectFloatStorage[index] =
                         (float)canonicalValue;
                     args[index] =
-                        (u64)&floatingIndirectFloatStorage[index];
+                        (u64)&s.floatingIndirectFloatStorage[index];
                 } else {
-                    floatingIndirectType[index] =
+                    s.floatingIndirectType[index] =
                         LC32FloatingIndirectType::Double;
-                    floatingIndirectDoubleStorage[index] = canonicalValue;
+                    s.floatingIndirectDoubleStorage[index] = canonicalValue;
                     args[index] =
-                        (u64)&floatingIndirectDoubleStorage[index];
+                        (u64)&s.floatingIndirectDoubleStorage[index];
                 }
                 free(argumentType);
                 continue;
@@ -3069,14 +3149,17 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
 
             const u32 guestStorage = (u32)args[index];
             args[index] = 0;
+            u64 initialValue = 0;
             if(!guestStorage || Dynarmic_mem_1read(
-                    guestStorage, sizeof(indirectHostStorage[index]),
-                    reinterpret_cast<char *>(
-                        &indirectHostStorage[index])) != 0) {
+                    guestStorage, sizeof(initialValue),
+                    reinterpret_cast<char *>(&initialValue)) != 0) {
                 continue;
             }
-            indirectGuestStorage[index] = guestStorage;
-            args[index] = (u64)&indirectHostStorage[index];
+            auto &s = ensureScratch();
+            s.indirectHostStorage[index] = initialValue;
+            s.indirectGuestStorage[index] = guestStorage;
+            s.hasIndirectWriteback = true;
+            args[index] = (u64)&s.indirectHostStorage[index];
         }
     } else {
         for(size_t index = 0; index < 9; index++) {
@@ -3101,41 +3184,45 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
 
     auto finishIndirectArguments = [&](u64 result) -> u64 {
         if(hook.didInvoke) hook.didInvoke(receiver, args);
+        if(!scratch.has_value() || !scratch->hasIndirectWriteback) {
+            return result;
+        }
+        auto &s = *scratch;
         for(size_t index = 0; index < 9; index++) {
-            if(sizedIndirectGuestStorage[index]) {
+            if(s.sizedIndirectGuestStorage[index]) {
                 (void)Dynarmic_mem_1write(
-                    sizedIndirectGuestStorage[index],
-                    sizedIndirectSize[index],
+                    s.sizedIndirectGuestStorage[index],
+                    s.sizedIndirectSize[index],
                     reinterpret_cast<char *>(
-                        sizedIndirectHostStorage[index].data()));
+                        s.sizedIndirectHostStorage[index].data()));
                 continue;
             }
-            if(!indirectGuestStorage[index]) continue;
-            if(floatingIndirectType[index] ==
+            if(!s.indirectGuestStorage[index]) continue;
+            if(s.floatingIndirectType[index] ==
                     LC32FloatingIndirectType::Float) {
-                floatingIndirectDoubleStorage[index] =
-                    (double)floatingIndirectFloatStorage[index];
+                s.floatingIndirectDoubleStorage[index] =
+                    (double)s.floatingIndirectFloatStorage[index];
                 (void)Dynarmic_mem_1write(
-                    indirectGuestStorage[index],
-                    sizeof(floatingIndirectDoubleStorage[index]),
+                    s.indirectGuestStorage[index],
+                    sizeof(s.floatingIndirectDoubleStorage[index]),
                     reinterpret_cast<char *>(
-                        &floatingIndirectDoubleStorage[index]));
+                        &s.floatingIndirectDoubleStorage[index]));
                 continue;
             }
-            if(floatingIndirectType[index] ==
+            if(s.floatingIndirectType[index] ==
                     LC32FloatingIndirectType::Double) {
                 (void)Dynarmic_mem_1write(
-                    indirectGuestStorage[index],
-                    sizeof(floatingIndirectDoubleStorage[index]),
+                    s.indirectGuestStorage[index],
+                    sizeof(s.floatingIndirectDoubleStorage[index]),
                     reinterpret_cast<char *>(
-                        &floatingIndirectDoubleStorage[index]));
+                        &s.floatingIndirectDoubleStorage[index]));
                 continue;
             }
             (void)Dynarmic_mem_1write(
-                indirectGuestStorage[index],
-                sizeof(indirectHostStorage[index]),
+                s.indirectGuestStorage[index],
+                sizeof(s.indirectHostStorage[index]),
                 reinterpret_cast<char *>(
-                    &indirectHostStorage[index]));
+                    &s.indirectHostStorage[index]));
         }
         return result;
     };
@@ -3194,8 +3281,10 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     floatingArguments[floatingArgumentCount++] = args[index];
                     break;
                 case '{': {
-                    const size_t nativeSize = aggregateHostSize[index];
+                    const size_t nativeSize =
+                        scratch.has_value() ? scratch->aggregateHostSize[index] : 0;
                     if(!nativeSize) {
+                        // Legacy untagged by-value aggregate from older guest shims.
                         useTypedScalarArguments = false;
                         break;
                     }
@@ -3217,7 +3306,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                         }
                         NSRange range;
                         memcpy(&range,
-                               aggregateHostStorage[index].data(),
+                               scratch->aggregateHostStorage[index].data(),
                                sizeof(range));
                         integerArguments[integerArgumentCount++] =
                             (u64)range.location;
@@ -3232,7 +3321,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                         if(floatingArgumentCount + elementCount > 8) {
                             /* AAPCS64 spills the whole HFA when it does not
                              * fit. The fixed trampoline has no typed FP stack
-                             * path yet, so reject instead of corrupting it. */
+                             * path yet, so fall back (or reject if tagged). */
                             useTypedScalarArguments = false;
                             break;
                         }
@@ -3240,15 +3329,19 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                                 element++) {
                             memcpy(&floatingArguments[
                                        floatingArgumentCount++],
-                                   aggregateHostStorage[index].data() +
+                                   scratch->aggregateHostStorage[index].data() +
                                        element * sizeof(double),
                                    sizeof(double));
                         }
                         break;
                     }
                     if(nativeSize > 16) {
+                        if(integerArgumentCount >= 9) {
+                            useTypedScalarArguments = false;
+                            break;
+                        }
                         integerArguments[integerArgumentCount++] =
-                            (u64)aggregateHostStorage[index].data();
+                            (u64)scratch->aggregateHostStorage[index].data();
                         break;
                     }
                     useTypedScalarArguments = false;
@@ -3272,6 +3365,10 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                 case 'l':
                 case 'q':
                 case 's':
+                    if(integerArgumentCount >= 9) {
+                        useTypedScalarArguments = false;
+                        break;
+                    }
                     integerArguments[integerArgumentCount++] = args[index];
                     break;
                 default:
@@ -3279,6 +3376,11 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     break;
             }
             free(argumentType);
+        }
+        if(hasTaggedAggregate && !useTypedScalarArguments) {
+            printf("LC32: cannot pack tagged aggregate arguments for %s\n",
+                   sel_getName(selector));
+            return 0;
         }
         if(useTypedScalarArguments) {
             /*
@@ -3291,17 +3393,76 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
              * at integerArguments[6], so leave the unused register slots
              * empty for the variadic selectors known to cross this bridge.
              */
-            if(LC32SelectorUsesHostStackVarargs(selector) &&
-               integerArgumentCount < 6) {
+            if(usesHostStackVarargs && integerArgumentCount < 6) {
                 integerArgumentCount = 6;
             }
+            bool sawVarargsTerminator =
+                !usesHostStackVarargs ||
+                (argumentCount > 0 && argumentCount <= slotsRead &&
+                 args[argumentCount - 1] == 0);
             for(size_t index = argumentCount;
                     index < 9 && integerArgumentCount < 9; index++) {
-                integerArguments[integerArgumentCount++] = args[index];
+                const u64 slotValue = args[index];
+                integerArguments[integerArgumentCount++] = slotValue;
+                if(usesHostStackVarargs && index < slotsRead && slotValue == 0) {
+                    sawVarargsTerminator = true;
+                }
+            }
+            if(usesHostStackVarargs && !sawVarargsTerminator) {
+                printf("LC32: variadic selector %s exceeds host stack "
+                       "argument slots\n", sel_getName(selector));
+                return 0;
             }
         }
     }
     if(!useTypedScalarArguments) {
+        if(slotsRead < 9) {
+            // Short-read path (guard page within 72 bytes of SP): verify that
+            // every required physical slot was actually read before raw
+            // fallback so truncated legacy aggregates cannot fabricate zeros.
+            size_t requiredRawSlots = 9;
+            if(hasMethodSignature) {
+                const NSUInteger argumentCount = methodArgumentCount - 2;
+                size_t rawSlots = 0;
+                bool exactSize = true;
+                for(unsigned int i = 0; i < argumentCount; i++) {
+                    char *argType = copyArgumentType(i + 2);
+                    const char *unqual = argType;
+                    while(unqual && *unqual && strchr("rnNoORVA", *unqual)) {
+                        unqual++;
+                    }
+                    if(unqual && (*unqual == '{' || *unqual == '(')) {
+                        if(LC32NativeNSRangeType(unqual)) {
+                            if(rawSlots == 5) rawSlots = 6;
+                            rawSlots += 2;
+                        } else {
+                            NSUInteger sz = 0, align = 0;
+                            if(LC32NativeNSDecimalType(unqual)) {
+                                sz = sizeof(NSDecimal);
+                            } else {
+                                NSGetSizeAndAlignment(unqual, &sz, &align);
+                            }
+                            if(!sz) {
+                                exactSize = false;
+                                free(argType);
+                                break;
+                            }
+                            rawSlots += (sz + sizeof(u64) - 1) / sizeof(u64);
+                        }
+                    } else {
+                        rawSlots += 1;
+                    }
+                    free(argType);
+                }
+                if(exactSize) {
+                    requiredRawSlots = std::min<size_t>(rawSlots, 9u);
+                }
+            }
+            if(slotsRead < requiredRawSlots) {
+                faultGuestArgSlot(slotsRead);
+                return 0;
+            }
+        }
         memcpy(integerArguments, args, sizeof(integerArguments));
         memcpy(floatingArguments, args, sizeof(floatingArguments));
     }
