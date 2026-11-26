@@ -2033,13 +2033,30 @@ struct StagedClientArray {
     std::vector<uint8_t> bytes;
 };
 
+struct GLProfileSample {
+    uint64_t nativeTicks = 0;
+    uint64_t stagingSetupTicks = 0;
+    uint64_t stagingCopyTicks = 0;
+    uint64_t stagingGLStateTicks = 0;
+    uint64_t stagingBytes = 0;
+    uint32_t stagingArrays = 0;
+    bool nativeRecorded = false;
+    bool stagingRecorded = false;
+};
+
 bool StageClientArrays(size_t maximumIndex, size_t instanceCount,
                        std::vector<StagedClientArray> &staged,
-                       const std::vector<ClientArrayDescriptor> *only = nullptr) {
+                       const std::vector<ClientArrayDescriptor> *only = nullptr,
+                       GLProfileSample *profileSample = nullptr) {
+    const uint64_t t0 = profileSample ? mach_absolute_time() : 0;
     std::vector<ClientArrayDescriptor> descriptors =
         only ? *only : EnabledClientArrays();
     staged.clear();
     staged.reserve(descriptors.size());
+    const uint64_t t1 = profileSample ? mach_absolute_time() : 0;
+    if(profileSample) {
+        profileSample->stagingSetupTicks += t1 - t0;
+    }
     for(const ClientArrayDescriptor &descriptor : descriptors) {
         const size_t descriptorMaximum =
             descriptor.kind == ClientArrayKind::VertexAttrib &&
@@ -2057,6 +2074,8 @@ bool StageClientArrays(size_t maximumIndex, size_t instanceCount,
     }
 
     if(staged.empty()) return true;
+
+    const uint64_t t2 = profileSample ? mach_absolute_time() : 0;
 
     GLint savedBinding = 0;
     GLint savedClientActiveTexture = GL_TEXTURE0;
@@ -2115,12 +2134,25 @@ bool StageClientArrays(size_t maximumIndex, size_t instanceCount,
     if(changedClientActiveTexture)
         glClientActiveTexture(savedClientActiveTexture);
     glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(savedBinding));
+    if(profileSample) {
+        const uint64_t t3 = mach_absolute_time();
+        uint64_t copiedBytes = 0;
+        for(const StagedClientArray &entry : staged) {
+            copiedBytes += entry.bytes.size();
+        }
+        profileSample->stagingCopyTicks += t2 - t1;
+        profileSample->stagingGLStateTicks += t3 - t2;
+        profileSample->stagingBytes += copiedBytes;
+        profileSample->stagingArrays += static_cast<uint32_t>(staged.size());
+        profileSample->stagingRecorded = true;
+    }
     return true;
 }
 
 bool StageClientArrays(size_t maximumIndex,
-                       std::vector<StagedClientArray> &staged) {
-    return StageClientArrays(maximumIndex, 1, staged);
+                       std::vector<StagedClientArray> &staged,
+                       GLProfileSample *profileSample = nullptr) {
+    return StageClientArrays(maximumIndex, 1, staged, nullptr, profileSample);
 }
 
 bool MaximumIndex(GLenum type, const std::vector<uint8_t> &indices,
@@ -2741,16 +2773,29 @@ std::vector<ClientArrayDescriptor> ClientArraysUsedByProgram() {
  */
 bool StageClientArraysForElementBuffer(GLenum type, GLsizei count,
                                        uintptr_t offset, size_t instanceCount,
-                                       std::vector<StagedClientArray> &staged) {
+                                       std::vector<StagedClientArray> &staged,
+                                       GLProfileSample *profileSample = nullptr) {
+    const uint64_t setupStart = profileSample ? mach_absolute_time() : 0;
     std::vector<ClientArrayDescriptor> descriptors =
         ClientArraysUsedByProgram();
-    if(descriptors.empty()) return true;
+    if(descriptors.empty()) {
+        if(profileSample) {
+            profileSample->stagingSetupTicks +=
+                mach_absolute_time() - setupStart;
+            profileSample->stagingRecorded = true;
+        }
+        return true;
+    }
     size_t maximumIndex = 0;
     bool hasIndex = false;
     if(!BoundElementBufferMaximumIndex(type, count, offset, maximumIndex,
             hasIndex)) {
         SetBridgeError(GL_INVALID_OPERATION);
         return false;
+    }
+    if(profileSample) {
+        profileSample->stagingSetupTicks += mach_absolute_time() - setupStart;
+        profileSample->stagingRecorded = true;
     }
     if(!hasIndex) return true;
     static std::atomic<bool> logged(false);
@@ -2759,7 +2804,7 @@ bool StageClientArraysForElementBuffer(GLenum type, GLsizei count,
             "array(s), indices read back (max %zu)\n", descriptors.size(),
             maximumIndex);
     return StageClientArrays(maximumIndex, instanceCount, staged,
-        &descriptors);
+        &descriptors, profileSample);
 }
 
 bool ReadCount(int32_t signedCount, size_t multiplier, size_t &count) {
@@ -2774,11 +2819,12 @@ bool ReadCount(int32_t signedCount, size_t multiplier, size_t &count) {
 }
 
 // LC32_PROFILE: GL calls per opcode, objects named in Gen*/Delete*-style calls,
-// and exact total vs native-driver timing split on every call (zero overhead
-// when LC32_PROFILE is off). LC32_GL_TIME_NATIVE times only the guest-requested
-// native GL driver call(s); bridge-inserted glGetIntegerv queries and tracking
-// bookkeeping remain outside so bridge = total - native reflects all
-// bridge-attributable overhead.
+// exact total vs native-driver timing split on every call, and client-array
+// staging breakdown (setup vs guest copy vs GL pointer state + bytes staged).
+// No clock reads or profiler locks when LC32_PROFILE is off. LC32_GL_TIME_NATIVE times only the
+// guest-requested native GL driver call(s); bridge-inserted glGetIntegerv
+// queries and tracking bookkeeping remain outside so bridge = total - native
+// reflects all bridge-attributable overhead.
 constexpr uint32_t kProfileOpcodeCount = 512;
 std::atomic<uint64_t> profileOpObjects[kProfileOpcodeCount];
 
@@ -2788,13 +2834,17 @@ struct ProfileOpTiming {
     uint64_t nativeCalls = 0;        // calls that reached LC32_GL_TIME_NATIVE
     uint64_t nativeDriverTicks = 0;  // exact native GL ticks across nativeCalls
 };
+struct ProfileStagingTotals {
+    uint64_t draws = 0;
+    uint64_t arrays = 0;
+    uint64_t bytes = 0;
+    uint64_t setupTicks = 0;
+    uint64_t copyTicks = 0;
+    uint64_t glStateTicks = 0;
+};
 std::mutex profileTimingMutex;
 ProfileOpTiming profileOpTiming[kProfileOpcodeCount];
-
-struct GLProfileSample {
-    uint64_t nativeTicks = 0;
-    bool nativeRecorded = false;
-};
+ProfileStagingTotals profileStagingTotals;
 
 #define LC32_GL_TIME_NATIVE(stmt) do { \
     if(__builtin_expect(profileSample != nullptr, 0)) { \
@@ -3514,6 +3564,7 @@ extern "C" uint32_t LC32_OpenGLES_Dispatch(uint32_t opcode,
 // LC32OpenGLESOp values in GuestFrameworks/OpenGLES/LC32OpenGLESBridge.h.
 extern "C" void LC32_OpenGLES_ProfileReport(double seconds) {
     static ProfileOpTiming lastTiming[kProfileOpcodeCount];
+    static ProfileStagingTotals lastStaging;
     static double ticksToNs = 0.0;
     static double timerPairNs = 0.0;
     if(ticksToNs == 0.0) {
@@ -3531,9 +3582,11 @@ extern "C" void LC32_OpenGLES_ProfileReport(double seconds) {
     }
 
     ProfileOpTiming curTiming[kProfileOpcodeCount];
+    ProfileStagingTotals curStaging;
     {
         std::lock_guard<std::mutex> lock(profileTimingMutex);
         memcpy(curTiming, profileOpTiming, sizeof(curTiming));
+        curStaging = profileStagingTotals;
     }
 
     struct OpWindow {
@@ -3625,6 +3678,36 @@ extern "C" void LC32_OpenGLES_ProfileReport(double seconds) {
                 "LC32PROF   GL ns/call (tot=nat+br):%s\n", breakdown.c_str());
         }
     }
+    const uint64_t dStDraws = curStaging.draws - lastStaging.draws;
+    const uint64_t dStArrays = curStaging.arrays - lastStaging.arrays;
+    const uint64_t dStBytes = curStaging.bytes - lastStaging.bytes;
+    const uint64_t dStSetup = curStaging.setupTicks - lastStaging.setupTicks;
+    const uint64_t dStCopy = curStaging.copyTicks - lastStaging.copyTicks;
+    const uint64_t dStGLState =
+        curStaging.glStateTicks - lastStaging.glStateTicks;
+    lastStaging = curStaging;
+    if(dStDraws && seconds > 0.0) {
+        const double setupNs = (double)dStSetup * ticksToNs;
+        const double copyNs = (double)dStCopy * ticksToNs;
+        const double glStateNs = (double)dStGLState * ticksToNs;
+        const double totNs = setupNs + copyNs + glStateNs;
+        fprintf(stderr,
+            "LC32PROF   GL staging: %.0f draws/s (%.1f arrays/draw, "
+            "%.2f MB/s, %.1f KB/draw): tot %.2fms/s = setup %.2f + "
+            "copy %.2f + glstate %.2f (%.0f ns/draw: %.0f+%.0f+%.0f)\n",
+            (double)dStDraws / seconds,
+            (double)dStArrays / (double)dStDraws,
+            (double)dStBytes / (1024.0 * 1024.0) / seconds,
+            (double)dStBytes / 1024.0 / (double)dStDraws,
+            totNs / 1e6 / seconds,
+            setupNs / 1e6 / seconds,
+            copyNs / 1e6 / seconds,
+            glStateNs / 1e6 / seconds,
+            totNs / (double)dStDraws,
+            setupNs / (double)dStDraws,
+            copyNs / (double)dStDraws,
+            glStateNs / (double)dStDraws);
+    }
 }
 
 extern "C" uint32_t LC32_OpenGLES_DispatchInline(uint32_t opcode,
@@ -3666,6 +3749,14 @@ extern "C" uint32_t LC32_OpenGLES_Dispatch(uint32_t opcode,
         if(sample.nativeRecorded) {
             slot.nativeCalls++;
             slot.nativeDriverTicks += clampedNative;
+        }
+        if(sample.stagingRecorded && sample.nativeRecorded) {
+            profileStagingTotals.draws++;
+            profileStagingTotals.arrays += sample.stagingArrays;
+            profileStagingTotals.bytes += sample.stagingBytes;
+            profileStagingTotals.setupTicks += sample.stagingSetupTicks;
+            profileStagingTotals.copyTicks += sample.stagingCopyTicks;
+            profileStagingTotals.glStateTicks += sample.stagingGLStateTicks;
         }
     }
     return result;
@@ -3970,7 +4061,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             const size_t maximumIndex = static_cast<size_t>(first) +
                 static_cast<size_t>(count) - 1;
             std::vector<StagedClientArray> staged;
-            if(!StageClientArrays(maximumIndex, staged)) return 0;
+            if(!StageClientArrays(maximumIndex, staged, profileSample)) return 0;
             if(GLAttribCheckSkipsDraw("DrawArrays")) return 0;
             LC32_GL_TIME_NATIVE(glDrawArrays(U(0), first, count));
             return 0;
@@ -3993,7 +4084,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 static_cast<size_t>(count) - 1;
             std::vector<StagedClientArray> staged;
             if(!StageClientArrays(maximumIndex,
-                    static_cast<size_t>(instanceCount), staged)) return 0;
+                    static_cast<size_t>(instanceCount), staged, nullptr,
+                    profileSample)) return 0;
             LC32_GL_TIME_NATIVE(glDrawArraysInstancedEXT(U(0), first, count, instanceCount));
             return 0;
         }
@@ -5837,9 +5929,17 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &binding);
             if(binding) {
                 std::vector<StagedClientArray> staged;
-                if(!EnabledClientArrays().empty() &&
-                   !StageClientArraysForElementBuffer(U(4), count, U(5), 1,
-                        staged)) return 0;
+                const uint64_t checkStart =
+                    profileSample ? mach_absolute_time() : 0;
+                const bool hasClientArrays = !EnabledClientArrays().empty();
+                if(hasClientArrays) {
+                    if(profileSample) {
+                        profileSample->stagingSetupTicks +=
+                            mach_absolute_time() - checkStart;
+                    }
+                    if(!StageClientArraysForElementBuffer(U(4), count, U(5), 1,
+                            staged, profileSample)) return 0;
+                }
                 LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4),
                     reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(5)))));
@@ -5852,19 +5952,34 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 return 0;
             }
             std::vector<uint8_t> indices;
+            const uint64_t idxCopyStart =
+                profileSample ? mach_absolute_time() : 0;
             if(!ReadGuestBytes(U(5), byteCount, indices)) return 0;
+            if(profileSample && byteCount) {
+                profileSample->stagingCopyTicks +=
+                    mach_absolute_time() - idxCopyStart;
+                profileSample->stagingBytes += byteCount;
+                profileSample->stagingRecorded = true;
+            }
             if(!count) {
                 LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4), nullptr));
                 return 0;
             }
             size_t maximumIndex;
             bool hasIndex;
+            const uint64_t maxIdxStart =
+                profileSample ? mach_absolute_time() : 0;
             if(!MaximumIndex(U(4), indices, maximumIndex, hasIndex)) {
                 SetBridgeError(GL_INVALID_ENUM);
                 return 0;
             }
+            if(profileSample) {
+                profileSample->stagingSetupTicks +=
+                    mach_absolute_time() - maxIdxStart;
+            }
             std::vector<StagedClientArray> staged;
-            if(hasIndex && !StageClientArrays(maximumIndex, staged)) return 0;
+            if(hasIndex && !StageClientArrays(maximumIndex, staged, profileSample))
+                return 0;
             LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4),
                 indices.data()));
             return 0;
@@ -5876,9 +5991,17 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &binding);
             if(binding) {
                 std::vector<StagedClientArray> staged;
-                if(!EnabledClientArrays().empty() &&
-                   !StageClientArraysForElementBuffer(U(2), I(1), U(3), 1,
-                        staged)) return 0;
+                const uint64_t checkStart =
+                    profileSample ? mach_absolute_time() : 0;
+                const bool hasClientArrays = !EnabledClientArrays().empty();
+                if(hasClientArrays) {
+                    if(profileSample) {
+                        profileSample->stagingSetupTicks +=
+                            mach_absolute_time() - checkStart;
+                    }
+                    if(!StageClientArraysForElementBuffer(U(2), I(1), U(3), 1,
+                            staged, profileSample)) return 0;
+                }
                 if(GLAttribCheckSkipsDraw("DrawElements, element buffer"))
                     return 0;
                 LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2),
@@ -5892,19 +6015,34 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 return 0;
             }
             std::vector<uint8_t> indices;
+            const uint64_t idxCopyStart =
+                profileSample ? mach_absolute_time() : 0;
             if(!ReadGuestBytes(U(3), count, indices)) return 0;
+            if(profileSample && count) {
+                profileSample->stagingCopyTicks +=
+                    mach_absolute_time() - idxCopyStart;
+                profileSample->stagingBytes += count;
+                profileSample->stagingRecorded = true;
+            }
             if(I(1) == 0) {
                 LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2), nullptr));
                 return 0;
             }
             size_t maximumIndex;
             bool hasIndex;
+            const uint64_t maxIdxStart =
+                profileSample ? mach_absolute_time() : 0;
             if(!MaximumIndex(U(2), indices, maximumIndex, hasIndex)) {
                 SetBridgeError(GL_INVALID_ENUM);
                 return 0;
             }
+            if(profileSample) {
+                profileSample->stagingSetupTicks +=
+                    mach_absolute_time() - maxIdxStart;
+            }
             std::vector<StagedClientArray> staged;
-            if(hasIndex && !StageClientArrays(maximumIndex, staged)) return 0;
+            if(hasIndex && !StageClientArrays(maximumIndex, staged, profileSample))
+                return 0;
             if(GLAttribCheckSkipsDraw("DrawElements, client indices"))
                 return 0;
             LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2), indices.data()));
@@ -5932,9 +6070,18 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             if(binding) {
                 std::vector<StagedClientArray> staged;
-                if(!EnabledClientArrays().empty() &&
-                   !StageClientArraysForElementBuffer(U(2), count, U(3),
-                        static_cast<size_t>(instanceCount), staged)) return 0;
+                const uint64_t checkStart =
+                    profileSample ? mach_absolute_time() : 0;
+                const bool hasClientArrays = !EnabledClientArrays().empty();
+                if(hasClientArrays) {
+                    if(profileSample) {
+                        profileSample->stagingSetupTicks +=
+                            mach_absolute_time() - checkStart;
+                    }
+                    if(!StageClientArraysForElementBuffer(U(2), count, U(3),
+                            static_cast<size_t>(instanceCount), staged,
+                            profileSample)) return 0;
+                }
                 LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2),
                     reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(3))), instanceCount));
@@ -5947,16 +6094,31 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 return 0;
             }
             std::vector<uint8_t> indices;
+            const uint64_t idxCopyStart =
+                profileSample ? mach_absolute_time() : 0;
             if(!ReadGuestBytes(U(3), byteCount, indices)) return 0;
+            if(profileSample && byteCount) {
+                profileSample->stagingCopyTicks +=
+                    mach_absolute_time() - idxCopyStart;
+                profileSample->stagingBytes += byteCount;
+                profileSample->stagingRecorded = true;
+            }
             size_t maximumIndex;
             bool hasIndex;
+            const uint64_t maxIdxStart =
+                profileSample ? mach_absolute_time() : 0;
             if(!MaximumIndex(U(2), indices, maximumIndex, hasIndex)) {
                 SetBridgeError(GL_INVALID_ENUM);
                 return 0;
             }
+            if(profileSample) {
+                profileSample->stagingSetupTicks +=
+                    mach_absolute_time() - maxIdxStart;
+            }
             std::vector<StagedClientArray> staged;
             if(hasIndex && !StageClientArrays(maximumIndex,
-                    static_cast<size_t>(instanceCount), staged)) return 0;
+                    static_cast<size_t>(instanceCount), staged, nullptr,
+                    profileSample)) return 0;
             LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2), indices.data(),
                 instanceCount));
             return 0;

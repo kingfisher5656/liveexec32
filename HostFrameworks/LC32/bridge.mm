@@ -2805,6 +2805,9 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
         Double,
     };
     struct LC32HostSelectorScratch {
+        // Explicit empty ctor leaves the two large storage arrays uninitialized
+        // until targeted fill(0) calls write only the used argument slots.
+        LC32HostSelectorScratch() {}
         u32 indirectGuestStorage[9] = {};
         u64 indirectHostStorage[9] = {};
         u32 sizedIndirectGuestStorage[9] = {};
@@ -2920,6 +2923,33 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                 unqualifiedType[0] == '{' &&
                 argumentTag == LC32_GUEST_AGGREGATE_ARGUMENT_TAG &&
                 (u32)args[index] != 0;
+            bool untaggedDesyncsSlots = false;
+            if(!isTaggedAggregate &&
+               strchr("cCsSiIlLqQfdBv*@#:^", unqualifiedType[0]) == nullptr) {
+                bool singleSlot = false;
+                if(unqualifiedType[0] == '{') {
+                    if(LC32NativeNSDecimalType(unqualifiedType)) {
+                        singleSlot = true;
+                    } else {
+                        LC32PODType pod = {};
+                        if(LC32PODStructType(unqualifiedType, true, &pod)) {
+                            const char hfa = LC32PODHomogeneousFloat(&pod);
+                            if(hfa) {
+                                singleSlot = (pod.count == 1);
+                            } else {
+                                singleSlot = (pod.size <= 8 || pod.size > 16);
+                            }
+                        } else {
+                            NSUInteger sz = 0, align = 0;
+                            NSGetSizeAndAlignment(unqualifiedType, &sz, &align);
+                            // Non-POD structs cannot be HFAs, so <= 8 B (1
+                            // GPR) and > 16 B (indirect pointer) take 1 slot.
+                            singleSlot = (sz > 0 && (sz <= 8 || sz > 16));
+                        }
+                    }
+                }
+                untaggedDesyncsSlots = !singleSlot;
+            }
             if(argumentTag == LC32_GUEST_OBJECT_ARRAY_ARGUMENT_TAG &&
                !isTaggedObjectArray) {
                 printf("LC32: refusing object-array argument %u for "
@@ -3077,6 +3107,15 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                 hasTaggedAggregate = true;
                 free(argumentType);
                 continue;
+            }
+            if(untaggedDesyncsSlots) {
+                // This untagged composite/complex can occupy multiple physical
+                // slots in raw args[], so subsequent args[index] entries are
+                // continuation words rather than later logical arguments. Stop
+                // tag conversion here and let typed packing fall back to raw
+                // (or refuse below if an earlier argument was tagged).
+                free(argumentType);
+                break;
             }
             if(isTaggedSizedPointer) {
                 LC32HostSizedIndirectDescriptor descriptor = {};
@@ -3436,21 +3475,32 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                             if(rawSlots == 5) rawSlots = 6;
                             rawSlots += 2;
                         } else {
-                            NSUInteger sz = 0, align = 0;
-                            if(LC32NativeNSDecimalType(unqual)) {
-                                sz = sizeof(NSDecimal);
+                            LC32PODType pod = {};
+                            if(LC32PODStructType(unqual, true, &pod) &&
+                               LC32PODHomogeneousFloat(&pod) == 'd' &&
+                               (pod.size == sizeof(double) * 2 ||
+                                pod.size == sizeof(double) * 4)) {
+                                rawSlots += pod.size / sizeof(double);
                             } else {
-                                NSGetSizeAndAlignment(unqual, &sz, &align);
-                            }
-                            if(!sz) {
+                                // Require all 9 slots (matching 7ba1284) for
+                                // other composites so unions, 4-float HFAs,
+                                // or register holes are never undercounted.
                                 exactSize = false;
                                 free(argType);
                                 break;
                             }
-                            rawSlots += (sz + sizeof(u64) - 1) / sizeof(u64);
                         }
-                    } else {
+                    } else if(unqual && *unqual &&
+                              strchr("cCsSiIlLqQfdBv*@#:^", *unqual) !=
+                                  nullptr) {
                         rawSlots += 1;
+                    } else {
+                        // Unknown or multi-slot non-struct encoding (e.g.
+                        // 'j' _Complex, '[' array): require all 9 slots so
+                        // we never undercount.
+                        exactSize = false;
+                        free(argType);
+                        break;
                     }
                     free(argType);
                 }
