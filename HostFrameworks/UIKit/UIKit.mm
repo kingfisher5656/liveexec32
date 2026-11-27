@@ -156,6 +156,7 @@ id LC32ObjectProperty(id object, const char *name);
 
 std::atomic<NSInteger> LC32LegacyRequestedOrientation{
     UIInterfaceOrientationUnknown};
+std::atomic<bool> LC32LegacyRootAdoptionPending{false};
 // See LC32WidenLegacyLandscapeSides.
 std::atomic<bool> LC32LegacyLandscapeSidesWidened{false};
 thread_local bool LC32SuppressGuestOrientationQuery = false;
@@ -6646,7 +6647,13 @@ extern "C" void LC32UIKitPrepareGuestClass(Class cls) {
                                method_getTypeEncoding(declaration));
     };
 
+    /* iOS 6 deprecated shouldAutorotateToInterfaceOrientation: and iOS 8+
+     * never consults it. SDK 8+ binaries can still carry a dead pre-iOS-6
+     * stub that mutates engine orientation state when probed (e.g. Paladog
+     * 3.60, SDK 9.2), so only install the legacy probe adapter for pre-iOS-8
+     * guests. */
     const bool hasLegacyRotation =
+        LC32GetGuestExecutableSDKVersion() < 0x80000 &&
         LC32GuestClassHierarchyDefinesSelector(
             cls, @selector(shouldAutorotateToInterfaceOrientation:));
 
@@ -6705,11 +6712,22 @@ extern "C" void LC32UIKitPrepareGuestClass(Class cls) {
 extern "C" u32 LC32UIKitHandleLegacyStatusBarOrientation(
         u32 orientationValue, u32, u32) {
     if(!LC32UIKitLegacyCompatibilityEnabled()) return 0;
+    /* Ignore side-effect calls made while LiveExec32 is probing a guest
+     * controller's orientation policy: letting a probe overwrite the requested
+     * orientation or schedule another root adoption causes a self-amplifying
+     * main-queue feedback loop. */
+    if(LC32AllowGuestOrientationQuery) return 0;
+    /* On iOS 8+, setStatusBarOrientation: no longer drives scene rotation for
+     * phone/universal apps (and applying legacy window policy would pin a
+     * multi-orientation SDK 8+ app to one side). Keep legacy iPad-canvas
+     * guests on iPhones covered. */
+    if(LC32GetGuestExecutableSDKVersion() >= 0x80000 &&
+            !LC32UIKitLegacyIPadCanvasEnabled()) return 0;
     const UIInterfaceOrientation orientation =
         (UIInterfaceOrientation)orientationValue;
     if(!LC32MaskForInterfaceOrientation(orientation)) return 0;
     LC32LegacyRequestedOrientation.store(
-        orientation, std::memory_order_relaxed);
+        orientation, std::memory_order_release);
     /* Early game engines can keep the native main thread inside their guest
      * loop indefinitely. Refit synchronously while this legacy setter is
      * already executing on that thread; queuing the only refit would leave
@@ -6728,10 +6746,16 @@ extern "C" u32 LC32UIKitHandleLegacyStatusBarOrientation(
     }
 
     /* Avoid entering guest shouldAutorotate... while its outgoing direct
-     * UIKit host call is still on the JIT stack. */
-    dispatch_async(dispatch_get_main_queue(), ^{
-        LC32AdoptLegacyRootViewControllers();
-    });
+     * UIKit host call is still on the JIT stack. Coalesce rapid setter calls
+     * so they cannot flood the main queue. */
+    if(!LC32LegacyRootAdoptionPending.exchange(
+            true, std::memory_order_acq_rel)) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LC32LegacyRootAdoptionPending.exchange(
+                false, std::memory_order_acq_rel);
+            LC32AdoptLegacyRootViewControllers();
+        });
+    }
     return 0;
 }
 

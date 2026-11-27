@@ -578,26 +578,41 @@ extern "C" u32 LC32_Foundation_StringGetBytes(
     const u64 hostStringAddress = request.hostStringLow |
         (static_cast<u64>(request.hostStringHigh) << 32);
     NSString *string = reinterpret_cast<NSString *>(hostStringAddress);
-    if(!string || request.rangeLocation > string.length ||
-       request.rangeLength > string.length - request.rangeLocation) {
+    if(!string || request.rangeLocation > string.length) {
         return NO;
     }
+    /* 32-bit __NSCFString tolerated a source range length extending past the
+     * string end (for example Paladog's GetBaseDir passes the destination
+     * buffer capacity 0x1ff as range.length). Clamp to the available code
+     * units so host Foundation neither throws on tagged strings nor reads
+     * past the string's backing store. */
+    const NSUInteger availableLength = string.length - request.rangeLocation;
+    const NSUInteger effectiveRangeLength =
+        request.rangeLength > availableLength
+            ? availableLength
+            : request.rangeLength;
 
     std::vector<uint8_t> bytes(request.guestBuffer
         ? request.maximumLength : 0);
+    uint8_t emptyScratch = 0;
+    void *destination = request.guestBuffer
+        ? (bytes.empty() ? static_cast<void *>(&emptyScratch)
+                         : static_cast<void *>(bytes.data()))
+        : nullptr;
     NSUInteger usedLength = 0;
     NSRange remainingRange = NSMakeRange(0, 0);
     const BOOL converted = [string
-        getBytes:bytes.empty() ? nullptr : bytes.data()
+        getBytes:destination
         maxLength:request.maximumLength
         usedLength:&usedLength
         encoding:(NSStringEncoding)request.encoding
         options:(NSStringEncodingConversionOptions)request.options
-        range:NSMakeRange(request.rangeLocation, request.rangeLength)
+        range:NSMakeRange(request.rangeLocation, effectiveRangeLength)
         remainingRange:request.guestRemainingRange
             ? &remainingRange : nullptr];
 
-    if(usedLength > request.maximumLength || usedLength > UINT32_MAX ||
+    if((request.guestBuffer && usedLength > request.maximumLength) ||
+       usedLength > UINT32_MAX ||
        remainingRange.location > UINT32_MAX ||
        remainingRange.length > UINT32_MAX ||
        (request.guestBuffer && !writeGuestStringBytes(
