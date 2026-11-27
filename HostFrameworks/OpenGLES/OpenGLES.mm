@@ -13,14 +13,17 @@
 #include <pthread.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -42,10 +45,15 @@
                     fromDrawable:(id<EAGLDrawable>)drawable;
 @end
 
+struct LC32ClientArrayContextState;
+
 @interface LC32EAGLContextStateLifetime : NSObject {
 @public
     uintptr_t _contextKey;
+    uintptr_t _sharegroupKey;
+    EAGLRenderingAPI _api;
     GLint _maxVertexAttribs;
+    LC32ClientArrayContextState *_clientArrays;
 }
 @end
 
@@ -291,6 +299,179 @@ bool ReadGuestBytes(uint32_t guestAddress, size_t byteCount,
     bytes.resize(byteCount);
     if(byteCount && Dynarmic_mem_1read(guestAddress, byteCount,
             reinterpret_cast<char *>(bytes.data())) != 0) {
+        SetBridgeError(GL_INVALID_OPERATION);
+        return false;
+    }
+    return true;
+}
+
+bool GLZeroCopyClientArraysEnabled() {
+    static const bool enabled = []() {
+        const char *env = getenv("LC32_GL_ZERO_COPY");
+        return !env || strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+class UninitializedByteBuffer {
+public:
+    static constexpr size_t kMaxRetainedBytes = 256u * 1024u;
+
+    UninitializedByteBuffer() = default;
+    ~UninitializedByteBuffer() { free(data_); }
+    UninitializedByteBuffer(const UninitializedByteBuffer &) = delete;
+    UninitializedByteBuffer &operator=(const UninitializedByteBuffer &) = delete;
+    UninitializedByteBuffer(UninitializedByteBuffer &&other) noexcept
+        : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
+    }
+    UninitializedByteBuffer &operator=(UninitializedByteBuffer &&other) noexcept {
+        if(this != &other) {
+            free(data_);
+            data_ = other.data_;
+            size_ = other.size_;
+            capacity_ = other.capacity_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.capacity_ = 0;
+        }
+        return *this;
+    }
+
+    bool ResizeUninitialized(size_t n, bool &oversizedOut) {
+        size_ = n;
+        if(n <= capacity_) return true;
+        size_t newCapacity = capacity_ ? capacity_ : 4096u;
+        while(newCapacity < n) {
+            if(newCapacity >= (SIZE_MAX >> 1)) {
+                newCapacity = n;
+                break;
+            }
+            newCapacity <<= 1;
+        }
+        // Avoid doubling way past the retention cap for huge one-off draws.
+        if(newCapacity > kMaxRetainedBytes && n > kMaxRetainedBytes) {
+            newCapacity = n;
+        }
+        uint8_t *grown = static_cast<uint8_t *>(malloc(newCapacity));
+        if(!grown) {
+            size_ = 0;
+            return false;
+        }
+        free(data_);
+        data_ = grown;
+        capacity_ = newCapacity;
+        if(capacity_ > kMaxRetainedBytes) oversizedOut = true;
+        return true;
+    }
+
+    void TrimIfOversized() {
+        if(capacity_ > kMaxRetainedBytes) {
+            free(data_);
+            data_ = nullptr;
+            size_ = 0;
+            capacity_ = 0;
+        }
+    }
+
+    uint8_t *Data() { return size_ ? data_ : nullptr; }
+    const uint8_t *Data() const { return size_ ? data_ : nullptr; }
+    size_t Size() const { return size_; }
+
+private:
+    uint8_t *data_ = nullptr;
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+};
+
+struct DrawStagingScratch {
+    static constexpr size_t kInlineArraySlots = 16;
+    UninitializedByteBuffer indexBytes;
+    std::array<UninitializedByteBuffer, kInlineArraySlots> arrayBuffers;
+    std::vector<UninitializedByteBuffer> extraArrayBuffers;
+    bool inUse = false;
+    bool hasOversized = false;
+
+    UninitializedByteBuffer &ArrayBufferAt(size_t slot) {
+        if(slot < kInlineArraySlots) return arrayBuffers[slot];
+        const size_t extra = slot - kInlineArraySlots;
+        if(extra >= extraArrayBuffers.size()) {
+            extraArrayBuffers.resize(extra + 1);
+        }
+        return extraArrayBuffers[extra];
+    }
+
+    void TrimOversized() {
+        if(__builtin_expect(!hasOversized, 1)) return;
+        indexBytes.TrimIfOversized();
+        for(auto &buf : arrayBuffers) buf.TrimIfOversized();
+        extraArrayBuffers.clear();
+        extraArrayBuffers.shrink_to_fit();
+        hasOversized = false;
+    }
+};
+
+struct ScopedDrawStagingScratch {
+    DrawStagingScratch *claimed = nullptr;
+    std::unique_ptr<DrawStagingScratch> overflow;
+    GLuint disabledUnusedInline[16];
+    uint8_t disabledUnusedCount = 0;
+    std::vector<GLuint> disabledUnusedExtra;
+
+    void DisableUnusedVertexAttrib(GLuint index) {
+        glDisableVertexAttribArray(index);
+        if(disabledUnusedCount < 16) {
+            disabledUnusedInline[disabledUnusedCount++] = index;
+        } else {
+            disabledUnusedExtra.push_back(index);
+        }
+    }
+
+    DrawStagingScratch &Ensure() {
+        if(!claimed) {
+            thread_local DrawStagingScratch tlsScratch;
+            if(!tlsScratch.inUse) {
+                tlsScratch.inUse = true;
+                claimed = &tlsScratch;
+            } else {
+                overflow.reset(new DrawStagingScratch());
+                claimed = overflow.get();
+            }
+        }
+        return *claimed;
+    }
+
+    ~ScopedDrawStagingScratch() {
+        for(uint8_t i = 0; i < disabledUnusedCount; ++i) {
+            glEnableVertexAttribArray(disabledUnusedInline[i]);
+        }
+        for(GLuint index : disabledUnusedExtra) {
+            glEnableVertexAttribArray(index);
+        }
+        if(claimed && !overflow) {
+            claimed->TrimOversized();
+            claimed->inUse = false;
+        }
+    }
+};
+
+bool ReadGuestBytesUninitialized(uint32_t guestAddress, size_t byteCount,
+                                 UninitializedByteBuffer &bytes,
+                                 bool &oversizedFlag) {
+    if(byteCount > kMaximumTransfer ||
+       !GuestRangeValid(guestAddress, byteCount) ||
+       (byteCount && !guestAddress)) {
+        SetBridgeError(GL_INVALID_VALUE);
+        return false;
+    }
+    if(!bytes.ResizeUninitialized(byteCount, oversizedFlag)) {
+        SetBridgeError(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    if(byteCount && !Dynarmic_read_guest_memory_checked(
+            guestAddress, bytes.Data(), byteCount)) {
         SetBridgeError(GL_INVALID_OPERATION);
         return false;
     }
@@ -1097,15 +1278,80 @@ struct ClientArrayDescriptor {
     bool integer = false;
     bool valid = false;
 };
+static_assert(std::is_trivially_copyable_v<ClientArrayDescriptor> &&
+              std::is_trivially_destructible_v<ClientArrayDescriptor>,
+              "ClientArrayDescriptor must remain trivially copyable/destructible");
+
+struct ClientArrayList {
+    static constexpr size_t kInlineCapacity = 16;
+    union InlineSlot {
+        ClientArrayDescriptor item;
+        InlineSlot() noexcept {}
+    };
+    InlineSlot inlineItems[kInlineCapacity];
+    std::vector<ClientArrayDescriptor> extraItems;
+    size_t count = 0;
+
+    void Clear() {
+        count = 0;
+        if(!extraItems.empty()) extraItems.clear();
+    }
+
+    bool Empty() const { return count == 0; }
+    size_t Size() const { return count; }
+
+    void Push(const ClientArrayDescriptor &item) {
+        if(count < kInlineCapacity) {
+            new (&inlineItems[count++].item) ClientArrayDescriptor(item);
+        } else {
+            extraItems.push_back(item);
+            count++;
+        }
+    }
+
+    ClientArrayDescriptor &operator[](size_t index) {
+        return index < kInlineCapacity
+            ? inlineItems[index].item
+            : extraItems[index - kInlineCapacity];
+    }
+
+    const ClientArrayDescriptor &operator[](size_t index) const {
+        return index < kInlineCapacity
+            ? inlineItems[index].item
+            : extraItems[index - kInlineCapacity];
+    }
+
+    void Truncate(size_t newCount) {
+        if(newCount >= count) return;
+        count = newCount;
+        if(count <= kInlineCapacity) {
+            if(!extraItems.empty()) extraItems.clear();
+        } else {
+            extraItems.resize(count - kInlineCapacity);
+        }
+    }
+};
 
 struct VertexArrayClientState {
-    std::unordered_map<GLuint, ClientArrayDescriptor> vertexAttribs;
-    std::unordered_set<GLuint> enabledVertexAttribs;
-    std::unordered_map<GLuint, GLuint> vertexAttribDivisors;
+    static constexpr GLuint kFastVertexAttribs = 32;
+    static constexpr size_t kFastTexCoords = 8;
+
+    ClientArrayDescriptor fastVertexAttribs[kFastVertexAttribs];
+    GLuint fastVertexAttribDivisors[kFastVertexAttribs] = {};
+    uint32_t enabledVertexAttribMask = 0;
+    uint32_t validVertexAttribMask = 0;
+    std::unordered_map<GLuint, ClientArrayDescriptor> extraVertexAttribs;
+    std::unordered_set<GLuint> extraEnabledVertexAttribs;
+    std::unordered_map<GLuint, GLuint> extraVertexAttribDivisors;
+
+    ClientArrayDescriptor fastTexCoords[kFastTexCoords];
+    uint8_t enabledTexCoordMask = 0;
+    uint8_t validTexCoordMask = 0;
+    std::unordered_map<GLenum, ClientArrayDescriptor> extraTexCoords;
+    std::unordered_set<GLenum> extraEnabledTexCoords;
+
     ClientArrayDescriptor vertex;
     ClientArrayDescriptor color;
-    std::unordered_map<GLenum, ClientArrayDescriptor> texCoords;
-    std::unordered_set<GLenum> enabledTexCoords;
     ClientArrayDescriptor normal;
     ClientArrayDescriptor pointSize;
     ClientArrayDescriptor matrixIndex;
@@ -1116,16 +1362,219 @@ struct VertexArrayClientState {
     bool pointSizeEnabled = false;
     bool matrixIndexEnabled = false;
     bool weightEnabled = false;
+
+    void SetVertexAttribEnabled(GLuint index, bool enabled) {
+        if(index < kFastVertexAttribs) {
+            const uint32_t bit = UINT32_C(1) << index;
+            if(enabled) enabledVertexAttribMask |= bit;
+            else enabledVertexAttribMask &= ~bit;
+        } else {
+            if(enabled) extraEnabledVertexAttribs.insert(index);
+            else extraEnabledVertexAttribs.erase(index);
+        }
+    }
+
+    bool IsVertexAttribEnabled(GLuint index) const {
+        if(index < kFastVertexAttribs) {
+            return (enabledVertexAttribMask & (UINT32_C(1) << index)) != 0;
+        }
+        return extraEnabledVertexAttribs.count(index) != 0;
+    }
+
+    void SetVertexAttribDivisor(GLuint index, GLuint divisor) {
+        if(index < kFastVertexAttribs) {
+            fastVertexAttribDivisors[index] = divisor;
+            if(validVertexAttribMask & (UINT32_C(1) << index)) {
+                fastVertexAttribs[index].divisor = divisor;
+            }
+        } else {
+            if(divisor) extraVertexAttribDivisors[index] = divisor;
+            else extraVertexAttribDivisors.erase(index);
+            auto descriptor = extraVertexAttribs.find(index);
+            if(descriptor != extraVertexAttribs.end()) {
+                descriptor->second.divisor = divisor;
+            }
+        }
+    }
+
+    void SetVertexAttribPointer(GLuint index,
+                                const ClientArrayDescriptor *descriptor) {
+        if(index < kFastVertexAttribs) {
+            const uint32_t bit = UINT32_C(1) << index;
+            if(descriptor) {
+                ClientArrayDescriptor saved = *descriptor;
+                saved.divisor = fastVertexAttribDivisors[index];
+                fastVertexAttribs[index] = saved;
+                if(saved.valid) validVertexAttribMask |= bit;
+                else validVertexAttribMask &= ~bit;
+            } else {
+                fastVertexAttribs[index] = ClientArrayDescriptor{};
+                validVertexAttribMask &= ~bit;
+            }
+        } else {
+            if(descriptor) {
+                ClientArrayDescriptor saved = *descriptor;
+                auto divisor = extraVertexAttribDivisors.find(index);
+                if(divisor != extraVertexAttribDivisors.end()) {
+                    saved.divisor = divisor->second;
+                }
+                extraVertexAttribs[index] = saved;
+            } else {
+                extraVertexAttribs.erase(index);
+            }
+        }
+    }
+
+    const ClientArrayDescriptor *FindVertexAttrib(GLuint index) const {
+        if(index < kFastVertexAttribs) {
+            if(validVertexAttribMask & (UINT32_C(1) << index)) {
+                return &fastVertexAttribs[index];
+            }
+            return nullptr;
+        }
+        auto it = extraVertexAttribs.find(index);
+        return it != extraVertexAttribs.end() ? &it->second : nullptr;
+    }
+
+    void SetTexCoordEnabled(GLenum texture, bool enabled) {
+        if(texture >= GL_TEXTURE0 &&
+           texture < GL_TEXTURE0 + kFastTexCoords) {
+            const uint8_t bit = static_cast<uint8_t>(1u << (texture - GL_TEXTURE0));
+            if(enabled) enabledTexCoordMask |= bit;
+            else enabledTexCoordMask &= ~bit;
+        } else {
+            if(enabled) extraEnabledTexCoords.insert(texture);
+            else extraEnabledTexCoords.erase(texture);
+        }
+    }
+
+    void SetTexCoordPointer(GLenum texture,
+                            const ClientArrayDescriptor *descriptor) {
+        if(texture >= GL_TEXTURE0 &&
+           texture < GL_TEXTURE0 + kFastTexCoords) {
+            const size_t unit = static_cast<size_t>(texture - GL_TEXTURE0);
+            const uint8_t bit = static_cast<uint8_t>(1u << unit);
+            if(descriptor) {
+                ClientArrayDescriptor saved = *descriptor;
+                saved.index = texture;
+                fastTexCoords[unit] = saved;
+                if(saved.valid) validTexCoordMask |= bit;
+                else validTexCoordMask &= ~bit;
+            } else {
+                fastTexCoords[unit] = ClientArrayDescriptor{};
+                validTexCoordMask &= ~bit;
+            }
+        } else {
+            if(descriptor) {
+                ClientArrayDescriptor saved = *descriptor;
+                saved.index = texture;
+                extraTexCoords[texture] = saved;
+            } else {
+                extraTexCoords.erase(texture);
+            }
+        }
+    }
+
+    const ClientArrayDescriptor *FindTexCoord(GLenum texture) const {
+        if(texture >= GL_TEXTURE0 &&
+           texture < GL_TEXTURE0 + kFastTexCoords) {
+            const size_t unit = static_cast<size_t>(texture - GL_TEXTURE0);
+            if(validTexCoordMask & static_cast<uint8_t>(1u << unit)) {
+                return &fastTexCoords[unit];
+            }
+            return nullptr;
+        }
+        auto it = extraTexCoords.find(texture);
+        return it != extraTexCoords.end() ? &it->second : nullptr;
+    }
+
+    bool HasAnyEnabledValid() const {
+        if((enabledVertexAttribMask & validVertexAttribMask) != 0) return true;
+        if((enabledTexCoordMask & validTexCoordMask) != 0) return true;
+        if((vertexEnabled && vertex.valid) ||
+           (colorEnabled && color.valid) ||
+           (normalEnabled && normal.valid) ||
+           (pointSizeEnabled && pointSize.valid) ||
+           (matrixIndexEnabled && matrixIndex.valid) ||
+           (weightEnabled && weight.valid)) {
+            return true;
+        }
+        if(__builtin_expect(!extraEnabledVertexAttribs.empty(), 0)) {
+            for(GLuint index : extraEnabledVertexAttribs) {
+                auto it = extraVertexAttribs.find(index);
+                if(it != extraVertexAttribs.end() && it->second.valid)
+                    return true;
+            }
+        }
+        if(__builtin_expect(!extraEnabledTexCoords.empty(), 0)) {
+            for(GLenum texture : extraEnabledTexCoords) {
+                auto it = extraTexCoords.find(texture);
+                if(it != extraTexCoords.end() && it->second.valid)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    void CollectEnabled(ClientArrayList &out) const {
+        out.Clear();
+        uint32_t attribMask = enabledVertexAttribMask & validVertexAttribMask;
+        while(attribMask) {
+            const unsigned index = static_cast<unsigned>(__builtin_ctz(attribMask));
+            attribMask &= attribMask - 1;
+            out.Push(fastVertexAttribs[index]);
+        }
+        if(__builtin_expect(!extraEnabledVertexAttribs.empty(), 0)) {
+            for(GLuint index : extraEnabledVertexAttribs) {
+                auto descriptor = extraVertexAttribs.find(index);
+                if(descriptor != extraVertexAttribs.end() &&
+                   descriptor->second.valid) {
+                    out.Push(descriptor->second);
+                }
+            }
+        }
+        if(vertexEnabled && vertex.valid) out.Push(vertex);
+        if(colorEnabled && color.valid) out.Push(color);
+        uint32_t texMask = enabledTexCoordMask & validTexCoordMask;
+        while(texMask) {
+            const unsigned unit = static_cast<unsigned>(__builtin_ctz(texMask));
+            texMask &= texMask - 1;
+            out.Push(fastTexCoords[unit]);
+        }
+        if(__builtin_expect(!extraEnabledTexCoords.empty(), 0)) {
+            for(GLenum texture : extraEnabledTexCoords) {
+                auto descriptor = extraTexCoords.find(texture);
+                if(descriptor != extraTexCoords.end() &&
+                   descriptor->second.valid) {
+                    out.Push(descriptor->second);
+                }
+            }
+        }
+        if(normalEnabled && normal.valid) out.Push(normal);
+        if(pointSizeEnabled && pointSize.valid) out.Push(pointSize);
+        if(matrixIndexEnabled && matrixIndex.valid) out.Push(matrixIndex);
+        if(weightEnabled && weight.valid) out.Push(weight);
+    }
 };
 
-struct ClientArrayContextState {
-    std::unordered_map<GLuint, VertexArrayClientState> vertexArrays;
+} // namespace
+
+struct LC32ClientArrayContextState {
+    LC32ClientArrayContextState() = default;
+    LC32ClientArrayContextState(const LC32ClientArrayContextState &) = delete;
+    LC32ClientArrayContextState &operator=(
+        const LC32ClientArrayContextState &) = delete;
+
+    std::mutex mutex;
+    VertexArrayClientState defaultVertexArray;
+    std::unordered_map<GLuint, VertexArrayClientState> namedVertexArrays;
     GLuint currentVertexArray = 0;
+    VertexArrayClientState *currentVao = &defaultVertexArray;
     GLenum clientActiveTexture = GL_TEXTURE0;
 };
 
-std::mutex clientArrayStateMutex;
-std::unordered_map<uintptr_t, ClientArrayContextState> clientArrayStates;
+namespace {
+
 static const void *clientArrayStateLifetimeKey =
     &clientArrayStateLifetimeKey;
 static const void *auxiliarySharegroupStateLifetimeKey =
@@ -1135,10 +1584,23 @@ std::mutex auxiliarySharegroupLifetimeMutex;
 void ForgetDetachedVertexAttribs(uintptr_t context, GLsizei count,
                                  const GLuint *vertexArrays);
 
-void RemoveClientArrayState(uintptr_t contextKey) {
-    ForgetDetachedVertexAttribs(contextKey, 0, nullptr);
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    clientArrayStates.erase(contextKey);
+uintptr_t SharegroupKeyForSharegroup(EAGLSharegroup *sharegroup) {
+    const uintptr_t sharegroupKey = reinterpret_cast<uintptr_t>(
+        (__bridge void *)sharegroup);
+    if(sharegroup) {
+        std::lock_guard<std::mutex> lock(auxiliarySharegroupLifetimeMutex);
+        if(!objc_getAssociatedObject(
+                sharegroup, auxiliarySharegroupStateLifetimeKey)) {
+            LC32EAGLSharegroupStateLifetime *lifetime =
+                [LC32EAGLSharegroupStateLifetime new];
+            lifetime->_sharegroupKey = sharegroupKey;
+            objc_setAssociatedObject(sharegroup,
+                auxiliarySharegroupStateLifetimeKey, lifetime,
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [lifetime release];
+        }
+    }
+    return sharegroupKey;
 }
 
 LC32EAGLContextStateLifetime *ContextStateLifetimeForContext(
@@ -1155,6 +1617,10 @@ LC32EAGLContextStateLifetime *ContextStateLifetimeForContext(
             lifetime = [LC32EAGLContextStateLifetime new];
             lifetime->_contextKey =
                 reinterpret_cast<uintptr_t>((__bridge void *)context);
+            lifetime->_sharegroupKey =
+                SharegroupKeyForSharegroup(context.sharegroup);
+            lifetime->_api = context.API;
+            lifetime->_clientArrays = new LC32ClientArrayContextState();
             // Installed at most once under lifetimeInstallMutex and never
             // replaced or removed until context deallocs, so NONATOMIC is safe
             // while avoiding per-call retain+autorelease in objc_getAssociatedObject.
@@ -1166,6 +1632,21 @@ LC32EAGLContextStateLifetime *ContextStateLifetimeForContext(
     return lifetime;
 }
 
+LC32ClientArrayContextState &ClientArrayStateForLifetime(
+        LC32EAGLContextStateLifetime *lifetime) {
+    if(__builtin_expect(lifetime != nil && lifetime->_clientArrays != nullptr, 1)) {
+        return *lifetime->_clientArrays;
+    }
+    static LC32ClientArrayContextState *nilState =
+        new LC32ClientArrayContextState();
+    return *nilState;
+}
+
+LC32ClientArrayContextState &CurrentClientArrayState() {
+    return ClientArrayStateForLifetime(
+        ContextStateLifetimeForContext(EAGLContext.currentContext));
+}
+
 uintptr_t CurrentGLContextKey() {
     EAGLContext *context = EAGLContext.currentContext;
     (void)ContextStateLifetimeForContext(context);
@@ -1173,13 +1654,15 @@ uintptr_t CurrentGLContextKey() {
 }
 
 bool CurrentContextIsES3() {
-    EAGLContext *context = EAGLContext.currentContext;
-    return context.API == kEAGLRenderingAPIOpenGLES3;
+    LC32EAGLContextStateLifetime *lifetime =
+        ContextStateLifetimeForContext(EAGLContext.currentContext);
+    return lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES3;
 }
 
 bool CurrentContextIsES1() {
-    EAGLContext *context = EAGLContext.currentContext;
-    return context.API == kEAGLRenderingAPIOpenGLES1;
+    LC32EAGLContextStateLifetime *lifetime =
+        ContextStateLifetimeForContext(EAGLContext.currentContext);
+    return lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES1;
 }
 
 static const void *drawableRenderbuffersKey = &drawableRenderbuffersKey;
@@ -1290,24 +1773,9 @@ BOOL ReconcileDrawableStorage(EAGLContext *context, NSUInteger target,
 }
 
 uintptr_t CurrentGLSharegroupKey() {
-    EAGLContext *context = EAGLContext.currentContext;
-    EAGLSharegroup *sharegroup = context.sharegroup;
-    const uintptr_t sharegroupKey = reinterpret_cast<uintptr_t>(
-        (__bridge void *)sharegroup);
-    if(sharegroup) {
-        std::lock_guard<std::mutex> lock(auxiliarySharegroupLifetimeMutex);
-        if(!objc_getAssociatedObject(
-                sharegroup, auxiliarySharegroupStateLifetimeKey)) {
-            LC32EAGLSharegroupStateLifetime *lifetime =
-                [LC32EAGLSharegroupStateLifetime new];
-            lifetime->_sharegroupKey = sharegroupKey;
-            objc_setAssociatedObject(sharegroup,
-                auxiliarySharegroupStateLifetimeKey, lifetime,
-                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [lifetime release];
-        }
-    }
-    return sharegroupKey;
+    LC32EAGLContextStateLifetime *lifetime =
+        ContextStateLifetimeForContext(EAGLContext.currentContext);
+    return lifetime ? lifetime->_sharegroupKey : 0;
 }
 
 struct SyncSlot {
@@ -1641,61 +2109,50 @@ void RemoveAuxiliarySharegroupState(uintptr_t sharegroupKey) {
     }
 }
 
-VertexArrayClientState &CurrentVertexArrayState(
-        ClientArrayContextState &context) {
-    return context.vertexArrays[context.currentVertexArray];
-}
-
 void SetCurrentVertexArray(GLuint vertexArray) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    clientArrayStates[CurrentGLContextKey()].currentVertexArray = vertexArray;
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    context.currentVertexArray = vertexArray;
+    context.currentVao = vertexArray
+        ? &context.namedVertexArrays[vertexArray]
+        : &context.defaultVertexArray;
 }
 
 void ForgetVertexArrayStates(GLsizei count, const GLuint *vertexArrays) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto context = clientArrayStates.find(CurrentGLContextKey());
-    if(context == clientArrayStates.end()) return;
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
     for(GLsizei i = 0; i < count; ++i) {
         const GLuint vertexArray = vertexArrays[i];
         if(!vertexArray) continue;
-        context->second.vertexArrays.erase(vertexArray);
-        if(context->second.currentVertexArray == vertexArray)
-            context->second.currentVertexArray = 0;
+        if(context.currentVertexArray == vertexArray) {
+            context.currentVertexArray = 0;
+            context.currentVao = &context.defaultVertexArray;
+        }
+        context.namedVertexArrays.erase(vertexArray);
     }
 }
 
 void SetVertexAttribArrayEnabled(GLuint index, bool enabled) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto &context = clientArrayStates[CurrentGLContextKey()];
-    auto &state = CurrentVertexArrayState(context);
-    if(enabled) state.enabledVertexAttribs.insert(index);
-    else state.enabledVertexAttribs.erase(index);
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    context.currentVao->SetVertexAttribEnabled(index, enabled);
 }
 
 void SetVertexAttribDivisor(GLuint index, GLuint divisor) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto &context = clientArrayStates[CurrentGLContextKey()];
-    auto &state = CurrentVertexArrayState(context);
-    if(divisor) state.vertexAttribDivisors[index] = divisor;
-    else state.vertexAttribDivisors.erase(index);
-    auto descriptor = state.vertexAttribs.find(index);
-    if(descriptor != state.vertexAttribs.end())
-        descriptor->second.divisor = divisor;
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    context.currentVao->SetVertexAttribDivisor(index, divisor);
 }
 
 void SetClientStateEnabled(GLenum array, bool enabled) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto &context = clientArrayStates[CurrentGLContextKey()];
-    auto &state = CurrentVertexArrayState(context);
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    auto &state = *context.currentVao;
     switch(array) {
         case GL_VERTEX_ARRAY: state.vertexEnabled = enabled; break;
         case GL_COLOR_ARRAY: state.colorEnabled = enabled; break;
         case GL_TEXTURE_COORD_ARRAY:
-            if(enabled) {
-                state.enabledTexCoords.insert(context.clientActiveTexture);
-            } else {
-                state.enabledTexCoords.erase(context.clientActiveTexture);
-            }
+            state.SetTexCoordEnabled(context.clientActiveTexture, enabled);
             break;
         case GL_NORMAL_ARRAY: state.normalEnabled = enabled; break;
 #ifdef GL_POINT_SIZE_ARRAY_OES
@@ -1712,40 +2169,25 @@ void SetClientStateEnabled(GLenum array, bool enabled) {
 }
 
 void SetClientActiveTexture(GLenum texture) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    clientArrayStates[CurrentGLContextKey()].clientActiveTexture = texture;
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    context.clientActiveTexture = texture;
 }
 
 void RememberVertexAttribPointer(const ClientArrayDescriptor *descriptor,
                                  GLuint index) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto &context = clientArrayStates[CurrentGLContextKey()];
-    auto &attributes = CurrentVertexArrayState(context).vertexAttribs;
-    if(descriptor) {
-        ClientArrayDescriptor saved = *descriptor;
-        auto divisor = CurrentVertexArrayState(context).vertexAttribDivisors.find(
-            index);
-        if(divisor != CurrentVertexArrayState(context).vertexAttribDivisors.end())
-            saved.divisor = divisor->second;
-        attributes[index] = saved;
-    }
-    else attributes.erase(index);
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    context.currentVao->SetVertexAttribPointer(index, descriptor);
 }
 
 void RememberClientPointer(const ClientArrayDescriptor *descriptor,
                            ClientArrayKind kind) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto &context = clientArrayStates[CurrentGLContextKey()];
-    auto &state = CurrentVertexArrayState(context);
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    auto &state = *context.currentVao;
     if(kind == ClientArrayKind::TexCoord) {
-        const GLenum texture = context.clientActiveTexture;
-        if(descriptor) {
-            ClientArrayDescriptor saved = *descriptor;
-            saved.index = texture;
-            state.texCoords[texture] = saved;
-        } else {
-            state.texCoords.erase(texture);
-        }
+        state.SetTexCoordPointer(context.clientActiveTexture, descriptor);
         return;
     }
     ClientArrayDescriptor *destination = nullptr;
@@ -1765,24 +2207,17 @@ void RememberClientPointer(const ClientArrayDescriptor *descriptor,
 }
 
 bool GuestClientPointer(GLenum pname, uint32_t &guestPointer) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto context = clientArrayStates.find(CurrentGLContextKey());
-    if(context == clientArrayStates.end()) return false;
-    auto vertexArray = context->second.vertexArrays.find(
-        context->second.currentVertexArray);
-    if(vertexArray == context->second.vertexArrays.end()) return false;
-
-    const auto &state = vertexArray->second;
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    const auto &state = *context.currentVao;
     const ClientArrayDescriptor *descriptor = nullptr;
     switch(pname) {
         case GL_VERTEX_ARRAY_POINTER: descriptor = &state.vertex; break;
         case GL_NORMAL_ARRAY_POINTER: descriptor = &state.normal; break;
         case GL_COLOR_ARRAY_POINTER: descriptor = &state.color; break;
-        case GL_TEXTURE_COORD_ARRAY_POINTER: {
-            auto value = state.texCoords.find(context->second.clientActiveTexture);
-            if(value != state.texCoords.end()) descriptor = &value->second;
+        case GL_TEXTURE_COORD_ARRAY_POINTER:
+            descriptor = state.FindTexCoord(context.clientActiveTexture);
             break;
-        }
 #ifdef GL_POINT_SIZE_ARRAY_POINTER_OES
         case GL_POINT_SIZE_ARRAY_POINTER_OES:
             descriptor = &state.pointSize;
@@ -1823,57 +2258,24 @@ GLenum ClientPointerBufferBinding(GLenum pname) {
 }
 
 bool GuestVertexAttribPointer(GLuint index, uint32_t &guestPointer) {
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto context = clientArrayStates.find(CurrentGLContextKey());
-    if(context == clientArrayStates.end()) return false;
-    auto vertexArray = context->second.vertexArrays.find(
-        context->second.currentVertexArray);
-    if(vertexArray == context->second.vertexArrays.end()) return false;
-    auto attribute = vertexArray->second.vertexAttribs.find(index);
-    if(attribute == vertexArray->second.vertexAttribs.end()) return false;
-    guestPointer = attribute->second.guestPointer;
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    const ClientArrayDescriptor *attribute =
+        context.currentVao->FindVertexAttrib(index);
+    if(!attribute) return false;
+    guestPointer = attribute->guestPointer;
     return true;
 }
 
-std::vector<ClientArrayDescriptor> EnabledClientArrays() {
-    std::vector<ClientArrayDescriptor> descriptors;
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto context = clientArrayStates.find(CurrentGLContextKey());
-    if(context == clientArrayStates.end()) return descriptors;
-    auto vertexArray = context->second.vertexArrays.find(
-        context->second.currentVertexArray);
-    if(vertexArray == context->second.vertexArrays.end()) return descriptors;
-
-    const auto &state = vertexArray->second;
-    descriptors.reserve(state.enabledVertexAttribs.size() +
-        state.enabledTexCoords.size() + 6);
-    for(GLuint index : state.enabledVertexAttribs) {
-        auto descriptor = state.vertexAttribs.find(index);
-        if(descriptor != state.vertexAttribs.end() &&
-           descriptor->second.valid) {
-            descriptors.push_back(descriptor->second);
-        }
+void CollectEnabledClientArrays(LC32EAGLContextStateLifetime *lifetime,
+                                ClientArrayList &out) {
+    auto &context = ClientArrayStateForLifetime(lifetime);
+    std::lock_guard<std::mutex> lock(context.mutex);
+    if(!context.currentVao->HasAnyEnabledValid()) {
+        out.Clear();
+        return;
     }
-    if(state.vertexEnabled && state.vertex.valid)
-        descriptors.push_back(state.vertex);
-    if(state.colorEnabled && state.color.valid)
-        descriptors.push_back(state.color);
-    for(GLenum texture : state.enabledTexCoords) {
-        auto descriptor = state.texCoords.find(texture);
-        if(descriptor != state.texCoords.end() &&
-                descriptor->second.valid) {
-            descriptors.push_back(descriptor->second);
-        }
-    }
-    if(state.normalEnabled && state.normal.valid)
-        descriptors.push_back(state.normal);
-    if(state.pointSizeEnabled && state.pointSize.valid)
-        descriptors.push_back(state.pointSize);
-    if(state.matrixIndexEnabled && state.matrixIndex.valid)
-        descriptors.push_back(state.matrixIndex);
-    if(state.weightEnabled && state.weight.valid)
-        descriptors.push_back(state.weight);
-    return descriptors;
+    context.currentVao->CollectEnabled(out);
 }
 
 size_t ClientArrayScalarSize(GLenum type) {
@@ -1886,6 +2288,9 @@ size_t ClientArrayScalarSize(GLenum type) {
         case GL_UNSIGNED_INT:
         case GL_FIXED:
         case GL_FLOAT: return 4;
+#ifdef GL_HALF_FLOAT
+        case GL_HALF_FLOAT: return 2;
+#endif
 #ifdef GL_HALF_FLOAT_OES
         case GL_HALF_FLOAT_OES: return 2;
 #endif
@@ -1893,17 +2298,18 @@ size_t ClientArrayScalarSize(GLenum type) {
     }
 }
 
-bool VertexAttribIndexValid(GLuint index) {
+bool VertexAttribIndexValid(GLuint index, bool *outIsES3 = nullptr) {
     // Cache unclamped GL_MAX_VERTEX_ATTRIBS per EAGLContext (separate from
     // MaximumTrackedVertexAttribs, which clamps to 32). A nil or ES1 context
     // has no generic vertex attributes and returns false without querying GL.
-    EAGLContext *context = EAGLContext.currentContext;
-    if(!context) return false;
-    const EAGLRenderingAPI api = context.API;
-    if(api != kEAGLRenderingAPIOpenGLES2 && api != kEAGLRenderingAPIOpenGLES3)
-        return false;
     LC32EAGLContextStateLifetime *lifetime =
-        ContextStateLifetimeForContext(context);
+        ContextStateLifetimeForContext(EAGLContext.currentContext);
+    if(!lifetime) return false;
+    if(lifetime->_api != kEAGLRenderingAPIOpenGLES2 &&
+       lifetime->_api != kEAGLRenderingAPIOpenGLES3) {
+        return false;
+    }
+    if(outIsES3) *outIsES3 = (lifetime->_api == kEAGLRenderingAPIOpenGLES3);
     GLint maximum = __atomic_load_n(&lifetime->_maxVertexAttribs,
                                     __ATOMIC_RELAXED);
     if(maximum <= 0) {
@@ -1918,32 +2324,32 @@ bool VertexAttribIndexValid(GLuint index) {
 bool ClientMemoryPointerAllowed(GLint arrayBufferBinding,
                                 uint32_t guestPointer) {
     if(arrayBufferBinding || !guestPointer) return true;
-    const uintptr_t contextKey = CurrentGLContextKey();
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto context = clientArrayStates.find(contextKey);
-    return context == clientArrayStates.end() ||
-        context->second.currentVertexArray == 0;
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    return context.currentVertexArray == 0;
 }
 
 bool VertexAttribDescriptorValid(GLuint index, GLint size, GLenum type,
                                  GLsizei stride, bool integer) {
-    if(!VertexAttribIndexValid(index) || size < 1 || size > 4 || stride < 0)
+    bool isES3 = false;
+    if(!VertexAttribIndexValid(index, &isES3) || size < 1 || size > 4 ||
+       stride < 0)
         return false;
     if(integer) {
-        return type == GL_BYTE || type == GL_UNSIGNED_BYTE ||
+        return isES3 && (type == GL_BYTE || type == GL_UNSIGNED_BYTE ||
             type == GL_SHORT || type == GL_UNSIGNED_SHORT ||
-            type == GL_INT || type == GL_UNSIGNED_INT;
+            type == GL_INT || type == GL_UNSIGNED_INT);
     }
 #ifdef GL_INT_2_10_10_10_REV
     if(type == GL_INT_2_10_10_10_REV ||
-       type == GL_UNSIGNED_INT_2_10_10_10_REV) return size == 4;
+       type == GL_UNSIGNED_INT_2_10_10_10_REV) return isES3 && size == 4;
 #endif
     return type == GL_BYTE || type == GL_UNSIGNED_BYTE ||
         type == GL_SHORT || type == GL_UNSIGNED_SHORT ||
-        type == GL_INT || type == GL_UNSIGNED_INT ||
-        type == GL_FIXED || type == GL_FLOAT
+        type == GL_FIXED || type == GL_FLOAT ||
+        (isES3 && (type == GL_INT || type == GL_UNSIGNED_INT))
 #ifdef GL_HALF_FLOAT
-        || type == GL_HALF_FLOAT
+        || (isES3 && type == GL_HALF_FLOAT)
 #endif
         /* OES_vertex_half_float. Unreal Engine 3 (BioShock) streams
          * half-float client arrays; rejected here, they went to the host
@@ -2028,10 +2434,15 @@ bool ClientArrayByteCount(const ClientArrayDescriptor &descriptor,
     return true;
 }
 
-struct StagedClientArray {
-    ClientArrayDescriptor descriptor;
-    std::vector<uint8_t> bytes;
+struct ResolvedClientArray {
+    const ClientArrayDescriptor *descriptor;
+    const void *pointer;
+    size_t byteCount;
+    bool zeroCopy;
 };
+static_assert(std::is_trivially_default_constructible_v<ResolvedClientArray> &&
+              std::is_trivially_copyable_v<ResolvedClientArray>,
+              "ResolvedClientArray must stay trivially default-constructible");
 
 struct GLProfileSample {
     uint64_t nativeTicks = 0;
@@ -2039,25 +2450,54 @@ struct GLProfileSample {
     uint64_t stagingCopyTicks = 0;
     uint64_t stagingGLStateTicks = 0;
     uint64_t stagingBytes = 0;
+    uint64_t stagingCopiedBytes = 0;
     uint32_t stagingArrays = 0;
+    uint32_t stagingZeroCopyArrays = 0;
     bool nativeRecorded = false;
     bool stagingRecorded = false;
 };
 
-bool StageClientArrays(size_t maximumIndex, size_t instanceCount,
-                       std::vector<StagedClientArray> &staged,
-                       const std::vector<ClientArrayDescriptor> *only = nullptr,
-                       GLProfileSample *profileSample = nullptr) {
+void FilterClientArraysUsedByProgram(LC32EAGLContextStateLifetime *lifetime,
+                                     ClientArrayList &descriptors,
+                                     ScopedDrawStagingScratch *scratchScope = nullptr);
+
+bool StageClientArrays(LC32EAGLContextStateLifetime *lifetime,
+                       size_t maximumIndex, size_t instanceCount,
+                       ScopedDrawStagingScratch &scratchScope,
+                       const ClientArrayList *only = nullptr,
+                       GLProfileSample *profileSample = nullptr,
+                       bool *outStagedAny = nullptr) {
     const uint64_t t0 = profileSample ? mach_absolute_time() : 0;
-    std::vector<ClientArrayDescriptor> descriptors =
-        only ? *only : EnabledClientArrays();
-    staged.clear();
-    staged.reserve(descriptors.size());
+    ClientArrayList localDescriptors;
+    const ClientArrayList *descriptors = only;
+    if(!descriptors) {
+        CollectEnabledClientArrays(lifetime, localDescriptors);
+        if(!localDescriptors.Empty()) {
+            FilterClientArraysUsedByProgram(lifetime, localDescriptors,
+                                            &scratchScope);
+        }
+        descriptors = &localDescriptors;
+    }
+    const size_t descriptorCount = descriptors->Size();
     const uint64_t t1 = profileSample ? mach_absolute_time() : 0;
     if(profileSample) {
         profileSample->stagingSetupTicks += t1 - t0;
     }
-    for(const ClientArrayDescriptor &descriptor : descriptors) {
+    if(outStagedAny) *outStagedAny = (descriptorCount != 0);
+    if(descriptorCount == 0) return true;
+
+    SmallBuffer<ResolvedClientArray, 16> resolved;
+    if(!resolved.ResizeUninitialized(descriptorCount)) {
+        SetBridgeError(GL_OUT_OF_MEMORY);
+        return false;
+    }
+    ResolvedClientArray *resolvedData = resolved.Data();
+    const bool allowZeroCopy =
+        dispatchingInline && GLZeroCopyClientArraysEnabled();
+    size_t fallbackSlot = 0;
+
+    for(size_t i = 0; i < descriptorCount; ++i) {
+        const ClientArrayDescriptor &descriptor = (*descriptors)[i];
         const size_t descriptorMaximum =
             descriptor.kind == ClientArrayKind::VertexAttrib &&
                     descriptor.divisor
@@ -2066,14 +2506,37 @@ bool StageClientArrays(size_t maximumIndex, size_t instanceCount,
         size_t byteCount;
         if(!ClientArrayByteCount(descriptor, descriptorMaximum, byteCount))
             return false;
-        staged.push_back({descriptor, {}});
-        if(!ReadGuestBytes(descriptor.guestPointer, byteCount,
-                           staged.back().bytes)) {
+        if(byteCount > kMaximumTransfer ||
+           !GuestRangeValid(descriptor.guestPointer, byteCount) ||
+           (byteCount && !descriptor.guestPointer)) {
+            SetBridgeError(GL_INVALID_VALUE);
             return false;
         }
+        const void *pointer = nullptr;
+        bool zeroCopy = false;
+        if(allowZeroCopy && byteCount) {
+            const size_t scalarSize = ClientArrayScalarSize(descriptor.type);
+            const size_t baseAlign = scalarSize ? scalarSize : 4;
+            if(const char *span = Dynarmic_direct_read_contiguous_span(
+                    descriptor.guestPointer, byteCount)) {
+                if((reinterpret_cast<uintptr_t>(span) & (baseAlign - 1)) == 0) {
+                    pointer = span;
+                    zeroCopy = true;
+                }
+            }
+        }
+        if(!zeroCopy) {
+            DrawStagingScratch &scratch = scratchScope.Ensure();
+            UninitializedByteBuffer &buf =
+                scratch.ArrayBufferAt(fallbackSlot++);
+            if(!ReadGuestBytesUninitialized(descriptor.guestPointer, byteCount,
+                                            buf, scratch.hasOversized)) {
+                return false;
+            }
+            pointer = buf.Data();
+        }
+        resolvedData[i] = {&descriptor, pointer, byteCount, zeroCopy};
     }
-
-    if(staged.empty()) return true;
 
     const uint64_t t2 = profileSample ? mach_absolute_time() : 0;
 
@@ -2082,9 +2545,9 @@ bool StageClientArrays(size_t maximumIndex, size_t instanceCount,
     bool changedClientActiveTexture = false;
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &savedBinding);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    for(const StagedClientArray &array : staged) {
-        const ClientArrayDescriptor &descriptor = array.descriptor;
-        const GLvoid *pointer = array.bytes.data();
+    for(size_t i = 0; i < descriptorCount; ++i) {
+        const ClientArrayDescriptor &descriptor = *resolvedData[i].descriptor;
+        const GLvoid *pointer = resolvedData[i].pointer;
         switch(descriptor.kind) {
             case ClientArrayKind::VertexAttrib:
                 if(descriptor.integer) {
@@ -2136,44 +2599,89 @@ bool StageClientArrays(size_t maximumIndex, size_t instanceCount,
     glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(savedBinding));
     if(profileSample) {
         const uint64_t t3 = mach_absolute_time();
+        uint64_t stagedBytes = 0;
         uint64_t copiedBytes = 0;
-        for(const StagedClientArray &entry : staged) {
-            copiedBytes += entry.bytes.size();
+        uint32_t zeroCopyCount = 0;
+        for(size_t i = 0; i < descriptorCount; ++i) {
+            stagedBytes += resolvedData[i].byteCount;
+            if(resolvedData[i].zeroCopy) {
+                zeroCopyCount++;
+            } else {
+                copiedBytes += resolvedData[i].byteCount;
+            }
         }
         profileSample->stagingCopyTicks += t2 - t1;
         profileSample->stagingGLStateTicks += t3 - t2;
-        profileSample->stagingBytes += copiedBytes;
-        profileSample->stagingArrays += static_cast<uint32_t>(staged.size());
+        profileSample->stagingBytes += stagedBytes;
+        profileSample->stagingCopiedBytes += copiedBytes;
+        profileSample->stagingArrays += static_cast<uint32_t>(descriptorCount);
+        profileSample->stagingZeroCopyArrays += zeroCopyCount;
         profileSample->stagingRecorded = true;
     }
     return true;
 }
 
-bool StageClientArrays(size_t maximumIndex,
-                       std::vector<StagedClientArray> &staged,
+bool StageClientArrays(LC32EAGLContextStateLifetime *lifetime,
+                       size_t maximumIndex,
+                       ScopedDrawStagingScratch &scratchScope,
                        GLProfileSample *profileSample = nullptr) {
-    return StageClientArrays(maximumIndex, 1, staged, nullptr, profileSample);
+    return StageClientArrays(lifetime, maximumIndex, 1, scratchScope, nullptr,
+                             profileSample);
 }
 
-bool MaximumIndex(GLenum type, const std::vector<uint8_t> &indices,
-                  size_t &maximumIndex, bool &hasIndex) {
+template<typename IndexT>
+void ScanMaximumIndex(const uint8_t *data, size_t count, bool restartEnabled,
+                      size_t &maximumIndex, bool &hasIndex) {
+    if(!count) return;
+    if(!restartEnabled) {
+        IndexT maxVal = 0;
+        for(size_t i = 0; i < count; ++i) {
+            IndexT v;
+            memcpy(&v, data + i * sizeof(IndexT), sizeof(IndexT));
+            if(v > maxVal) maxVal = v;
+        }
+        hasIndex = true;
+        maximumIndex = static_cast<size_t>(maxVal);
+        return;
+    }
+    constexpr IndexT restartIndex = std::numeric_limits<IndexT>::max();
+    IndexT maxVal = 0;
+    bool found = false;
+    for(size_t i = 0; i < count; ++i) {
+        IndexT v;
+        memcpy(&v, data + i * sizeof(IndexT), sizeof(IndexT));
+        if(v == restartIndex) continue;
+        if(!found || v > maxVal) maxVal = v;
+        found = true;
+    }
+    if(found) {
+        hasIndex = true;
+        maximumIndex = static_cast<size_t>(maxVal);
+    }
+}
+
+bool MaximumIndex(GLenum type, const uint8_t *data, size_t byteCount,
+                  bool isES3, size_t &maximumIndex, bool &hasIndex) {
     maximumIndex = 0;
     hasIndex = false;
     const size_t elementSize = IndexElementSize(type);
-    if(!elementSize || indices.size() % elementSize) return false;
+    if(!elementSize || (byteCount % elementSize) != 0) return false;
+    if(!byteCount) return true;
     bool restartEnabled = false;
 #ifdef GL_PRIMITIVE_RESTART_FIXED_INDEX
-    restartEnabled = CurrentContextIsES3() &&
-        glIsEnabled(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+    if(isES3) {
+        restartEnabled = glIsEnabled(GL_PRIMITIVE_RESTART_FIXED_INDEX) != GL_FALSE;
+    }
+#else
+    (void)isES3;
 #endif
-    const uint32_t restartIndex = elementSize == 1 ? UINT8_MAX :
-        elementSize == 2 ? UINT16_MAX : UINT32_MAX;
-    for(size_t offset = 0; offset < indices.size(); offset += elementSize) {
-        uint32_t index = 0;
-        memcpy(&index, indices.data() + offset, elementSize);
-        if(restartEnabled && index == restartIndex) continue;
-        hasIndex = true;
-        maximumIndex = std::max(maximumIndex, static_cast<size_t>(index));
+    const size_t count = byteCount / elementSize;
+    if(elementSize == 1) {
+        ScanMaximumIndex<uint8_t>(data, count, restartEnabled, maximumIndex, hasIndex);
+    } else if(elementSize == 2) {
+        ScanMaximumIndex<uint16_t>(data, count, restartEnabled, maximumIndex, hasIndex);
+    } else {
+        ScanMaximumIndex<uint32_t>(data, count, restartEnabled, maximumIndex, hasIndex);
     }
     return true;
 }
@@ -2190,16 +2698,18 @@ struct ElementRangeKey {
     GLenum type;
     uintptr_t offset;
     GLsizei count;
+    bool restartEnabled;
     bool operator==(const ElementRangeKey &other) const {
         return type == other.type && offset == other.offset &&
-            count == other.count;
+            count == other.count && restartEnabled == other.restartEnabled;
     }
 };
 
 struct ElementRangeKeyHash {
     size_t operator()(const ElementRangeKey &key) const {
         return std::hash<uint64_t>()((static_cast<uint64_t>(key.offset) << 20) ^
-            (static_cast<uint64_t>(key.count) << 2) ^ key.type);
+            (static_cast<uint64_t>(key.count) << 2) ^ key.type ^
+            (key.restartEnabled ? UINT64_C(0x9e3779b97f4a7c15) : 0));
     }
 };
 
@@ -2221,9 +2731,58 @@ std::unordered_map<uintptr_t, std::unordered_map<GLuint,
 std::unordered_map<uintptr_t, std::unordered_map<GLuint,
     std::vector<uint8_t>>> elementShadows;
 
-void ForgetElementRanges(uintptr_t sharegroupKey, GLuint buffer,
-                         bool keepShadow = false) {
-    std::lock_guard<std::mutex> lock(elementRangeMutex);
+struct ActiveElementScan {
+    uintptr_t sharegroupKey = 0;
+    GLuint buffer = 0;
+    bool invalidated = false;
+    ActiveElementScan *prev = nullptr;
+    ActiveElementScan *next = nullptr;
+};
+ActiveElementScan *activeElementScansHead = nullptr;
+
+struct ScopedActiveElementScan {
+    ActiveElementScan node;
+    bool registered = false;
+
+    ScopedActiveElementScan(uintptr_t sharegroupKey, GLuint buffer) noexcept {
+        node.sharegroupKey = sharegroupKey;
+        node.buffer = buffer;
+    }
+
+    void RegisterLocked() noexcept {
+        node.prev = nullptr;
+        node.next = activeElementScansHead;
+        if(activeElementScansHead) activeElementScansHead->prev = &node;
+        activeElementScansHead = &node;
+        registered = true;
+    }
+
+    void UnregisterLocked() noexcept {
+        if(!registered) return;
+        if(node.prev) node.prev->next = node.next;
+        else activeElementScansHead = node.next;
+        if(node.next) node.next->prev = node.prev;
+        node.prev = nullptr;
+        node.next = nullptr;
+        registered = false;
+    }
+
+    ~ScopedActiveElementScan() {
+        if(registered) {
+            std::lock_guard<std::mutex> lock(elementRangeMutex);
+            UnregisterLocked();
+        }
+    }
+};
+
+void ForgetElementRangesLocked(uintptr_t sharegroupKey, GLuint buffer,
+                               bool keepShadow = false) {
+    for(ActiveElementScan *scan = activeElementScansHead; scan;
+        scan = scan->next) {
+        if(scan->sharegroupKey == sharegroupKey && scan->buffer == buffer) {
+            scan->invalidated = true;
+        }
+    }
     auto sharegroup = elementRanges.find(sharegroupKey);
     if(sharegroup != elementRanges.end()) sharegroup->second.erase(buffer);
     if(!keepShadow) {
@@ -2232,36 +2791,94 @@ void ForgetElementRanges(uintptr_t sharegroupKey, GLuint buffer,
     }
 }
 
-// glBufferData: keep a copy when uploaded as an element buffer.
-void RecordBufferData(uintptr_t sharegroupKey, GLenum target, GLuint buffer,
-                      const std::vector<uint8_t> &bytes, size_t size) {
-    ForgetElementRanges(sharegroupKey, buffer);
-    if(target != GL_ELEMENT_ARRAY_BUFFER) return;
+void ForgetElementRanges(uintptr_t sharegroupKey, GLuint buffer,
+                         bool keepShadow = false) {
     std::lock_guard<std::mutex> lock(elementRangeMutex);
-    std::vector<uint8_t> &shadow = elementShadows[sharegroupKey][buffer];
-    if(bytes.size() == size) shadow = bytes;
-    else shadow.assign(size, 0);
+    ForgetElementRangesLocked(sharegroupKey, buffer, keepShadow);
 }
 
-// glBufferSubData: patch the copy if there is one.
-void RecordBufferSubData(GLenum target, size_t offset,
-                         const std::vector<uint8_t> &bytes) {
-    GLuint buffer = 0;
-    if(!BoundBuffer(target, buffer)) return;
-    const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
-    ForgetElementRanges(sharegroupKey, buffer, /*keepShadow=*/true);
-    std::lock_guard<std::mutex> lock(elementRangeMutex);
-    auto shadows = elementShadows.find(sharegroupKey);
-    if(shadows == elementShadows.end()) return;
-    auto shadow = shadows->second.find(buffer);
-    if(shadow == shadows->second.end()) return;
-    if(offset > shadow->second.size() ||
-       bytes.size() > shadow->second.size() - offset) {
-        shadows->second.erase(shadow);
-        return;
+bool BufferUsageValid(GLenum usage, EAGLRenderingAPI api) {
+    switch(usage) {
+        case GL_STATIC_DRAW:
+        case GL_DYNAMIC_DRAW:
+            return true;
+        case GL_STREAM_DRAW:
+            return api != kEAGLRenderingAPIOpenGLES1;
+#ifdef GL_STREAM_READ
+        case GL_STREAM_READ:
+        case GL_STREAM_COPY:
+        case GL_STATIC_READ:
+        case GL_STATIC_COPY:
+        case GL_DYNAMIC_READ:
+        case GL_DYNAMIC_COPY:
+            return api == kEAGLRenderingAPIOpenGLES3;
+#endif
+        default:
+            return false;
     }
-    if(!bytes.empty())
-        memcpy(shadow->second.data() + offset, bytes.data(), bytes.size());
+}
+
+void ForgetElementRangesForTransformFeedback(uintptr_t sharegroupKey) {
+#ifdef GL_TRANSFORM_FEEDBACK_BUFFER_BINDING
+    if(!CurrentContextIsES3()) return;
+    {
+        std::lock_guard<std::mutex> lock(elementRangeMutex);
+        if(elementRanges.find(sharegroupKey) == elementRanges.end() &&
+           elementShadows.find(sharegroupKey) == elementShadows.end() &&
+           activeElementScansHead == nullptr) {
+            return;
+        }
+    }
+    GLint maxBindings = 0;
+    glGetIntegerv(GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS, &maxBindings);
+    for(GLint i = 0; i < maxBindings; ++i) {
+        GLint buffer = 0;
+        glGetIntegeri_v(GL_TRANSFORM_FEEDBACK_BUFFER_BINDING,
+            static_cast<GLuint>(i), &buffer);
+        if(static_cast<GLuint>(buffer) != 0) {
+            ForgetElementRanges(sharegroupKey, static_cast<GLuint>(buffer));
+        }
+    }
+#else
+    (void)sharegroupKey;
+#endif
+}
+
+// glBufferData: called after a verified non-NULL GL_ELEMENT_ARRAY_BUFFER upload.
+void RecordBufferData(uintptr_t sharegroupKey, GLuint buffer,
+                      const std::vector<uint8_t> &bytes) {
+    std::lock_guard<std::mutex> lock(elementRangeMutex);
+    ForgetElementRangesLocked(sharegroupKey, buffer);
+    elementShadows[sharegroupKey][buffer] = bytes;
+}
+
+// glBufferSubData: atomically invalidate ranges and patch (or populate on full
+// replacement of a NULL-allocated element buffer) the CPU shadow.
+void RecordBufferSubData(uintptr_t sharegroupKey, GLuint buffer, size_t offset,
+                         const std::vector<uint8_t> &bytes,
+                         GLint fullElementBufferSize = -1) {
+    std::lock_guard<std::mutex> lock(elementRangeMutex);
+    ForgetElementRangesLocked(sharegroupKey, buffer, /*keepShadow=*/true);
+    auto shadows = elementShadows.find(sharegroupKey);
+    if(shadows != elementShadows.end()) {
+        auto shadow = shadows->second.find(buffer);
+        if(shadow != shadows->second.end()) {
+            if(offset > shadow->second.size() ||
+               bytes.size() > shadow->second.size() - offset) {
+                shadows->second.erase(shadow);
+                return;
+            }
+            if(!bytes.empty()) {
+                memcpy(shadow->second.data() + offset, bytes.data(),
+                       bytes.size());
+            }
+            return;
+        }
+    }
+    if(offset == 0 && !bytes.empty() && fullElementBufferSize >= 0 &&
+       bytes.size() == static_cast<size_t>(fullElementBufferSize)) {
+        elementShadows[sharegroupKey][buffer] = bytes;
+    }
 }
 
 /*
@@ -2269,9 +2886,24 @@ void RecordBufferSubData(GLenum target, size_t offset,
  * the glGetActiveAttrib queries. Dropped when the program is relinked,
  * loaded from a binary or deleted.
  */
+struct ProgramAttributeSet {
+    uint64_t lowMask = 0;
+    std::unordered_set<GLuint> high;
+
+    void Insert(GLuint location) {
+        if(location < 64) lowMask |= (UINT64_C(1) << location);
+        else high.insert(location);
+    }
+
+    bool Contains(GLuint location) const {
+        if(location < 64) return (lowMask & (UINT64_C(1) << location)) != 0;
+        return high.count(location) != 0;
+    }
+};
+
 std::mutex programAttributeMutex;
 std::unordered_map<uintptr_t, std::unordered_map<GLuint,
-    std::unordered_set<GLuint>>> programAttributes;
+    ProgramAttributeSet>> programAttributes;
 
 void ForgetProgramAttributes(GLuint program) {
     const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
@@ -2289,6 +2921,12 @@ void ForgetElementRangesForTarget(GLenum target) {
 void ForgetSharegroupElementRanges(uintptr_t sharegroupKey) {
     {
         std::lock_guard<std::mutex> lock(elementRangeMutex);
+        for(ActiveElementScan *scan = activeElementScansHead; scan;
+            scan = scan->next) {
+            if(scan->sharegroupKey == sharegroupKey) {
+                scan->invalidated = true;
+            }
+        }
         elementRanges.erase(sharegroupKey);
         elementShadows.erase(sharegroupKey);
     }
@@ -2296,15 +2934,23 @@ void ForgetSharegroupElementRanges(uintptr_t sharegroupKey) {
     programAttributes.erase(sharegroupKey);
 }
 
-bool BoundElementBufferMaximumIndex(GLenum type, GLsizei count,
+bool BoundElementBufferMaximumIndex(LC32EAGLContextStateLifetime *lifetime,
+                                    GLuint buffer, GLenum type, GLsizei count,
                                     uintptr_t offset, size_t &maximumIndex,
                                     bool &hasIndex) {
     const size_t elementSize = IndexElementSize(type);
-    GLuint buffer = 0;
-    if(!elementSize || count <= 0 ||
-       !BoundBuffer(GL_ELEMENT_ARRAY_BUFFER, buffer)) return false;
-    const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
-    const ElementRangeKey key = {type, offset, count};
+    if(!elementSize || count <= 0 || !buffer) return false;
+    const bool es3 =
+        lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES3;
+    bool restartEnabled = false;
+#ifdef GL_PRIMITIVE_RESTART_FIXED_INDEX
+    if(es3) {
+        restartEnabled =
+            glIsEnabled(GL_PRIMITIVE_RESTART_FIXED_INDEX) != GL_FALSE;
+    }
+#endif
+    const uintptr_t sharegroupKey = lifetime ? lifetime->_sharegroupKey : 0;
+    const ElementRangeKey key = {type, offset, count, restartEnabled};
     {
         std::lock_guard<std::mutex> lock(elementRangeMutex);
         auto sharegroup = elementRanges.find(sharegroupKey);
@@ -2328,50 +2974,88 @@ bool BoundElementBufferMaximumIndex(GLenum type, GLsizei count,
     if(bufferSize < 0 || offset > static_cast<size_t>(bufferSize) ||
        byteCount > static_cast<size_t>(bufferSize) - offset) return false;
 
-    std::vector<uint8_t> indices(byteCount);
-    bool fromShadow = false;
-    {
-        std::lock_guard<std::mutex> lock(elementRangeMutex);
-        auto shadows = elementShadows.find(sharegroupKey);
-        if(shadows != elementShadows.end()) {
-            auto shadow = shadows->second.find(buffer);
-            if(shadow != shadows->second.end() &&
-               offset <= shadow->second.size() &&
-               byteCount <= shadow->second.size() - offset) {
-                memcpy(indices.data(), shadow->second.data() + offset,
-                    byteCount);
-                fromShadow = true;
-            }
+    auto scanBuffer = [&](const uint8_t *bytes) -> bool {
+        maximumIndex = 0;
+        hasIndex = false;
+        const size_t indexCount = byteCount / elementSize;
+        if(elementSize == 1) {
+            ScanMaximumIndex<uint8_t>(bytes, indexCount, restartEnabled,
+                                      maximumIndex, hasIndex);
+        } else if(elementSize == 2) {
+            ScanMaximumIndex<uint16_t>(bytes, indexCount, restartEnabled,
+                                       maximumIndex, hasIndex);
+        } else {
+            ScanMaximumIndex<uint32_t>(bytes, indexCount, restartEnabled,
+                                       maximumIndex, hasIndex);
         }
-    }
-    if(!fromShadow) {
-        std::lock_guard<std::mutex> lock(mappedBufferMutex);
-        // The guest has this buffer mapped: GL cannot map it again.
-        if(FindMappedBufferLocked(sharegroupKey, GL_ELEMENT_ARRAY_BUFFER,
-                buffer) != mappedBuffers.end()) return false;
-        const bool es3 = CurrentContextIsES3();
-        const void *bytes = es3
-            ? glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER,
-                static_cast<GLintptr>(offset),
-                static_cast<GLsizeiptr>(byteCount), GL_MAP_READ_BIT)
-            : glMapBufferRangeEXT(GL_ELEMENT_ARRAY_BUFFER,
-                static_cast<GLintptr>(offset),
-                static_cast<GLsizeiptr>(byteCount), GL_MAP_READ_BIT_EXT);
-        if(!bytes) {
-            glGetError();
+        return true;
+    };
+
+    for(int attempt = 0; attempt < 3; ++attempt) {
+        ScopedActiveElementScan activeScan(sharegroupKey, buffer);
+        {
+            std::lock_guard<std::mutex> lock(elementRangeMutex);
+            auto shadows = elementShadows.find(sharegroupKey);
+            if(shadows != elementShadows.end()) {
+                auto shadow = shadows->second.find(buffer);
+                if(shadow != shadows->second.end() &&
+                   offset <= shadow->second.size() &&
+                   byteCount <= shadow->second.size() - offset) {
+                    if(scanBuffer(shadow->second.data() + offset)) {
+                        auto &ranges = elementRanges[sharegroupKey][buffer];
+                        if(ranges.size() > 4096) ranges.clear();
+                        ranges[key] = {maximumIndex, hasIndex};
+                        return true;
+                    }
+                }
+            }
+            activeScan.RegisterLocked();
+        }
+
+        bool scanned = false;
+        bool unmapFailed = false;
+        {
+            std::lock_guard<std::mutex> lock(mappedBufferMutex);
+            // The guest has this buffer mapped: GL cannot map it again.
+            if(FindMappedBufferLocked(sharegroupKey, GL_ELEMENT_ARRAY_BUFFER,
+                    buffer) != mappedBuffers.end()) return false;
+            GLint isMapped = GL_FALSE;
+            glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_MAPPED_OES,
+                &isMapped);
+            if(isMapped != GL_FALSE) return false;
+            const void *bytes = es3
+                ? glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER,
+                    static_cast<GLintptr>(offset),
+                    static_cast<GLsizeiptr>(byteCount), GL_MAP_READ_BIT)
+                : glMapBufferRangeEXT(GL_ELEMENT_ARRAY_BUFFER,
+                    static_cast<GLintptr>(offset),
+                    static_cast<GLsizeiptr>(byteCount), GL_MAP_READ_BIT_EXT);
+            if(!bytes) return false;
+            scanned = scanBuffer(static_cast<const uint8_t *>(bytes));
+            const GLboolean unmapOk = es3
+                ? glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER)
+                : glUnmapBufferOES(GL_ELEMENT_ARRAY_BUFFER);
+            if(unmapOk == GL_FALSE) unmapFailed = true;
+        }
+        if(unmapFailed) {
+            // Per ES 3.0 §2.10.3, a FALSE unmap leaves the buffer data store
+            // undefined; evict any previously cached ranges and shadow.
+            ForgetElementRanges(sharegroupKey, buffer);
             return false;
         }
-        memcpy(indices.data(), bytes, byteCount);
-        if(es3) glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
-        else glUnmapBufferOES(GL_ELEMENT_ARRAY_BUFFER);
-    }
-    if(!MaximumIndex(type, indices, maximumIndex, hasIndex)) return false;
+        if(!scanned) return false;
 
-    std::lock_guard<std::mutex> lock(elementRangeMutex);
-    auto &ranges = elementRanges[sharegroupKey][buffer];
-    if(ranges.size() > 4096) ranges.clear();
-    ranges[key] = {maximumIndex, hasIndex};
-    return true;
+        std::lock_guard<std::mutex> lock(elementRangeMutex);
+        const bool invalidated = activeScan.node.invalidated;
+        activeScan.UnregisterLocked();
+        if(!invalidated) {
+            auto &ranges = elementRanges[sharegroupKey][buffer];
+            if(ranges.size() > 4096) ranges.clear();
+            ranges[key] = {maximumIndex, hasIndex};
+            return true;
+        }
+    }
+    return false;
 }
 
 /*
@@ -2403,11 +3087,12 @@ std::map<DetachedVertexAttribKey,
 std::atomic<size_t> detachedVertexAttribContexts{0};
 
 DetachedVertexAttribKey CurrentDetachedVertexAttribKey() {
-    const uintptr_t context = CurrentGLContextKey();
-    std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-    auto state = clientArrayStates.find(context);
-    return {context, state == clientArrayStates.end()
-        ? 0 : state->second.currentVertexArray};
+    LC32EAGLContextStateLifetime *lifetime =
+        ContextStateLifetimeForContext(EAGLContext.currentContext);
+    const uintptr_t contextKey = lifetime ? lifetime->_contextKey : 0;
+    auto &state = ClientArrayStateForLifetime(lifetime);
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return {contextKey, state.currentVertexArray};
 }
 
 GLint MaximumTrackedVertexAttribs() {
@@ -2652,23 +3337,16 @@ bool GLAttribCheckSkipsDraw(const char *what) {
         uint32_t guestPointer = 0;
         GLuint trackedType = 0, bridgeVertexArray = 0;
         {
-            std::lock_guard<std::mutex> lock(clientArrayStateMutex);
-            auto context = clientArrayStates.find(CurrentGLContextKey());
-            if(context != clientArrayStates.end()) {
-                bridgeVertexArray = context->second.currentVertexArray;
-                auto state = context->second.vertexArrays.find(
-                    bridgeVertexArray);
-                if(state != context->second.vertexArrays.end()) {
-                    trackedEnabled =
-                        state->second.enabledVertexAttribs.count(index);
-                    auto descriptor = state->second.vertexAttribs.find(index);
-                    if(descriptor != state->second.vertexAttribs.end()) {
-                        tracked = true;
-                        valid = descriptor->second.valid;
-                        guestPointer = descriptor->second.guestPointer;
-                        trackedType = descriptor->second.type;
-                    }
-                }
+            auto &context = CurrentClientArrayState();
+            std::lock_guard<std::mutex> lock(context.mutex);
+            bridgeVertexArray = context.currentVertexArray;
+            trackedEnabled = context.currentVao->IsVertexAttribEnabled(index);
+            if(const ClientArrayDescriptor *descriptor =
+                    context.currentVao->FindVertexAttrib(index)) {
+                tracked = true;
+                valid = descriptor->valid;
+                guestPointer = descriptor->guestPointer;
+                trackedType = descriptor->type;
             }
         }
         std::pair<GLint, uint32_t> last = {-1, 0};
@@ -2695,27 +3373,50 @@ bool GLAttribCheckSkipsDraw(const char *what) {
 }
 
 /*
- * Client arrays the current program reads. An attribute array the game left
- * enabled from an earlier draw but that this program does not use is never
- * fetched by GL, so it needs no copy (and its stale pointer may not even be
- * readable any more).
+ * Filter client arrays in place to those the current program reads. An
+ * attribute array the game left enabled from an earlier draw but that this
+ * program does not use is never fetched by GL, so it needs no staging (and its
+ * stale pointer may not even be readable any more).
  */
-std::vector<ClientArrayDescriptor> ClientArraysUsedByProgram() {
-    std::vector<ClientArrayDescriptor> descriptors = EnabledClientArrays();
-    if(descriptors.empty() || CurrentContextIsES1()) return descriptors;
+void FilterClientArraysUsedByProgram(LC32EAGLContextStateLifetime *lifetime,
+                                     ClientArrayList &descriptors,
+                                     ScopedDrawStagingScratch *scratchScope) {
+    if(descriptors.Empty() ||
+       (lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES1)) {
+        return;
+    }
     GLint program = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
-    if(!program) return descriptors;
-    const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
-    auto filter = [&](const std::unordered_set<GLuint> &used) {
-        std::vector<ClientArrayDescriptor> filtered;
-        filtered.reserve(descriptors.size());
-        for(const ClientArrayDescriptor &descriptor : descriptors) {
-            if(descriptor.kind != ClientArrayKind::VertexAttrib ||
-               used.count(descriptor.index))
-                filtered.push_back(descriptor);
+    if(!program) {
+#ifdef GL_PROGRAM_PIPELINE_BINDING_EXT
+        GLint pipeline = 0;
+        glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING_EXT, &pipeline);
+        if(pipeline) {
+            glGetProgramPipelineivEXT(static_cast<GLuint>(pipeline),
+                GL_VERTEX_SHADER, &program);
         }
-        return filtered;
+#endif
+        if(!program) return;
+    }
+    const uintptr_t sharegroupKey = lifetime ? lifetime->_sharegroupKey : 0;
+    auto filterInPlace = [&](const ProgramAttributeSet &used) {
+        size_t kept = 0;
+        const size_t total = descriptors.Size();
+        for(size_t i = 0; i < total; ++i) {
+            const ClientArrayDescriptor &descriptor = descriptors[i];
+            if(descriptor.kind != ClientArrayKind::VertexAttrib ||
+               used.Contains(descriptor.index)) {
+                if(kept != i) descriptors[kept] = descriptor;
+                kept++;
+            } else if(scratchScope) {
+                // Temporarily disable dropped client attributes on the host GL
+                // driver across the draw: its placeholder pointer is NULL, and
+                // GLEngine still faults on an enabled NULL attrib 0 even when
+                // the vertex shader has zero active attributes.
+                scratchScope->DisableUnusedVertexAttrib(descriptor.index);
+            }
+        }
+        descriptors.Truncate(kept);
     };
     {
         std::lock_guard<std::mutex> lock(programAttributeMutex);
@@ -2723,47 +3424,73 @@ std::vector<ClientArrayDescriptor> ClientArraysUsedByProgram() {
         if(sharegroup != programAttributes.end()) {
             auto cached = sharegroup->second.find(
                 static_cast<GLuint>(program));
-            if(cached != sharegroup->second.end())
-                return filter(cached->second);
+            if(cached != sharegroup->second.end()) {
+                filterInPlace(cached->second);
+                return;
+            }
         }
     }
     GLint linked = GL_FALSE;
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if(!linked) return descriptors;
-    GLint attributeCount = 0, nameLength = 0;
+    if(!linked) return;
+    GLint attributeCount = 0;
     glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &attributeCount);
-    glGetProgramiv(program, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &nameLength);
-    if(attributeCount <= 0 || nameLength <= 0) return descriptors;
-    std::unordered_set<GLuint> used;
-    std::vector<GLchar> name(static_cast<size_t>(nameLength) + 1);
-    for(GLint index = 0; index < attributeCount; ++index) {
-        GLint size = 0;
-        GLenum type = 0;
-        glGetActiveAttrib(program, static_cast<GLuint>(index),
-            static_cast<GLsizei>(name.size()), nullptr, &size, &type,
-            name.data());
-        const GLint location = glGetAttribLocation(program, name.data());
-        if(location < 0) continue;
-        GLint columns = 1;
-        switch(type) {
-            case GL_FLOAT_MAT2: columns = 2; break;
-            case GL_FLOAT_MAT3: columns = 3; break;
-            case GL_FLOAT_MAT4: columns = 4; break;
+    if(attributeCount < 0) return;
+    ProgramAttributeSet used;
+    if(attributeCount > 0) {
+        GLint nameLength = 0;
+        glGetProgramiv(program, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &nameLength);
+        if(nameLength <= 0) return;
+        std::vector<GLchar> name(static_cast<size_t>(nameLength) + 1);
+        for(GLint index = 0; index < attributeCount; ++index) {
+            GLint size = 0;
+            GLenum type = 0;
+            glGetActiveAttrib(program, static_cast<GLuint>(index),
+                static_cast<GLsizei>(name.size()), nullptr, &size, &type,
+                name.data());
+            const GLint location = glGetAttribLocation(program, name.data());
+            if(location < 0) continue;
+            GLint columns = 1;
+            switch(type) {
+                case GL_FLOAT_MAT2: columns = 2; break;
+                case GL_FLOAT_MAT3: columns = 3; break;
+                case GL_FLOAT_MAT4: columns = 4; break;
 #ifdef GL_FLOAT_MAT2x3
-            case GL_FLOAT_MAT2x3: case GL_FLOAT_MAT2x4: columns = 2; break;
-            case GL_FLOAT_MAT3x2: case GL_FLOAT_MAT3x4: columns = 3; break;
-            case GL_FLOAT_MAT4x2: case GL_FLOAT_MAT4x3: columns = 4; break;
+                case GL_FLOAT_MAT2x3: case GL_FLOAT_MAT2x4: columns = 2; break;
+                case GL_FLOAT_MAT3x2: case GL_FLOAT_MAT3x4: columns = 3; break;
+                case GL_FLOAT_MAT4x2: case GL_FLOAT_MAT4x3: columns = 4; break;
 #endif
-            default: break;
+                default: break;
+            }
+            for(GLint slot = 0; slot < columns * std::max(size, 1); ++slot)
+                used.Insert(static_cast<GLuint>(location + slot));
         }
-        for(GLint slot = 0; slot < columns * std::max(size, 1); ++slot)
-            used.insert(static_cast<GLuint>(location + slot));
     }
     {
         std::lock_guard<std::mutex> lock(programAttributeMutex);
         programAttributes[sharegroupKey][static_cast<GLuint>(program)] = used;
     }
-    return filter(used);
+    filterInPlace(used);
+}
+
+void DisableAllClientVertexAttribsForEmptyDraw(
+        LC32EAGLContextStateLifetime *lifetime,
+        ScopedDrawStagingScratch &scratchScope,
+        const ClientArrayList *alreadyCollected = nullptr) {
+    if(lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES1) return;
+    ClientArrayList localDescriptors;
+    const ClientArrayList *descriptors = alreadyCollected;
+    if(!descriptors) {
+        CollectEnabledClientArrays(lifetime, localDescriptors);
+        descriptors = &localDescriptors;
+    }
+    const size_t total = descriptors->Size();
+    for(size_t i = 0; i < total; ++i) {
+        const ClientArrayDescriptor &descriptor = (*descriptors)[i];
+        if(descriptor.kind == ClientArrayKind::VertexAttrib) {
+            scratchScope.DisableUnusedVertexAttrib(descriptor.index);
+        }
+    }
 }
 
 /*
@@ -2771,14 +3498,19 @@ std::vector<ClientArrayDescriptor> ClientArraysUsedByProgram() {
  * the program reads, up to the largest index in the element range. Returns
  * false (after setting a bridge error) when the draw cannot be made safe.
  */
-bool StageClientArraysForElementBuffer(GLenum type, GLsizei count,
-                                       uintptr_t offset, size_t instanceCount,
-                                       std::vector<StagedClientArray> &staged,
-                                       GLProfileSample *profileSample = nullptr) {
+bool StageClientArraysForElementBuffer(LC32EAGLContextStateLifetime *lifetime,
+                                       GLuint elementBuffer, GLenum type,
+                                       GLsizei count, uintptr_t offset,
+                                       size_t instanceCount,
+                                       ClientArrayList &descriptors,
+                                       ScopedDrawStagingScratch &scratchScope,
+                                       GLProfileSample *profileSample = nullptr,
+                                       size_t *outStagedMaxIndex = nullptr,
+                                       bool *outStagedAny = nullptr) {
+    if(outStagedAny) *outStagedAny = false;
     const uint64_t setupStart = profileSample ? mach_absolute_time() : 0;
-    std::vector<ClientArrayDescriptor> descriptors =
-        ClientArraysUsedByProgram();
-    if(descriptors.empty()) {
+    FilterClientArraysUsedByProgram(lifetime, descriptors, &scratchScope);
+    if(descriptors.Empty()) {
         if(profileSample) {
             profileSample->stagingSetupTicks +=
                 mach_absolute_time() - setupStart;
@@ -2788,8 +3520,8 @@ bool StageClientArraysForElementBuffer(GLenum type, GLsizei count,
     }
     size_t maximumIndex = 0;
     bool hasIndex = false;
-    if(!BoundElementBufferMaximumIndex(type, count, offset, maximumIndex,
-            hasIndex)) {
+    if(!BoundElementBufferMaximumIndex(lifetime, elementBuffer, type, count,
+            offset, maximumIndex, hasIndex)) {
         SetBridgeError(GL_INVALID_OPERATION);
         return false;
     }
@@ -2797,14 +3529,19 @@ bool StageClientArraysForElementBuffer(GLenum type, GLsizei count,
         profileSample->stagingSetupTicks += mach_absolute_time() - setupStart;
         profileSample->stagingRecorded = true;
     }
-    if(!hasIndex) return true;
+    if(!hasIndex) {
+        DisableAllClientVertexAttribsForEmptyDraw(lifetime, scratchScope,
+                                                  &descriptors);
+        return true;
+    }
     static std::atomic<bool> logged(false);
     if(!logged.exchange(true))
         fprintf(stderr, "LC32GL: element-buffer draw with %zu client "
-            "array(s), indices read back (max %zu)\n", descriptors.size(),
+            "array(s), indices read back (max %zu)\n", descriptors.Size(),
             maximumIndex);
-    return StageClientArrays(maximumIndex, instanceCount, staged,
-        &descriptors, profileSample);
+    if(outStagedMaxIndex) *outStagedMaxIndex = maximumIndex;
+    return StageClientArrays(lifetime, maximumIndex, instanceCount,
+        scratchScope, &descriptors, profileSample, outStagedAny);
 }
 
 bool ReadCount(int32_t signedCount, size_t multiplier, size_t &count) {
@@ -2837,7 +3574,9 @@ struct ProfileOpTiming {
 struct ProfileStagingTotals {
     uint64_t draws = 0;
     uint64_t arrays = 0;
+    uint64_t zeroCopyArrays = 0;
     uint64_t bytes = 0;
+    uint64_t copiedBytes = 0;
     uint64_t setupTicks = 0;
     uint64_t copyTicks = 0;
     uint64_t glStateTicks = 0;
@@ -3171,6 +3910,9 @@ uint32_t DispatchMapBuffer(const LC32OpenGLESCall &call, bool range) {
             const bool copied = WriteGuestBytes(guestPointer, snapshot,
                 length);
             const GLboolean unmapped = glUnmapBufferOES(target);
+            if(unmapped == GL_FALSE) {
+                ForgetElementRanges(sharegroupKey, buffer);
+            }
             if(!copied) return 0;
             if(unmapped == GL_FALSE) {
                 SetBridgeError(GL_INVALID_OPERATION);
@@ -3198,6 +3940,9 @@ uint32_t DispatchMapBuffer(const LC32OpenGLESCall &call, bool range) {
             const bool copied = WriteGuestBytes(guestPointer, snapshot,
                 static_cast<size_t>(signedLength));
             const GLboolean unmapped = glUnmapBufferOES(target);
+            if(unmapped == GL_FALSE) {
+                ForgetElementRanges(sharegroupKey, buffer);
+            }
             if(!copied) return 0;
             if(unmapped == GL_FALSE) {
                 SetBridgeError(GL_INVALID_OPERATION);
@@ -3208,9 +3953,20 @@ uint32_t DispatchMapBuffer(const LC32OpenGLESCall &call, bool range) {
         writable = access == GL_WRITE_ONLY_OES;
     }
     if(!nativePointer) return 0;
+    if(writable || (range && (SlotU32(call, 3) &
+            (GL_MAP_INVALIDATE_RANGE_BIT_EXT |
+             GL_MAP_INVALIDATE_BUFFER_BIT_EXT)))) {
+        ForgetElementRanges(sharegroupKey, buffer);
+    }
+
+    auto cleanupUnmap = [&]() {
+        if(glUnmapBufferOES(target) == GL_FALSE) {
+            ForgetElementRanges(sharegroupKey, buffer);
+        }
+    };
 
     if(!guestPointer) {
-        glUnmapBufferOES(target);
+        cleanupUnmap();
         SetBridgeError(signedLength > 0 ? GL_OUT_OF_MEMORY
                                         : GL_INVALID_OPERATION);
         return 0;
@@ -3218,7 +3974,7 @@ uint32_t DispatchMapBuffer(const LC32OpenGLESCall &call, bool range) {
 
     if(readable && !WriteGuestBytes(guestPointer, nativePointer,
             static_cast<size_t>(signedLength))) {
-        glUnmapBufferOES(target);
+        cleanupUnmap();
         return 0;
     }
 
@@ -3227,7 +3983,7 @@ uint32_t DispatchMapBuffer(const LC32OpenGLESCall &call, bool range) {
             guestPointer, static_cast<size_t>(signedLength), writable,
             flushExplicit});
     } catch(const std::bad_alloc &) {
-        glUnmapBufferOES(target);
+        cleanupUnmap();
         SetBridgeError(GL_OUT_OF_MEMORY);
         return 0;
     }
@@ -3394,7 +4150,9 @@ size_t VertexAttribElementCount(GLenum pname) {
 @implementation LC32EAGLContextStateLifetime
 
 - (void)dealloc {
-    RemoveClientArrayState(_contextKey);
+    ForgetDetachedVertexAttribs(_contextKey, 0, nullptr);
+    delete _clientArrays;
+    _clientArrays = nullptr;
     [super dealloc];
 }
 
@@ -3680,7 +4438,11 @@ extern "C" void LC32_OpenGLES_ProfileReport(double seconds) {
     }
     const uint64_t dStDraws = curStaging.draws - lastStaging.draws;
     const uint64_t dStArrays = curStaging.arrays - lastStaging.arrays;
+    const uint64_t dStZeroCopy =
+        curStaging.zeroCopyArrays - lastStaging.zeroCopyArrays;
     const uint64_t dStBytes = curStaging.bytes - lastStaging.bytes;
+    const uint64_t dStCopiedBytes =
+        curStaging.copiedBytes - lastStaging.copiedBytes;
     const uint64_t dStSetup = curStaging.setupTicks - lastStaging.setupTicks;
     const uint64_t dStCopy = curStaging.copyTicks - lastStaging.copyTicks;
     const uint64_t dStGLState =
@@ -3691,13 +4453,18 @@ extern "C" void LC32_OpenGLES_ProfileReport(double seconds) {
         const double copyNs = (double)dStCopy * ticksToNs;
         const double glStateNs = (double)dStGLState * ticksToNs;
         const double totNs = setupNs + copyNs + glStateNs;
+        const double zcPct = dStArrays
+            ? 100.0 * (double)dStZeroCopy / (double)dStArrays
+            : 0.0;
         fprintf(stderr,
             "LC32PROF   GL staging: %.0f draws/s (%.1f arrays/draw, "
-            "%.2f MB/s, %.1f KB/draw): tot %.2fms/s = setup %.2f + "
+            "%.0f%% zc, %.2f MB/s [%.2f copied], %.1f KB/draw): tot %.2fms/s = setup %.2f + "
             "copy %.2f + glstate %.2f (%.0f ns/draw: %.0f+%.0f+%.0f)\n",
             (double)dStDraws / seconds,
             (double)dStArrays / (double)dStDraws,
+            zcPct,
             (double)dStBytes / (1024.0 * 1024.0) / seconds,
+            (double)dStCopiedBytes / (1024.0 * 1024.0) / seconds,
             (double)dStBytes / 1024.0 / (double)dStDraws,
             totNs / 1e6 / seconds,
             setupNs / 1e6 / seconds,
@@ -3753,7 +4520,9 @@ extern "C" uint32_t LC32_OpenGLES_Dispatch(uint32_t opcode,
         if(sample.stagingRecorded && sample.nativeRecorded) {
             profileStagingTotals.draws++;
             profileStagingTotals.arrays += sample.stagingArrays;
+            profileStagingTotals.zeroCopyArrays += sample.stagingZeroCopyArrays;
             profileStagingTotals.bytes += sample.stagingBytes;
+            profileStagingTotals.copiedBytes += sample.stagingCopiedBytes;
             profileStagingTotals.setupTicks += sample.stagingSetupTicks;
             profileStagingTotals.copyTicks += sample.stagingCopyTicks;
             profileStagingTotals.glStateTicks += sample.stagingGLStateTicks;
@@ -4060,8 +4829,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             const size_t maximumIndex = static_cast<size_t>(first) +
                 static_cast<size_t>(count) - 1;
-            std::vector<StagedClientArray> staged;
-            if(!StageClientArrays(maximumIndex, staged, profileSample)) return 0;
+            LC32EAGLContextStateLifetime *lifetime =
+                ContextStateLifetimeForContext(EAGLContext.currentContext);
+            ScopedDrawStagingScratch scratch;
+            if(!StageClientArrays(lifetime, maximumIndex, scratch,
+                                  profileSample)) return 0;
             if(GLAttribCheckSkipsDraw("DrawArrays")) return 0;
             LC32_GL_TIME_NATIVE(glDrawArrays(U(0), first, count));
             return 0;
@@ -4082,9 +4854,11 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             const size_t maximumIndex = static_cast<size_t>(first) +
                 static_cast<size_t>(count) - 1;
-            std::vector<StagedClientArray> staged;
-            if(!StageClientArrays(maximumIndex,
-                    static_cast<size_t>(instanceCount), staged, nullptr,
+            LC32EAGLContextStateLifetime *lifetime =
+                ContextStateLifetimeForContext(EAGLContext.currentContext);
+            ScopedDrawStagingScratch scratch;
+            if(!StageClientArrays(lifetime, maximumIndex,
+                    static_cast<size_t>(instanceCount), scratch, nullptr,
                     profileSample)) return 0;
             LC32_GL_TIME_NATIVE(glDrawArraysInstancedEXT(U(0), first, count, instanceCount));
             return 0;
@@ -4099,7 +4873,10 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
         case LC32OpenGLESOpEndQueryEXT:
             REQUIRE(1); glEndQueryEXT(U(0)); return 0;
         case LC32OpenGLESOpEndTransformFeedback:
-            REQUIRE(0); glEndTransformFeedback(); return 0;
+            REQUIRE(0);
+            glEndTransformFeedback();
+            ForgetElementRangesForTransformFeedback(CurrentGLSharegroupKey());
+            return 0;
         case LC32OpenGLESOpFinish: REQUIRE(0); LC32_GL_TIME_NATIVE(glFinish()); return 0;
         case LC32OpenGLESOpFenceSyncAPPLE: {
             REQUIRE(2);
@@ -4214,7 +4991,10 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             return 0;
         case LC32OpenGLESOpPixelStorei: REQUIRE(2); glPixelStorei(U(0), I(1)); return 0;
         case LC32OpenGLESOpPauseTransformFeedback:
-            REQUIRE(0); glPauseTransformFeedback(); return 0;
+            REQUIRE(0);
+            glPauseTransformFeedback();
+            ForgetElementRangesForTransformFeedback(CurrentGLSharegroupKey());
+            return 0;
         case LC32OpenGLESOpPolygonOffset: REQUIRE(2); glPolygonOffset(F(0), F(1)); return 0;
         case LC32OpenGLESOpPopGroupMarkerEXT:
             REQUIRE(0); glPopGroupMarkerEXT(); return 0;
@@ -4831,9 +5611,9 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 return 0;
             }
             const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
-            RecordBufferData(sharegroupKey, U(0), buffer, bytes,
-                static_cast<size_t>(signedSize));
+            ForgetElementRanges(sharegroupKey, buffer);
             uint32_t guestPointer = 0;
+            bool leftMapped = false;
             {
                 std::lock_guard<std::mutex> lock(mappedBufferMutex);
                 auto mapped = FindMappedBufferLocked(sharegroupKey, U(0),
@@ -4843,10 +5623,32 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                     GLint stillMapped = GL_TRUE;
                     glGetBufferParameteriv(U(0), GL_BUFFER_MAPPED_OES,
                         &stillMapped);
-                    if(stillMapped == GL_FALSE)
+                    if(stillMapped == GL_FALSE) {
                         guestPointer = RetireMappedBufferLocked(
                             sharegroupKey, buffer);
+                    } else {
+                        leftMapped = true;
+                    }
                 }
+            }
+            LC32EAGLContextStateLifetime *bufLifetime =
+                ContextStateLifetimeForContext(EAGLContext.currentContext);
+            const EAGLRenderingAPI bufApi =
+                bufLifetime ? bufLifetime->_api : kEAGLRenderingAPIOpenGLES1;
+            bool recordedShadow = false;
+            if(!leftMapped && U(0) == GL_ELEMENT_ARRAY_BUFFER &&
+               (U(2) != 0 || signedSize == 0) &&
+               BufferUsageValid(U(3), bufApi)) {
+                GLint actualSize = -1;
+                glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE,
+                    &actualSize);
+                if(actualSize == signedSize) {
+                    RecordBufferData(sharegroupKey, buffer, bytes);
+                    recordedShadow = true;
+                }
+            }
+            if(!recordedShadow) {
+                ForgetElementRanges(sharegroupKey, buffer);
             }
             ReleaseGuestMappingPointer(guestPointer);
             return 0;
@@ -4861,9 +5663,28 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             std::vector<uint8_t> bytes;
             if(!ReadGuestBytes(U(3), signedSize, bytes)) return 0;
-            RecordBufferSubData(U(0), static_cast<size_t>(signedOffset), bytes);
             LC32_GL_TIME_NATIVE(glBufferSubData(U(0), signedOffset, signedSize,
                 signedSize ? bytes.data() : nullptr));
+            GLuint buffer = 0;
+            if(BoundBuffer(U(0), buffer)) {
+                const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
+                bool isMapped = false;
+                {
+                    std::lock_guard<std::mutex> lock(mappedBufferMutex);
+                    isMapped = FindMappedBufferLocked(sharegroupKey, U(0),
+                        buffer) != mappedBuffers.end();
+                }
+                if(!isMapped) {
+                    GLint actualSize = -1;
+                    if(U(0) == GL_ELEMENT_ARRAY_BUFFER && signedOffset == 0 &&
+                       signedSize > 0) {
+                        glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER,
+                            GL_BUFFER_SIZE, &actualSize);
+                    }
+                    RecordBufferSubData(sharegroupKey, buffer,
+                        static_cast<size_t>(signedOffset), bytes, actualSize);
+                }
+            }
             return 0;
         }
         case LC32OpenGLESOpGetBufferParameteriv:
@@ -5305,7 +6126,10 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 total += storage[i].size();
                 strings[i] = storage[i].c_str();
             }
-            return glCreateShaderProgramvEXT(U(0), I(1), strings.data());
+            const GLuint program =
+                glCreateShaderProgramvEXT(U(0), I(1), strings.data());
+            if(program) ForgetProgramAttributes(program);
+            return program;
         }
         case LC32OpenGLESOpLabelObjectEXT: {
             REQUIRE(4);
@@ -5339,6 +6163,8 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             if(CurrentContextIsES3())
                 glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
             if(packBuffer) {
+                ForgetElementRanges(CurrentGLSharegroupKey(),
+                    static_cast<GLuint>(packBuffer));
                 LC32_GL_TIME_NATIVE(glReadPixels(I(0), I(1), I(2), I(3), U(4), U(5),
                     reinterpret_cast<void *>(
                         static_cast<uintptr_t>(U(6)))));
@@ -5927,20 +6753,37 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             GLint binding = 0;
             glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &binding);
+            LC32EAGLContextStateLifetime *lifetime =
+                ContextStateLifetimeForContext(EAGLContext.currentContext);
             if(binding) {
-                std::vector<StagedClientArray> staged;
+                if(count == 0) {
+                    LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4),
+                        reinterpret_cast<const void *>(
+                            static_cast<uintptr_t>(U(5)))));
+                    return 0;
+                }
+                ScopedDrawStagingScratch scratch;
                 const uint64_t checkStart =
                     profileSample ? mach_absolute_time() : 0;
-                const bool hasClientArrays = !EnabledClientArrays().empty();
-                if(hasClientArrays) {
+                ClientArrayList descriptors;
+                CollectEnabledClientArrays(lifetime, descriptors);
+                GLuint drawEnd = U(2);
+                if(!descriptors.Empty()) {
                     if(profileSample) {
                         profileSample->stagingSetupTicks +=
                             mach_absolute_time() - checkStart;
                     }
-                    if(!StageClientArraysForElementBuffer(U(4), count, U(5), 1,
-                            staged, profileSample)) return 0;
+                    size_t stagedMaxIndex = 0;
+                    bool stagedAny = false;
+                    if(!StageClientArraysForElementBuffer(lifetime,
+                            static_cast<GLuint>(binding), U(4), count, U(5), 1,
+                            descriptors, scratch, profileSample,
+                            &stagedMaxIndex, &stagedAny)) return 0;
+                    if(stagedAny && stagedMaxIndex < drawEnd) {
+                        drawEnd = static_cast<GLuint>(stagedMaxIndex);
+                    }
                 }
-                LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4),
+                LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), drawEnd, count, U(4),
                     reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(5)))));
                 return 0;
@@ -5951,14 +6794,17 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 SetBridgeError(!elementSize ? GL_INVALID_ENUM : GL_INVALID_VALUE);
                 return 0;
             }
-            std::vector<uint8_t> indices;
+            ScopedDrawStagingScratch scratchScope;
+            DrawStagingScratch &scratch = scratchScope.Ensure();
             const uint64_t idxCopyStart =
                 profileSample ? mach_absolute_time() : 0;
-            if(!ReadGuestBytes(U(5), byteCount, indices)) return 0;
+            if(!ReadGuestBytesUninitialized(U(5), byteCount, scratch.indexBytes,
+                                            scratch.hasOversized)) return 0;
             if(profileSample && byteCount) {
                 profileSample->stagingCopyTicks +=
                     mach_absolute_time() - idxCopyStart;
                 profileSample->stagingBytes += byteCount;
+                profileSample->stagingCopiedBytes += byteCount;
                 profileSample->stagingRecorded = true;
             }
             if(!count) {
@@ -5967,9 +6813,13 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             size_t maximumIndex;
             bool hasIndex;
+            const bool isES3 =
+                lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES3;
             const uint64_t maxIdxStart =
                 profileSample ? mach_absolute_time() : 0;
-            if(!MaximumIndex(U(4), indices, maximumIndex, hasIndex)) {
+            if(!MaximumIndex(U(4), scratch.indexBytes.Data(),
+                             scratch.indexBytes.Size(), isES3,
+                             maximumIndex, hasIndex)) {
                 SetBridgeError(GL_INVALID_ENUM);
                 return 0;
             }
@@ -5977,11 +6827,22 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 profileSample->stagingSetupTicks +=
                     mach_absolute_time() - maxIdxStart;
             }
-            std::vector<StagedClientArray> staged;
-            if(hasIndex && !StageClientArrays(maximumIndex, staged, profileSample))
-                return 0;
-            LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), U(2), count, U(4),
-                indices.data()));
+            GLuint drawEnd = U(2);
+            if(hasIndex) {
+                bool stagedAny = false;
+                if(!StageClientArrays(lifetime, maximumIndex, 1,
+                                      scratchScope, nullptr, profileSample,
+                                      &stagedAny))
+                    return 0;
+                if(stagedAny && maximumIndex < drawEnd) {
+                    drawEnd = static_cast<GLuint>(maximumIndex);
+                }
+            } else {
+                DisableAllClientVertexAttribsForEmptyDraw(lifetime,
+                                                          scratchScope);
+            }
+            LC32_GL_TIME_NATIVE(glDrawRangeElements(U(0), U(1), drawEnd, count, U(4),
+                scratch.indexBytes.Data()));
             return 0;
         }
         case LC32OpenGLESOpDrawElements: {
@@ -5989,18 +6850,24 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             DetachedVertexAttribDrawGuard detachedAttribs;
             GLint binding = 0;
             glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &binding);
+            LC32EAGLContextStateLifetime *lifetime =
+                ContextStateLifetimeForContext(EAGLContext.currentContext);
             if(binding) {
-                std::vector<StagedClientArray> staged;
-                const uint64_t checkStart =
-                    profileSample ? mach_absolute_time() : 0;
-                const bool hasClientArrays = !EnabledClientArrays().empty();
-                if(hasClientArrays) {
-                    if(profileSample) {
-                        profileSample->stagingSetupTicks +=
-                            mach_absolute_time() - checkStart;
+                ScopedDrawStagingScratch scratch;
+                if(I(1) > 0) {
+                    const uint64_t checkStart =
+                        profileSample ? mach_absolute_time() : 0;
+                    ClientArrayList descriptors;
+                    CollectEnabledClientArrays(lifetime, descriptors);
+                    if(!descriptors.Empty()) {
+                        if(profileSample) {
+                            profileSample->stagingSetupTicks +=
+                                mach_absolute_time() - checkStart;
+                        }
+                        if(!StageClientArraysForElementBuffer(lifetime,
+                                static_cast<GLuint>(binding), U(2), I(1), U(3), 1,
+                                descriptors, scratch, profileSample)) return 0;
                     }
-                    if(!StageClientArraysForElementBuffer(U(2), I(1), U(3), 1,
-                            staged, profileSample)) return 0;
                 }
                 if(GLAttribCheckSkipsDraw("DrawElements, element buffer"))
                     return 0;
@@ -6014,14 +6881,17 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 SetBridgeError(GL_INVALID_ENUM);
                 return 0;
             }
-            std::vector<uint8_t> indices;
+            ScopedDrawStagingScratch scratchScope;
+            DrawStagingScratch &scratch = scratchScope.Ensure();
             const uint64_t idxCopyStart =
                 profileSample ? mach_absolute_time() : 0;
-            if(!ReadGuestBytes(U(3), count, indices)) return 0;
+            if(!ReadGuestBytesUninitialized(U(3), count, scratch.indexBytes,
+                                            scratch.hasOversized)) return 0;
             if(profileSample && count) {
                 profileSample->stagingCopyTicks +=
                     mach_absolute_time() - idxCopyStart;
                 profileSample->stagingBytes += count;
+                profileSample->stagingCopiedBytes += count;
                 profileSample->stagingRecorded = true;
             }
             if(I(1) == 0) {
@@ -6030,9 +6900,13 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             size_t maximumIndex;
             bool hasIndex;
+            const bool isES3 =
+                lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES3;
             const uint64_t maxIdxStart =
                 profileSample ? mach_absolute_time() : 0;
-            if(!MaximumIndex(U(2), indices, maximumIndex, hasIndex)) {
+            if(!MaximumIndex(U(2), scratch.indexBytes.Data(),
+                             scratch.indexBytes.Size(), isES3,
+                             maximumIndex, hasIndex)) {
                 SetBridgeError(GL_INVALID_ENUM);
                 return 0;
             }
@@ -6040,12 +6914,18 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 profileSample->stagingSetupTicks +=
                     mach_absolute_time() - maxIdxStart;
             }
-            std::vector<StagedClientArray> staged;
-            if(hasIndex && !StageClientArrays(maximumIndex, staged, profileSample))
-                return 0;
+            if(hasIndex) {
+                if(!StageClientArrays(lifetime, maximumIndex,
+                                      scratchScope, profileSample))
+                    return 0;
+            } else {
+                DisableAllClientVertexAttribsForEmptyDraw(lifetime,
+                                                          scratchScope);
+            }
             if(GLAttribCheckSkipsDraw("DrawElements, client indices"))
                 return 0;
-            LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2), indices.data()));
+            LC32_GL_TIME_NATIVE(glDrawElements(U(0), I(1), U(2),
+                scratch.indexBytes.Data()));
             return 0;
         }
         case LC32OpenGLESOpDrawElementsInstancedEXT: {
@@ -6068,19 +6948,23 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                     instanceCount));
                 return 0;
             }
+            LC32EAGLContextStateLifetime *lifetime =
+                ContextStateLifetimeForContext(EAGLContext.currentContext);
             if(binding) {
-                std::vector<StagedClientArray> staged;
+                ScopedDrawStagingScratch scratch;
                 const uint64_t checkStart =
                     profileSample ? mach_absolute_time() : 0;
-                const bool hasClientArrays = !EnabledClientArrays().empty();
-                if(hasClientArrays) {
+                ClientArrayList descriptors;
+                CollectEnabledClientArrays(lifetime, descriptors);
+                if(!descriptors.Empty()) {
                     if(profileSample) {
                         profileSample->stagingSetupTicks +=
                             mach_absolute_time() - checkStart;
                     }
-                    if(!StageClientArraysForElementBuffer(U(2), count, U(3),
-                            static_cast<size_t>(instanceCount), staged,
-                            profileSample)) return 0;
+                    if(!StageClientArraysForElementBuffer(lifetime,
+                            static_cast<GLuint>(binding), U(2), count, U(3),
+                            static_cast<size_t>(instanceCount), descriptors,
+                            scratch, profileSample)) return 0;
                 }
                 LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2),
                     reinterpret_cast<const void *>(
@@ -6093,21 +6977,28 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 SetBridgeError(!elementSize ? GL_INVALID_ENUM : GL_INVALID_VALUE);
                 return 0;
             }
-            std::vector<uint8_t> indices;
+            ScopedDrawStagingScratch scratchScope;
+            DrawStagingScratch &scratch = scratchScope.Ensure();
             const uint64_t idxCopyStart =
                 profileSample ? mach_absolute_time() : 0;
-            if(!ReadGuestBytes(U(3), byteCount, indices)) return 0;
+            if(!ReadGuestBytesUninitialized(U(3), byteCount, scratch.indexBytes,
+                                            scratch.hasOversized)) return 0;
             if(profileSample && byteCount) {
                 profileSample->stagingCopyTicks +=
                     mach_absolute_time() - idxCopyStart;
                 profileSample->stagingBytes += byteCount;
+                profileSample->stagingCopiedBytes += byteCount;
                 profileSample->stagingRecorded = true;
             }
             size_t maximumIndex;
             bool hasIndex;
+            const bool isES3 =
+                lifetime != nil && lifetime->_api == kEAGLRenderingAPIOpenGLES3;
             const uint64_t maxIdxStart =
                 profileSample ? mach_absolute_time() : 0;
-            if(!MaximumIndex(U(2), indices, maximumIndex, hasIndex)) {
+            if(!MaximumIndex(U(2), scratch.indexBytes.Data(),
+                             scratch.indexBytes.Size(), isES3,
+                             maximumIndex, hasIndex)) {
                 SetBridgeError(GL_INVALID_ENUM);
                 return 0;
             }
@@ -6115,12 +7006,16 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 profileSample->stagingSetupTicks +=
                     mach_absolute_time() - maxIdxStart;
             }
-            std::vector<StagedClientArray> staged;
-            if(hasIndex && !StageClientArrays(maximumIndex,
-                    static_cast<size_t>(instanceCount), staged, nullptr,
-                    profileSample)) return 0;
-            LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2), indices.data(),
-                instanceCount));
+            if(hasIndex) {
+                if(!StageClientArrays(lifetime, maximumIndex,
+                        static_cast<size_t>(instanceCount), scratchScope,
+                        nullptr, profileSample)) return 0;
+            } else {
+                DisableAllClientVertexAttribsForEmptyDraw(lifetime,
+                                                          scratchScope);
+            }
+            LC32_GL_TIME_NATIVE(glDrawElementsInstancedEXT(U(0), count, U(2),
+                scratch.indexBytes.Data(), instanceCount));
             return 0;
         }
         case LC32OpenGLESOpVertexAttribPointer: {
@@ -6139,10 +7034,45 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                     "%d, 0x%x) ARRAY_BUFFER %d valid %d\n", U(0), I(1), U(2),
                     U(3), I(4), U(5), binding, valid);
             if(!valid) {
+                const bool canCheckAcceptance =
+                    VertexAttribIndexValid(U(0)) && I(1) >= 1 && I(1) <= 4 &&
+                    I(4) >= 0 && ClientArrayScalarSize(U(2)) != 0;
                 LC32_GL_TIME_NATIVE(glVertexAttribPointer(U(0), I(1), U(2), U(3), I(4), binding
                     ? reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(5)))
                     : nullptr));
+                if(canCheckAcceptance) {
+                    GLint afterType = 0, afterSize = 0, afterStride = 0;
+                    GLint afterBinding = 0;
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_TYPE,
+                        &afterType);
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_SIZE,
+                        &afterSize);
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_STRIDE,
+                        &afterStride);
+                    glGetVertexAttribiv(U(0),
+                        GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &afterBinding);
+                    if(afterType == static_cast<GLint>(U(2)) &&
+                       afterSize == I(1) && afterStride == I(4) &&
+                       afterBinding == binding) {
+                        if(!binding) {
+                            ClientArrayDescriptor descriptor;
+                            descriptor.kind = ClientArrayKind::VertexAttrib;
+                            descriptor.index = U(0);
+                            descriptor.size = I(1);
+                            descriptor.type = U(2);
+                            descriptor.normalized = static_cast<GLboolean>(U(3));
+                            descriptor.stride = I(4);
+                            descriptor.guestPointer = U(5);
+                            descriptor.valid = true;
+                            RememberVertexAttribPointer(&descriptor,
+                                descriptor.index);
+                        } else {
+                            RememberVertexAttribPointer(nullptr, U(0));
+                            GLAttribCheckNotePointer(U(0), binding, U(5));
+                        }
+                    }
+                }
                 return 0;
             }
             if(!binding) {

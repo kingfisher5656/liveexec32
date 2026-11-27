@@ -159,6 +159,31 @@ std::uint32_t LC32GuestInitialFpscr() {
 }
 
 /*
+ * Sequence counter incremented (odd before, even after) under guestVmMutex
+ * around every guest page-table mutation. Multi-page readers in
+ * Dynarmic_direct_read_contiguous_span verify that no mapping or protection
+ * change overlapped their walk across firstIdx..lastIdx.
+ */
+static std::atomic<uint64_t> guestVmMappingSeq{0};
+
+class GuestVmMappingSeqWriter {
+public:
+    GuestVmMappingSeqWriter() {
+        const uint64_t seq = guestVmMappingSeq.load(std::memory_order_relaxed);
+        assert((seq & 1u) == 0);
+        guestVmMappingSeq.store(seq + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acq_rel);
+    }
+    ~GuestVmMappingSeqWriter() {
+        const uint64_t seq = guestVmMappingSeq.load(std::memory_order_relaxed);
+        assert((seq & 1u) == 1u);
+        guestVmMappingSeq.store(seq + 1, std::memory_order_release);
+    }
+    GuestVmMappingSeqWriter(const GuestVmMappingSeqWriter &) = delete;
+    GuestVmMappingSeqWriter &operator=(const GuestVmMappingSeqWriter &) = delete;
+};
+
+/*
  * Class:     com_github_unidbg_arm_backend_dynarmic_Dynarmic
  * Method:    nativeInitialize
  * Signature: (Z)J
@@ -401,6 +426,7 @@ void Dynarmic_nativeDestroy() {
             guestVmMutex);
         khash_t(memory) *memory = sharedHandle.memory;
         if (memory != nullptr) {
+            GuestVmMappingSeqWriter mappingSeq;
             InvalidateGuestMemoryLookupCaches();
             for (khiter_t k = kh_begin(memory);
                     k < kh_end(memory); ++k) {
@@ -660,22 +686,25 @@ int Dynarmic_munmap(u64 address, u64 size) {
     }
 #endif
 
-    InvalidateGuestMemoryLookupCaches();
-    for(u64 vaddr = address; vaddr < end;
-            vaddr += DYN_PAGE_SIZE) {
-        khiter_t k = kh_get(memory, memory, vaddr);
-        ClearGuestPageTableEntries(vaddr);
-        t_memory_page page = kh_value(memory, k);
-        /*
-         * Guest pages are 4 KiB while Apple Silicon host VM pages are
-         * 16 KiB. Anonymous guest mappings therefore share one host mmap
-         * backing object and release it only after every guest slice has
-         * gone away. Per-slice munmap would also remove adjacent live guest
-         * pages (notably the pthread structure beside a retired stack).
-         */
-        ReleaseMemoryPageBacking(page);
-        free(page);
-        kh_del(memory, memory, k);
+    {
+        GuestVmMappingSeqWriter mappingSeq;
+        InvalidateGuestMemoryLookupCaches();
+        for(u64 vaddr = address; vaddr < end;
+                vaddr += DYN_PAGE_SIZE) {
+            khiter_t k = kh_get(memory, memory, vaddr);
+            ClearGuestPageTableEntries(vaddr);
+            t_memory_page page = kh_value(memory, k);
+            /*
+             * Guest pages are 4 KiB while Apple Silicon host VM pages are
+             * 16 KiB. Anonymous guest mappings therefore share one host mmap
+             * backing object and release it only after every guest slice has
+             * gone away. Per-slice munmap would also remove adjacent live guest
+             * pages (notably the pthread structure beside a retired stack).
+             */
+            ReleaseMemoryPageBacking(page);
+            free(page);
+            kh_del(memory, memory, k);
+        }
     }
     lock.unlock();
     InvalidateAllGuestJits(
@@ -914,33 +943,36 @@ u32 Dynarmic_direct_mmap(
         return UINT32_MAX;
     }
     address = static_cast<u32>(reservedAddress);
-    InvalidateGuestMemoryLookupCaches();
+    {
+        GuestVmMappingSeqWriter mappingSeq;
+        InvalidateGuestMemoryLookupCaches();
 
-    const u64 end = reservedAddress + size;
-    for(u64 vaddr = reservedAddress; vaddr < end;
-            vaddr += DYN_PAGE_SIZE) {
-        ClearGuestPageTableEntries(vaddr);
-        if (volatileExternal) {
-            MarkGuestPageEverExternal(vaddr);
+        const u64 end = reservedAddress + size;
+        for(u64 vaddr = reservedAddress; vaddr < end;
+                vaddr += DYN_PAGE_SIZE) {
+            ClearGuestPageTableEntries(vaddr);
+            if (volatileExternal) {
+                MarkGuestPageEverExternal(vaddr);
+            }
         }
-    }
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    for(u64 vaddr = reservedAddress; vaddr < end;
-            vaddr += DYN_PAGE_SIZE) {
-        void *addr = reinterpret_cast<void *>(
-            reinterpret_cast<u64>(src) + off +
-                vaddr - reservedAddress);
-        t_memory_page page = kh_value(memory, kh_get(memory, memory, vaddr));
-        t_memory_backing oldBacking =
-            page->backing;
-        page->addr = addr;
-        page->perms = protection;
-        page->enforceDataPermissions =
-            (protection & PROT_READ) == 0;
-        page->backing = nullptr;
-        UpdateGuestPageTableEntries(vaddr, page);
-        ReleaseMemoryBackingReference(
-            oldBacking);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for(u64 vaddr = reservedAddress; vaddr < end;
+                vaddr += DYN_PAGE_SIZE) {
+            void *addr = reinterpret_cast<void *>(
+                reinterpret_cast<u64>(src) + off +
+                    vaddr - reservedAddress);
+            t_memory_page page = kh_value(memory, kh_get(memory, memory, vaddr));
+            t_memory_backing oldBacking =
+                page->backing;
+            page->addr = addr;
+            page->perms = protection;
+            page->enforceDataPermissions =
+                (protection & PROT_READ) == 0;
+            page->backing = nullptr;
+            UpdateGuestPageTableEntries(vaddr, page);
+            ReleaseMemoryBackingReference(
+                oldBacking);
+        }
     }
     reservations.clear();
     lock.unlock();
@@ -1083,33 +1115,36 @@ u32 Dynarmic_mmap(
 #endif
 
     const u64 end = reservedAddress + size;
-    InvalidateGuestMemoryLookupCaches();
-    for(u64 vaddr = reservedAddress; vaddr < end;
-            vaddr += DYN_PAGE_SIZE) {
-        ClearGuestPageTableEntries(vaddr);
-    }
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    for(u64 vaddr = reservedAddress; vaddr < end;
-            vaddr += DYN_PAGE_SIZE) {
-        t_memory_page page = kh_value(memory, kh_get(memory, memory, vaddr));
-        t_memory_backing oldBacking =
-            page->backing;
-        page->addr = (void *)addr;
-        page->perms = guestProtection;
-        /*
-         * Read-only shared-cache ranges are performance-critical and were
-         * historically direct-mapped. Keep that initial compatibility path;
-         * PROT_NONE/write-only pages and every explicit mprotect transition
-         * use callbacks for strict per-4K data permissions.
-         */
-        page->enforceDataPermissions =
-            (guestProtection & PROT_READ) == 0;
-        page->backing = backing;
-        UpdateGuestPageTableEntries(vaddr, page);
-        ReleaseMemoryBackingReference(
-            oldBacking);
+    {
+        GuestVmMappingSeqWriter mappingSeq;
+        InvalidateGuestMemoryLookupCaches();
+        for(u64 vaddr = reservedAddress; vaddr < end;
+                vaddr += DYN_PAGE_SIZE) {
+            ClearGuestPageTableEntries(vaddr);
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for(u64 vaddr = reservedAddress; vaddr < end;
+                vaddr += DYN_PAGE_SIZE) {
+            t_memory_page page = kh_value(memory, kh_get(memory, memory, vaddr));
+            t_memory_backing oldBacking =
+                page->backing;
+            page->addr = (void *)addr;
+            page->perms = guestProtection;
+            /*
+             * Read-only shared-cache ranges are performance-critical and were
+             * historically direct-mapped. Keep that initial compatibility path;
+             * PROT_NONE/write-only pages and every explicit mprotect transition
+             * use callbacks for strict per-4K data permissions.
+             */
+            page->enforceDataPermissions =
+                (guestProtection & PROT_READ) == 0;
+            page->backing = backing;
+            UpdateGuestPageTableEntries(vaddr, page);
+            ReleaseMemoryBackingReference(
+                oldBacking);
 
-        addr += DYN_PAGE_SIZE;
+            addr += DYN_PAGE_SIZE;
+        }
     }
     reservations.clear();
 #ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
@@ -1164,7 +1199,14 @@ kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
             const khiter_t key = kh_get(memory, memory, u64(source) + offset);
             if(key == kh_end(memory) || !kh_value(memory, key) ||
                     !kh_value(memory, key)->addr) return KERN_INVALID_ADDRESS;
-            copyProtection &= kh_value(memory, key)->perms;
+            const t_memory_page page = kh_value(memory, key);
+            if(page->backing != nullptr) {
+                if((page->backing->hostProtection & PROT_READ) == 0)
+                    return KERN_PROTECTION_FAILURE;
+            } else if((page->perms & PROT_READ) == 0) {
+                return KERN_PROTECTION_FAILURE;
+            }
+            copyProtection &= page->perms;
         }
         if(!anywhere && !overwrite) {
             for(u64 page = destination; page < destination + length; page += DYN_PAGE_SIZE)
@@ -1176,7 +1218,7 @@ kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
         if(!read_guest_memory_with_permissions(source, snapshot.data(),
                 snapshot.size(), PROT_NONE)) return KERN_PROTECTION_FAILURE;
         const u32 mapped = Dynarmic_mmap(static_cast<u32>(destination), length,
-            PROT_READ | PROT_WRITE,
+            PROT_NONE,
             MAP_PRIVATE | MAP_ANONYMOUS | (anywhere ? 0 : MAP_FIXED),
             -1, 0, alignment);
         if(mapped == UINT32_MAX) return KERN_NO_SPACE;
@@ -1184,7 +1226,7 @@ kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
             (PROT_READ | PROT_WRITE | PROT_EXEC);
         if(!write_guest_memory_with_permissions(mapped, snapshot.data(),
                 snapshot.size(), PROT_NONE) ||
-                (finalProtection != (PROT_READ | PROT_WRITE) &&
+                (finalProtection != PROT_NONE &&
                  Dynarmic_mprotect(mapped, length, finalProtection) != 0)) {
             Dynarmic_munmap(mapped, length);
             return KERN_FAILURE;
@@ -1221,19 +1263,22 @@ kern_return_t Dynarmic_vm_remap(u32 *address, u32 size, u32 mask,
     // Retain every source first: an overlapping overwrite may release the
     // original mappings while later pages still refer to those same backings.
     for(const auto &page : pages) ++page.backing->references;
-    InvalidateGuestMemoryLookupCaches();
-    for(size_t index = 0; index < pages.size(); ++index) {
-        ClearGuestPageTableEntries(mapped + index * DYN_PAGE_SIZE);
-    }
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    for(size_t index = 0; index < pages.size(); ++index) {
-        const u64 guestAddress = mapped + index * DYN_PAGE_SIZE;
-        t_memory_page page = kh_value(memory, kh_get(memory, memory, guestAddress));
-        t_memory_backing previous = page->backing;
-        *page = pages[index];
-        page->enforceDataPermissions = true;
-        UpdateGuestPageTableEntries(guestAddress, page);
-        ReleaseMemoryBackingReference(previous);
+    {
+        GuestVmMappingSeqWriter mappingSeq;
+        InvalidateGuestMemoryLookupCaches();
+        for(size_t index = 0; index < pages.size(); ++index) {
+            ClearGuestPageTableEntries(mapped + index * DYN_PAGE_SIZE);
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for(size_t index = 0; index < pages.size(); ++index) {
+            const u64 guestAddress = mapped + index * DYN_PAGE_SIZE;
+            t_memory_page page = kh_value(memory, kh_get(memory, memory, guestAddress));
+            t_memory_backing previous = page->backing;
+            *page = pages[index];
+            page->enforceDataPermissions = true;
+            UpdateGuestPageTableEntries(guestAddress, page);
+            ReleaseMemoryBackingReference(previous);
+        }
     }
     reservations.clear();
     *address = static_cast<u32>(mapped);
@@ -1326,57 +1371,60 @@ int Dynarmic_mprotect(u64 address, u64 size, int perms) {
         return -1;
     }
 
-    /*
-     * Remove fast-path pointers before changing permissions. Any new access
-     * then enters a callback and waits on guestVmMutex until the operation is
-     * committed or rolled back.
-     */
-    InvalidateGuestMemoryLookupCaches();
-    for (const ProtectedPage &protectedPage :
-            pages) {
-        ClearGuestPageTableEntries(protectedPage.address);
-    }
-
-    /*
-     * Host protections are widened when a guest page gains permissions, but
-     * are never narrowed. Per-page guest permissions are enforced by the
-     * page table/callback layer. This is intentional: one 16 KiB host page
-     * can contain four independently protected 4 KiB guest pages, and
-     * revoking the host page could crash another guest thread that already
-     * loaded its fast-path pointer.
-     */
-    for (const BackingProtectionUpdate &update :
-            backingUpdates) {
-        if (update.requiredHostProtection ==
-                update.backing->hostProtection) {
-            continue;
+    {
+        GuestVmMappingSeqWriter mappingSeq;
+        /*
+         * Remove fast-path pointers before changing permissions. Any new access
+         * then enters a callback and waits on guestVmMutex until the operation is
+         * committed or rolled back.
+         */
+        InvalidateGuestMemoryLookupCaches();
+        for (const ProtectedPage &protectedPage :
+                pages) {
+            ClearGuestPageTableEntries(protectedPage.address);
         }
-        if (mprotect(
-                update.backing->addr,
-                update.backing->size,
-                update.requiredHostProtection) != 0) {
-            const int savedErrno = errno;
-            for (const ProtectedPage &protectedPage :
-                    pages) {
-                UpdateGuestPageTableEntries(
-                    protectedPage.address,
-                    protectedPage.page);
+
+        /*
+         * Host protections are widened when a guest page gains permissions, but
+         * are never narrowed. Per-page guest permissions are enforced by the
+         * page table/callback layer. This is intentional: one 16 KiB host page
+         * can contain four independently protected 4 KiB guest pages, and
+         * revoking the host page could crash another guest thread that already
+         * loaded its fast-path pointer.
+         */
+        for (const BackingProtectionUpdate &update :
+                backingUpdates) {
+            if (update.requiredHostProtection ==
+                    update.backing->hostProtection) {
+                continue;
             }
-            errno = savedErrno;
-            return -1;
+            if (mprotect(
+                    update.backing->addr,
+                    update.backing->size,
+                    update.requiredHostProtection) != 0) {
+                const int savedErrno = errno;
+                for (const ProtectedPage &protectedPage :
+                        pages) {
+                    UpdateGuestPageTableEntries(
+                        protectedPage.address,
+                        protectedPage.page);
+                }
+                errno = savedErrno;
+                return -1;
+            }
+            update.backing->hostProtection =
+                update.requiredHostProtection;
         }
-        update.backing->hostProtection =
-            update.requiredHostProtection;
-    }
 
-    for (const ProtectedPage &protectedPage :
-            pages) {
-        protectedPage.page->perms = perms;
-        protectedPage.page->enforceDataPermissions =
-            true;
-        UpdateGuestPageTableEntries(
-            protectedPage.address,
-            protectedPage.page);
+        for (const ProtectedPage &protectedPage :
+                pages) {
+            protectedPage.page->perms = perms;
+            protectedPage.page->enforceDataPermissions =
+                true;
+            UpdateGuestPageTableEntries(
+                protectedPage.address,
+                protectedPage.page);
+        }
     }
     lock.unlock();
     InvalidateAllGuestJits(
@@ -1641,19 +1689,22 @@ int ReplaceGuestMemoryRangeWithPrivateCopy(
     /* Every replacement page is complete before it becomes visible. Old
      * owned backings use the guest-VM epoch retirement path, so a JIT that
      * already loaded an old direct pointer cannot observe freed memory. */
-    InvalidateGuestMemoryLookupCaches();
-    for(const ReplacedPage &entry : pages) {
-        ClearGuestPageTableEntries(entry.address);
-    }
-    for(size_t index = 0; index < pages.size(); ++index) {
-        const ReplacedPage &entry = pages[index];
-        t_memory_backing oldBacking = entry.page->backing;
-        entry.page->addr = privateBytes + index * DYN_PAGE_SIZE;
-        entry.page->backing = privateBacking;
-        ReleaseMemoryBackingReference(oldBacking);
-    }
-    for(const ReplacedPage &entry : pages) {
-        UpdateGuestPageTableEntries(entry.address, entry.page);
+    {
+        GuestVmMappingSeqWriter mappingSeq;
+        InvalidateGuestMemoryLookupCaches();
+        for(const ReplacedPage &entry : pages) {
+            ClearGuestPageTableEntries(entry.address);
+        }
+        for(size_t index = 0; index < pages.size(); ++index) {
+            const ReplacedPage &entry = pages[index];
+            t_memory_backing oldBacking = entry.page->backing;
+            entry.page->addr = privateBytes + index * DYN_PAGE_SIZE;
+            entry.page->backing = privateBacking;
+            ReleaseMemoryBackingReference(oldBacking);
+        }
+        for(const ReplacedPage &entry : pages) {
+            UpdateGuestPageTableEntries(entry.address, entry.page);
+        }
     }
     return 0;
 }
@@ -1685,6 +1736,59 @@ const char *Dynarmic_direct_read_page_span(
         entry + static_cast<uintptr_t>(guestAddress));
 }
 
+const char *Dynarmic_direct_read_contiguous_span(
+        u32 guestAddress, size_t byteCount) {
+    if (!guestAddress || byteCount == 0 ||
+            !GuestAddressRangeIsValid32(guestAddress, byteCount) ||
+            !CurrentThreadInGuestVmEpoch() ||
+            sharedHandle.page_table == nullptr) {
+        return nullptr;
+    }
+    const u64 firstIdx = static_cast<u64>(guestAddress) >> DYN_PAGE_BITS;
+    const u64 lastIdx =
+        (static_cast<u64>(guestAddress) + byteCount - 1) >> DYN_PAGE_BITS;
+    if (lastIdx >= sharedHandle.num_page_table_entries) {
+        return nullptr;
+    }
+    if (firstIdx == lastIdx) {
+        const uintptr_t entry = reinterpret_cast<uintptr_t>(
+            __atomic_load_n(
+                &sharedHandle.page_table[firstIdx],
+                __ATOMIC_ACQUIRE));
+        if (entry == 0 || GuestPageEverExternal(firstIdx)) {
+            return nullptr;
+        }
+        return reinterpret_cast<const char *>(
+            entry + static_cast<uintptr_t>(guestAddress));
+    }
+    const uint64_t seq0 = guestVmMappingSeq.load(std::memory_order_acquire);
+    if ((seq0 & 1u) != 0) {
+        return nullptr;
+    }
+    const uintptr_t baseEntry = reinterpret_cast<uintptr_t>(
+        __atomic_load_n(
+            &sharedHandle.page_table[firstIdx],
+            __ATOMIC_RELAXED));
+    if (baseEntry == 0 || GuestPageEverExternal(firstIdx)) {
+        return nullptr;
+    }
+    for (u64 pageIdx = firstIdx + 1; pageIdx <= lastIdx; ++pageIdx) {
+        const uintptr_t entry = reinterpret_cast<uintptr_t>(
+            __atomic_load_n(
+                &sharedHandle.page_table[pageIdx],
+                __ATOMIC_RELAXED));
+        if (entry != baseEntry || GuestPageEverExternal(pageIdx)) {
+            return nullptr;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (guestVmMappingSeq.load(std::memory_order_relaxed) != seq0) {
+        return nullptr;
+    }
+    return reinterpret_cast<const char *>(
+        baseEntry + static_cast<uintptr_t>(guestAddress));
+}
+
 bool Dynarmic_read_guest_memory_checked(
         u64 address, void *destination, size_t size) {
     if (!GuestAddressRangeIsValid32(address, size)) {
@@ -1696,13 +1800,10 @@ bool Dynarmic_read_guest_memory_checked(
     if (destination == nullptr) {
         return false;
     }
-    size_t spanBytes = 0;
-    if (const char *span = Dynarmic_direct_read_page_span(
-            static_cast<u32>(address), &spanBytes)) {
-        if (spanBytes >= size) {
-            memcpy(destination, span, size);
-            return true;
-        }
+    if (const char *span = Dynarmic_direct_read_contiguous_span(
+            static_cast<u32>(address), size)) {
+        memcpy(destination, span, size);
+        return true;
     }
     return read_guest_memory_with_permissions(
         address, destination, size, PROT_READ);
