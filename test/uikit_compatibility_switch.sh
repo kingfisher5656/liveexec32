@@ -22,7 +22,7 @@ for mode in 0 1; do
         -o "$workdir/nib-$mode"
     "$workdir/nib-$mode"
 
-    for unit in LegacyAutoLayout LegacyFonts LegacyAlerts LegacyRotation GuestSelectorHooks GuestScreenMetrics GuestStatusBar ClassicPresentation; do
+    for unit in LegacyAutoLayout LegacyTraitLayout LegacyFonts LegacyAlerts LegacyRotation GuestSelectorHooks GuestScreenMetrics GuestStatusBar ClassicPresentation; do
         xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=15.0 \
             -std=c++17 -fobjc-arc -Wno-deprecated-declarations \
             -DLC32_UIKIT_COMPATIBILITY="$mode" -I"$repo_root/include" \
@@ -31,7 +31,7 @@ for mode in 0 1; do
             -I"$repo_root/External/mini-gdbstub/include" \
             -c "$repo_root/HostFrameworks/UIKit/$unit.mm" -o "$workdir/$unit.o"
         case "$unit" in
-            LegacyAutoLayout|LegacyFonts|LegacyAlerts) expected=1 ;;
+            LegacyAutoLayout|LegacyTraitLayout|LegacyFonts|LegacyAlerts) expected=1 ;;
             *) expected=$mode ;;
         esac
         pattern='OBJC_.*LC32'

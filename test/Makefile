@@ -1,6 +1,7 @@
 LC32_HOST_TEST_GOALS := check-jit-code-memory-mode check-float-structs check-guest-bootstrap check-memory-hash \
   check-coremedia-time-values-host check-debug-logging check-objc-trace check-build-info check-standalone \
   check-guest-thumb-linker check-guest-linker check-uikit-legacy-rootless-rotation-build \
+  check-uikit-legacy-trait-layout-build \
   check-scalar-callback-signature check-guest-timer-queue check-legacy-nib-loading \
   check-mach-exception-ports check-uikit-background-tasks check-mediaplayer-stop \
   check-foundation-ports-host check-uikit-compatibility-switch check-uikit-status-bar-orientation \
@@ -36,6 +37,7 @@ BUILD_INFO_LOGGING_HOST_TESTS := $(addprefix $(HOST_TEST_OUTPUT_DIR)/build-info-
 .PHONY: check-float-structs check-guest-bootstrap check-memory-hash \
   check-coremedia-time-values-host check-debug-logging check-objc-trace check-build-info check-standalone \
   check-guest-thumb-linker check-uikit-legacy-rootless-rotation-build \
+  check-uikit-legacy-trait-layout-build \
   check-scalar-callback-signature check-guest-timer-queue check-legacy-nib-loading \
   check-mach-exception-ports check-uikit-background-tasks check-mediaplayer-stop \
   check-foundation-ports-host check-uikit-compatibility-switch check-uikit-status-bar-orientation \
@@ -186,6 +188,9 @@ check-guest-linker:
 
 check-uikit-legacy-rootless-rotation-build:
 	sh ./uikit_legacy_rootless_rotation.sh --build-only
+
+check-uikit-legacy-trait-layout-build:
+	sh ./uikit_legacy_trait_layout.sh --build-only --baseline
 
 check-scalar-callback-signature:
 	HOST_CXX="$(HOST_CXX)" python3 scalar_callback_signature.py

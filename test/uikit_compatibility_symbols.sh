@@ -25,6 +25,7 @@ for symbol in 'lc32_interfaceOrientation]' 'lc32_statusBarOrientation]'; do
 done
 # Essential entry points, retained shims, and native forwarders survive either mode.
 check_symbol "$host" 'LC32LegacyAutoLayout' 1
+check_symbol "$host" '+[LC32LegacyTraitLayout load]' 1
 for selector in '_forceLayoutEngineSolutionInRationalEdges' '_hostsLayoutEngineAllowsTAMIC_NO'; do
     xcrun strings "$host" | grep -Fq -- "$selector"
     echo "PASS retained layout selector $selector"
