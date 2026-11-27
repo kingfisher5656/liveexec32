@@ -219,6 +219,11 @@ static const char *GuestMachineOverride() {
              * re-reads hw.machine and logs it (every frame; 200k lines),
              * and it gets no quality tier. */
             { "com.2k.bioshock", "bioshock", "iPhone7,2" },
+            /* Horn (UE3, SDK 6.0) inspects only [machine characterAtIndex:6]
+             * for "iPhone" models and treats < '5' as unsupported, so two-digit
+             * models like "iPhone15,2" read '1' and fall into IOS_Unknown (11).
+             * Report iPhone 5 (enum 3), its highest widescreen iPhone tier. */
+            { "com.zynga.phosphor.horn.1", "HornGame", "iPhone5,1" },
             /* Early Unreal Engine 4 (IOSPlatformMisc GetIOSDeviceType)
              * knows iPhone models up to iPhone7,x (iPhone 6 / 6 Plus) and
              * stops with LowLevelFatalError "This IOS device type is not

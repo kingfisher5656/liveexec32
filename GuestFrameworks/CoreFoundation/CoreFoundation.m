@@ -1,8 +1,14 @@
 #import <LC32/LC32.h>
 #import <CoreFoundation/CoreFoundation+LC32.h>
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 const CFAllocatorRef kCFAllocatorDefault = NULL;
 
@@ -345,52 +351,530 @@ Boolean CFURLGetFileSystemRepresentation(
         LC32_CF_U32(maxBufferLength));
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 /*
- * Deprecated CFURLAccess property lookup (Gamevil's Zenonia 1-4 size their
- * resource reads with kCFURLFileLength).  Only file URLs were ever supported
- * on iOS, so answer from a guest stat() of the URL's path.
+ * Deprecated CFURLAccess file resource helpers (Zenonia 1-4 size resource
+ * reads with CFURLCreatePropertyFromResource; Breakpad in games like Horn
+ * reads /System/Library/CoreServices/SystemVersion.plist with
+ * CFURLCreateDataAndPropertiesFromResource; WhiteRaccoon calls
+ * CFURLDestroyResource). Only file URLs were supported on iOS, so answer
+ * through guest POSIX calls on the URL's translated file-system path.
  */
+static SInt32 LC32CFURLErrorFromErrno(int err) {
+    switch(err) {
+        case ENOENT:
+        case ENOTDIR:
+            return kCFURLResourceNotFoundError;
+        case EACCES:
+        case EPERM:
+        case EROFS:
+            return kCFURLResourceAccessViolationError;
+        default:
+            return kCFURLUnknownError;
+    }
+}
+
+static Boolean LC32CFURLGetFilePath(CFURLRef url, char path[PATH_MAX],
+                                    SInt32 *errorCode) {
+    if(!url) {
+        if(errorCode) *errorCode = kCFURLImproperArgumentsError;
+        return false;
+    }
+    CFURLRef absolute = CFURLCopyAbsoluteURL(url);
+    CFStringRef scheme = absolute ? CFURLCopyScheme(absolute) : NULL;
+    if(absolute) CFRelease(absolute);
+    if(!scheme) {
+        if(errorCode) *errorCode = kCFURLImproperArgumentsError;
+        return false;
+    }
+    const CFComparisonResult cmp = CFStringCompare(
+        scheme, CFSTR("file"), kCFCompareCaseInsensitive);
+    CFRelease(scheme);
+    if(cmp != kCFCompareEqualTo) {
+        if(errorCode) *errorCode = kCFURLUnknownSchemeError;
+        return false;
+    }
+    if(!CFURLGetFileSystemRepresentation(url, true, (UInt8 *)path, PATH_MAX)) {
+        if(errorCode) *errorCode = kCFURLUnknownError;
+        return false;
+    }
+    return true;
+}
+
+static CFArrayRef LC32CFURLCopyDirectoryContents(CFAllocatorRef allocator,
+                                                 const char *path,
+                                                 SInt32 *errorCode) {
+    DIR *dir = opendir(path);
+    if(!dir) {
+        if(errorCode) *errorCode = LC32CFURLErrorFromErrno(errno);
+        return NULL;
+    }
+    CFMutableArrayRef contents = CFArrayCreateMutable(
+        allocator, 0, &kCFTypeArrayCallBacks);
+    if(!contents) {
+        closedir(dir);
+        if(errorCode) *errorCode = kCFURLUnknownError;
+        return NULL;
+    }
+    const size_t baseLen = strlen(path);
+    const BOOL needsSlash = baseLen == 0 || path[baseLen - 1] != '/';
+    struct dirent *entry = NULL;
+    int readErrno = 0;
+    for(;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if(!entry) {
+            readErrno = errno;
+            break;
+        }
+        if(strcmp(entry->d_name, ".") == 0 ||
+           strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char childPath[PATH_MAX];
+        const int written = snprintf(childPath, sizeof(childPath),
+            needsSlash ? "%s/%s" : "%s%s", path, entry->d_name);
+        if(written < 0 || (size_t)written >= sizeof(childPath)) continue;
+        Boolean isDirectory = false;
+        if(entry->d_type == DT_DIR) {
+            isDirectory = true;
+        } else if(entry->d_type == DT_UNKNOWN || entry->d_type == DT_LNK) {
+            struct stat childInfo;
+            if(stat(childPath, &childInfo) == 0 &&
+               S_ISDIR(childInfo.st_mode)) {
+                isDirectory = true;
+            }
+        }
+        CFURLRef childURL = CFURLCreateFromFileSystemRepresentation(
+            allocator, (const UInt8 *)childPath, (CFIndex)written,
+            isDirectory);
+        if(childURL) {
+            CFArrayAppendValue(contents, childURL);
+            CFRelease(childURL);
+        }
+    }
+    closedir(dir);
+    if(readErrno != 0) {
+        CFRelease(contents);
+        if(errorCode) *errorCode = LC32CFURLErrorFromErrno(readErrno);
+        return NULL;
+    }
+    return contents;
+}
+
+static CFTypeRef LC32CFURLCopyFileProperty(
+        CFAllocatorRef allocator, const char *path, BOOL exists,
+        int statErrno, const struct stat *info, CFStringRef property,
+        SInt32 *errorCode) {
+    if(!property) {
+        if(errorCode) *errorCode = kCFURLImproperArgumentsError;
+        return NULL;
+    }
+    if(CFEqual(property, kCFURLFileExists))
+        return CFRetain(exists ? kCFBooleanTrue : kCFBooleanFalse);
+    if(!exists) {
+        if(errorCode) *errorCode = LC32CFURLErrorFromErrno(statErrno);
+        return NULL;
+    }
+    if(CFEqual(property, kCFURLFileLength)) {
+        const SInt64 length = info->st_size;
+        return CFNumberCreate(allocator, kCFNumberSInt64Type, &length);
+    }
+    if(CFEqual(property, kCFURLFilePOSIXMode)) {
+        const SInt32 mode = info->st_mode;
+        return CFNumberCreate(allocator, kCFNumberSInt32Type, &mode);
+    }
+    if(CFEqual(property, kCFURLFileOwnerID)) {
+        const SInt32 owner = info->st_uid;
+        return CFNumberCreate(allocator, kCFNumberSInt32Type, &owner);
+    }
+    if(CFEqual(property, kCFURLFileLastModificationTime)) {
+        return CFDateCreate(allocator, (CFAbsoluteTime)info->st_mtimespec.tv_sec -
+            kCFAbsoluteTimeIntervalSince1970 +
+            info->st_mtimespec.tv_nsec / 1.0e9);
+    }
+    if(CFEqual(property, kCFURLFileDirectoryContents)) {
+        if(!S_ISDIR(info->st_mode)) {
+            if(errorCode) *errorCode = kCFURLPropertyKeyUnavailableError;
+            return NULL;
+        }
+        return LC32CFURLCopyDirectoryContents(allocator, path, errorCode);
+    }
+    if(errorCode) *errorCode = kCFURLUnknownPropertyKeyError;
+    return NULL;
+}
+
+static CFDataRef LC32CFURLReadFileData(CFAllocatorRef allocator,
+                                       const char *path,
+                                       const struct stat *info,
+                                       SInt32 *errorCode) {
+    if(!S_ISREG(info->st_mode)) {
+        if(errorCode) *errorCode = kCFURLUnknownError;
+        return NULL;
+    }
+    const int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if(fd < 0) {
+        if(errorCode) *errorCode = LC32CFURLErrorFromErrno(errno);
+        return NULL;
+    }
+    const size_t maxBytes = 256u * 1024u * 1024u;
+    struct stat fdInfo;
+    if(fstat(fd, &fdInfo) != 0) {
+        const int fstatErrno = errno;
+        close(fd);
+        if(errorCode) *errorCode = LC32CFURLErrorFromErrno(fstatErrno);
+        return NULL;
+    }
+    if(!S_ISREG(fdInfo.st_mode)) {
+        close(fd);
+        if(errorCode) *errorCode = kCFURLUnknownError;
+        return NULL;
+    }
+    size_t capacity = 4096;
+    if(fdInfo.st_size > 0) {
+        if((uint64_t)fdInfo.st_size > maxBytes) {
+            close(fd);
+            if(errorCode) *errorCode = kCFURLUnknownError;
+            return NULL;
+        }
+        capacity = (size_t)fdInfo.st_size < maxBytes
+            ? (size_t)fdInfo.st_size + 1 : maxBytes;
+    }
+    UInt8 *buffer = malloc(capacity);
+    if(!buffer) {
+        close(fd);
+        if(errorCode) *errorCode = kCFURLUnknownError;
+        return NULL;
+    }
+    size_t total = 0;
+    Boolean readOK = true;
+    for(;;) {
+        if(total == capacity) {
+            if(capacity == maxBytes) {
+                UInt8 extra = 0;
+                ssize_t probe = read(fd, &extra, 1);
+                if(probe < 0 && errno == EINTR) continue;
+                if(probe != 0) {
+                    if(errorCode) *errorCode = kCFURLUnknownError;
+                    readOK = false;
+                }
+                break;
+            }
+            const size_t nextCapacity = capacity > maxBytes / 2
+                ? maxBytes : capacity * 2;
+            UInt8 *resized = realloc(buffer, nextCapacity);
+            if(!resized) {
+                if(errorCode) *errorCode = kCFURLUnknownError;
+                readOK = false;
+                break;
+            }
+            buffer = resized;
+            capacity = nextCapacity;
+        }
+        const ssize_t n = read(fd, buffer + total, capacity - total);
+        if(n < 0) {
+            if(errno == EINTR) continue;
+            if(errorCode) *errorCode = LC32CFURLErrorFromErrno(errno);
+            readOK = false;
+            break;
+        }
+        if(n == 0) break;
+        total += (size_t)n;
+    }
+    close(fd);
+
+    CFDataRef data = NULL;
+    if(readOK) {
+        data = CFDataCreate(allocator, total ? buffer : NULL, (CFIndex)total);
+        if(!data && errorCode) *errorCode = kCFURLUnknownError;
+    }
+    free(buffer);
+    return data;
+}
+
+Boolean CFURLCreateDataAndPropertiesFromResource(
+        CFAllocatorRef alloc, CFURLRef url, CFDataRef *resourceData,
+        CFDictionaryRef *properties, CFArrayRef desiredProperties,
+        SInt32 *errorCode) {
+    if(resourceData) *resourceData = NULL;
+    if(properties) *properties = NULL;
+    if(errorCode) *errorCode = 0;
+
+    char path[PATH_MAX];
+    SInt32 err = 0;
+    if(!LC32CFURLGetFilePath(url, path, &err)) {
+        if(errorCode) *errorCode = err;
+        return false;
+    }
+    if(!resourceData && !properties) return true;
+
+    struct stat info;
+    errno = 0;
+    const BOOL exists = stat(path, &info) == 0;
+    const int statErrno = exists ? 0 : errno;
+    Boolean ok = true;
+
+    if(resourceData) {
+        if(!exists) {
+            err = LC32CFURLErrorFromErrno(statErrno);
+            ok = false;
+        } else {
+            SInt32 dataErr = 0;
+            *resourceData = LC32CFURLReadFileData(alloc, path, &info, &dataErr);
+            if(!*resourceData) {
+                ok = false;
+                err = dataErr ? dataErr : kCFURLUnknownError;
+            }
+        }
+    }
+
+    if(properties) {
+        CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
+            alloc, 0, &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+        if(!dict) {
+            ok = false;
+            if(err == 0) err = kCFURLUnknownError;
+        } else if(desiredProperties) {
+            const CFIndex count = CFArrayGetCount(desiredProperties);
+            for(CFIndex i = 0; i < count; i++) {
+                CFStringRef key = (CFStringRef)CFArrayGetValueAtIndex(
+                    desiredProperties, i);
+                SInt32 propErr = 0;
+                CFTypeRef value = LC32CFURLCopyFileProperty(
+                    alloc, path, exists, statErrno, &info, key, &propErr);
+                if(value) {
+                    CFDictionarySetValue(dict, key, value);
+                    CFRelease(value);
+                } else {
+                    if(err == 0) err = propErr ? propErr : kCFURLUnknownError;
+                }
+            }
+        } else {
+            CFDictionarySetValue(dict, kCFURLFileExists,
+                exists ? kCFBooleanTrue : kCFBooleanFalse);
+            if(exists) {
+                const CFStringRef defaultKeys[] = {
+                    kCFURLFileLength,
+                    kCFURLFilePOSIXMode,
+                    kCFURLFileOwnerID,
+                    kCFURLFileLastModificationTime,
+                };
+                for(size_t i = 0;
+                    i < sizeof(defaultKeys) / sizeof(defaultKeys[0]); i++) {
+                    SInt32 propErr = 0;
+                    CFTypeRef value = LC32CFURLCopyFileProperty(
+                        alloc, path, exists, statErrno, &info,
+                        defaultKeys[i], &propErr);
+                    if(value) {
+                        CFDictionarySetValue(dict, defaultKeys[i], value);
+                        CFRelease(value);
+                    }
+                }
+                if(S_ISDIR(info.st_mode)) {
+                    SInt32 dirErr = 0;
+                    CFArrayRef contents = LC32CFURLCopyDirectoryContents(
+                        alloc, path, &dirErr);
+                    if(contents) {
+                        CFDictionarySetValue(
+                            dict, kCFURLFileDirectoryContents, contents);
+                        CFRelease(contents);
+                    } else if(err == 0) {
+                        err = dirErr ? dirErr : kCFURLUnknownError;
+                    }
+                }
+            }
+        }
+        *properties = dict;
+    }
+
+    if(errorCode) *errorCode = err;
+    return ok;
+}
+
+static Boolean LC32CFURLWriteFileProperties(const char *path,
+                                            CFDictionaryRef propertiesToWrite,
+                                            SInt32 *errorCode) {
+    const CFIndex count = CFDictionaryGetCount(propertiesToWrite);
+    if(count <= 0) return true;
+    const void **keys = malloc((size_t)count * sizeof(*keys));
+    const void **values = malloc((size_t)count * sizeof(*values));
+    if(!keys || !values) {
+        free(keys);
+        free(values);
+        if(errorCode) *errorCode = kCFURLUnknownError;
+        return false;
+    }
+    CFDictionaryGetKeysAndValues(propertiesToWrite, keys, values);
+    Boolean ok = true;
+    SInt32 err = 0;
+    for(CFIndex i = 0; i < count; i++) {
+        CFTypeRef key = (CFTypeRef)keys[i];
+        CFTypeRef value = (CFTypeRef)values[i];
+        if(!key) {
+            ok = false;
+            if(err == 0) err = kCFURLImproperArgumentsError;
+            continue;
+        }
+        if(CFEqual(key, kCFURLFilePOSIXMode)) {
+            mode_t mode = 0;
+            Boolean valid = false;
+            if(value && CFGetTypeID(value) == CFNumberGetTypeID()) {
+                SInt32 numMode = 0;
+                if(CFNumberGetValue((CFNumberRef)value,
+                       kCFNumberSInt32Type, &numMode)) {
+                    mode = (mode_t)numMode;
+                    valid = true;
+                }
+            } else if(value && CFGetTypeID(value) == CFDataGetTypeID()) {
+                const CFIndex dataLen = CFDataGetLength((CFDataRef)value);
+                if(dataLen == (CFIndex)sizeof(mode_t)) {
+                    const UInt8 *raw = CFDataGetBytePtr((CFDataRef)value);
+                    if(raw) {
+                        memcpy(&mode, raw, sizeof(mode_t));
+                        valid = true;
+                    }
+                } else if(dataLen == (CFIndex)sizeof(SInt32)) {
+                    const UInt8 *raw = CFDataGetBytePtr((CFDataRef)value);
+                    if(raw) {
+                        SInt32 numMode = 0;
+                        memcpy(&numMode, raw, sizeof(numMode));
+                        mode = (mode_t)numMode;
+                        valid = true;
+                    }
+                }
+            }
+            if(!valid) {
+                ok = false;
+                if(err == 0) err = kCFURLImproperArgumentsError;
+            } else if(chmod(path, mode) != 0) {
+                ok = false;
+                if(err == 0) err = LC32CFURLErrorFromErrno(errno);
+            }
+        } else if(CFEqual(key, kCFURLFileExists) ||
+                  CFEqual(key, kCFURLFileDirectoryContents) ||
+                  CFEqual(key, kCFURLFileLength) ||
+                  CFEqual(key, kCFURLFileLastModificationTime) ||
+                  CFEqual(key, kCFURLFileOwnerID)) {
+            ok = false;
+            if(err == 0) err = kCFURLPropertyKeyUnavailableError;
+        } else {
+            ok = false;
+            if(err == 0) err = kCFURLUnknownPropertyKeyError;
+        }
+    }
+    free(keys);
+    free(values);
+    if(!ok && errorCode && *errorCode == 0) *errorCode = err;
+    return ok;
+}
+
+Boolean CFURLWriteDataAndPropertiesToResource(
+        CFURLRef url, CFDataRef dataToWrite,
+        CFDictionaryRef propertiesToWrite, SInt32 *errorCode) {
+    if(errorCode) *errorCode = 0;
+    char path[PATH_MAX];
+    SInt32 err = 0;
+    if(!LC32CFURLGetFilePath(url, path, &err)) {
+        if(errorCode) *errorCode = err;
+        return false;
+    }
+
+    Boolean ok = true;
+    if(dataToWrite) {
+        const CFIndex length = CFDataGetLength(dataToWrite);
+        if(length < 0) {
+            err = kCFURLImproperArgumentsError;
+            ok = false;
+        } else if(CFURLHasDirectoryPath(url)) {
+            if(mkdir(path, 0777) != 0) {
+                err = LC32CFURLErrorFromErrno(errno);
+                ok = false;
+            }
+        } else {
+            const UInt8 *bytes = length > 0
+                ? CFDataGetBytePtr(dataToWrite) : NULL;
+            if(length > 0 && !bytes) {
+                err = kCFURLUnknownError;
+                ok = false;
+            } else {
+                const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if(fd < 0) {
+                    err = LC32CFURLErrorFromErrno(errno);
+                    ok = false;
+                } else {
+                    size_t remaining = (size_t)length;
+                    while(remaining > 0) {
+                        const ssize_t written = write(fd, bytes, remaining);
+                        if(written < 0) {
+                            if(errno == EINTR) continue;
+                            err = LC32CFURLErrorFromErrno(errno);
+                            ok = false;
+                            break;
+                        }
+                        bytes += written;
+                        remaining -= (size_t)written;
+                    }
+                    if(close(fd) != 0 && ok) {
+                        err = LC32CFURLErrorFromErrno(errno);
+                        ok = false;
+                    }
+                }
+            }
+        }
+    }
+
+    if(ok && propertiesToWrite) {
+        ok = LC32CFURLWriteFileProperties(path, propertiesToWrite, &err);
+    }
+
+    if(errorCode) *errorCode = err;
+    return ok;
+}
+
+Boolean CFURLDestroyResource(CFURLRef url, SInt32 *errorCode) {
+    if(errorCode) *errorCode = 0;
+    char path[PATH_MAX];
+    SInt32 err = 0;
+    if(!LC32CFURLGetFilePath(url, path, &err)) {
+        if(errorCode) *errorCode = err;
+        return false;
+    }
+    const int rc = CFURLHasDirectoryPath(url) ? rmdir(path) : unlink(path);
+    if(rc != 0) {
+        if(errorCode) *errorCode = LC32CFURLErrorFromErrno(errno);
+        return false;
+    }
+    return true;
+}
+
 CFTypeRef CFURLCreatePropertyFromResource(
         CFAllocatorRef allocator, CFURLRef url, CFStringRef property,
         SInt32 *errorCode) {
-    UInt8 path[PATH_MAX];
-    struct stat info;
     if(errorCode) *errorCode = 0;
     if(!url || !property) {
         if(errorCode) *errorCode = kCFURLImproperArgumentsError;
         return NULL;
     }
-    if(!CFURLGetFileSystemRepresentation(url, true, path, sizeof(path))) {
-        if(errorCode) *errorCode = kCFURLUnknownSchemeError;
+    char path[PATH_MAX];
+    SInt32 err = 0;
+    if(!LC32CFURLGetFilePath(url, path, &err)) {
+        if(errorCode) *errorCode = err;
         return NULL;
     }
-    const BOOL exists = stat((const char *)path, &info) == 0;
-    if(CFEqual(property, kCFURLFileExists))
-        return CFRetain(exists ? kCFBooleanTrue : kCFBooleanFalse);
-    if(!exists) {
-        if(errorCode) *errorCode = kCFURLResourceNotFoundError;
-        return NULL;
-    }
-    if(CFEqual(property, kCFURLFileLength)) {
-        const SInt64 length = info.st_size;
-        return CFNumberCreate(allocator, kCFNumberSInt64Type, &length);
-    }
-    if(CFEqual(property, kCFURLFilePOSIXMode)) {
-        const SInt32 mode = info.st_mode;
-        return CFNumberCreate(allocator, kCFNumberSInt32Type, &mode);
-    }
-    if(CFEqual(property, kCFURLFileOwnerID)) {
-        const SInt32 owner = info.st_uid;
-        return CFNumberCreate(allocator, kCFNumberSInt32Type, &owner);
-    }
-    if(CFEqual(property, kCFURLFileLastModificationTime)) {
-        return CFDateCreate(allocator, (CFAbsoluteTime)info.st_mtimespec.tv_sec -
-            kCFAbsoluteTimeIntervalSince1970 +
-            info.st_mtimespec.tv_nsec / 1.0e9);
-    }
-    if(errorCode) *errorCode = kCFURLUnknownPropertyKeyError;
-    return NULL;
+    struct stat info;
+    errno = 0;
+    const BOOL exists = stat(path, &info) == 0;
+    const int statErrno = exists ? 0 : errno;
+    CFTypeRef value = LC32CFURLCopyFileProperty(
+        allocator, path, exists, statErrno, &info, property, &err);
+    if(!value && errorCode) *errorCode = err;
+    return value;
 }
+
+#pragma clang diagnostic pop
 
 CFIndex CFURLGetBytes(CFURLRef url, UInt8 *buffer,
                       CFIndex bufferLength) {

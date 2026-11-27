@@ -60,6 +60,32 @@ int main(void) {
                 stat(created.path.fileSystemRepresentation, &info) == 0 &&
                 S_ISDIR(info.st_mode));
         }
+        /* Pre-iOS-8 Unreal Engine 3 games (Horn) locate their legacy
+         * <HOME>/<Game>.app bundle by stripping /Applications from
+         * NSAllApplicationsDirectory[0]. */
+        const struct {
+            NSSearchPathDirectory directory;
+            NSString *firstRelative;
+        } appDirs[] = {
+            { NSApplicationDirectory, @"Applications" },
+            { NSAllApplicationsDirectory, @"Applications" },
+            { NSAllLibrariesDirectory, @"Library" },
+        };
+        for(unsigned i = 0; i < sizeof(appDirs) / sizeof(appDirs[0]); ++i) {
+            NSArray *expanded = NSSearchPathForDirectoriesInDomains(
+                appDirs[i].directory, NSUserDomainMask, YES);
+            NSArray *tilde = NSSearchPathForDirectoriesInDomains(
+                appDirs[i].directory, NSUserDomainMask, NO);
+            NSString *expectedExpanded =
+                [prefix stringByAppendingString:appDirs[i].firstRelative];
+            NSString *expectedTilde =
+                [@"~/" stringByAppendingString:appDirs[i].firstRelative];
+            check("app-search-path-expanded", expanded.count != 0 &&
+                [pathSpelling([expanded objectAtIndex:0])
+                    isEqualToString:expectedExpanded]);
+            check("app-search-path-tilde", tilde.count != 0 &&
+                [[tilde objectAtIndex:0] isEqualToString:expectedTilde]);
+        }
         /* Keep ordinary string-search failure semantics intact. */
         check("not-found-unchanged", [@"file:///Users/example"
             rangeOfString:@"/var/"].location == NSNotFound);

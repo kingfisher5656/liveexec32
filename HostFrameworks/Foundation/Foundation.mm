@@ -14,33 +14,60 @@ NSString *LC32GuestHomeDirectory() {
     return NSHomeDirectory();
 }
 
-NSString *LC32UserSearchPath(NSSearchPathDirectory directory,
-                             BOOL expandTilde) {
-    NSString *suffix = nil;
+NSArray<NSString *> *LC32UserSearchPaths(NSSearchPathDirectory directory,
+                                         BOOL expandTilde) {
+    NSArray<NSString *> *suffixes = nil;
     switch(directory) {
-        case NSDocumentDirectory: suffix = @"Documents"; break;
-        case NSLibraryDirectory: suffix = @"Library"; break;
-        case NSCachesDirectory: suffix = @"Library/Caches"; break;
+        case NSApplicationDirectory: suffixes = @[@"Applications"]; break;
+        case NSDemoApplicationDirectory:
+            suffixes = @[@"Applications/Demos"]; break;
+        case NSDeveloperApplicationDirectory:
+            suffixes = @[@"Developer/Applications"]; break;
+        case NSAdminApplicationDirectory:
+            suffixes = @[@"Applications/Utilities"]; break;
+        case NSLibraryDirectory: suffixes = @[@"Library"]; break;
+        case NSDeveloperDirectory: suffixes = @[@"Developer"]; break;
+        case NSDocumentationDirectory:
+            suffixes = @[@"Library/Documentation"]; break;
+        case NSDocumentDirectory: suffixes = @[@"Documents"]; break;
+        case NSCachesDirectory: suffixes = @[@"Library/Caches"]; break;
         case NSApplicationSupportDirectory:
-            suffix = @"Library/Application Support"; break;
+            suffixes = @[@"Library/Application Support"]; break;
         case NSAutosavedInformationDirectory:
-            suffix = @"Library/Autosave Information"; break;
-        case NSDesktopDirectory: suffix = @"Desktop"; break;
-        case NSDownloadsDirectory: suffix = @"Downloads"; break;
-        case NSInputMethodsDirectory: suffix = @"Library/Input Methods"; break;
-        case NSMoviesDirectory: suffix = @"Movies"; break;
-        case NSMusicDirectory: suffix = @"Music"; break;
-        case NSPicturesDirectory: suffix = @"Pictures"; break;
-        case NSSharedPublicDirectory: suffix = @"Public"; break;
+            suffixes = @[@"Library/Autosave Information"]; break;
+        case NSDesktopDirectory: suffixes = @[@"Desktop"]; break;
+        case NSDownloadsDirectory: suffixes = @[@"Downloads"]; break;
+        case NSInputMethodsDirectory:
+            suffixes = @[@"Library/Input Methods"]; break;
+        case NSMoviesDirectory: suffixes = @[@"Movies"]; break;
+        case NSMusicDirectory: suffixes = @[@"Music"]; break;
+        case NSPicturesDirectory: suffixes = @[@"Pictures"]; break;
+        case NSSharedPublicDirectory: suffixes = @[@"Public"]; break;
         case NSPreferencePanesDirectory:
-            suffix = @"Library/PreferencePanes"; break;
+            suffixes = @[@"Library/PreferencePanes"]; break;
         case static_cast<NSSearchPathDirectory>(23):
-            suffix = @"Library/Application Scripts"; break;
+            suffixes = @[@"Library/Application Scripts"]; break;
+        case NSAllApplicationsDirectory:
+            suffixes = @[
+                @"Applications",
+                @"Applications/Utilities",
+                @"Developer/Applications",
+                @"Applications/Demos",
+            ];
+            break;
+        case NSAllLibrariesDirectory:
+            suffixes = @[@"Library", @"Developer"];
+            break;
         default: break;
     }
-    if(!suffix) return nil;
+    if(!suffixes) return nil;
     NSString *base = expandTilde ? LC32GuestHomeDirectory() : @"~";
-    return [base stringByAppendingPathComponent:suffix];
+    NSMutableArray<NSString *> *result =
+        [NSMutableArray arrayWithCapacity:suffixes.count];
+    for(NSString *suffix in suffixes) {
+        [result addObject:[base stringByAppendingPathComponent:suffix]];
+    }
+    return result;
 }
 
 } // namespace
@@ -93,8 +120,9 @@ u32 LC32_Foundation_NSSearchPathForDirectoriesInDomains(
 
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
     if(domainMask & NSUserDomainMask) {
-        NSString *userPath = LC32UserSearchPath(directory, expandTilde);
-        if(userPath) [paths addObject:userPath];
+        NSArray<NSString *> *userPaths =
+            LC32UserSearchPaths(directory, expandTilde);
+        if(userPaths) [paths addObjectsFromArray:userPaths];
     }
     const NSSearchPathDomainMask remaining =
         domainMask & ~NSUserDomainMask;
