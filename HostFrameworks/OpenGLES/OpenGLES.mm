@@ -2181,6 +2181,19 @@ void RememberVertexAttribPointer(const ClientArrayDescriptor *descriptor,
     context.currentVao->SetVertexAttribPointer(index, descriptor);
 }
 
+bool TrackedVertexAttribIsInteger(GLuint index) {
+    auto &context = CurrentClientArrayState();
+    std::lock_guard<std::mutex> lock(context.mutex);
+    const VertexArrayClientState &vao = *context.currentVao;
+    if(index < VertexArrayClientState::kFastVertexAttribs) {
+        return ((vao.validVertexAttribMask & (UINT32_C(1) << index)) != 0) &&
+            vao.fastVertexAttribs[index].integer;
+    }
+    auto found = vao.extraVertexAttribs.find(index);
+    return found != vao.extraVertexAttribs.end() && found->second.valid &&
+        found->second.integer;
+}
+
 void RememberClientPointer(const ClientArrayDescriptor *descriptor,
                            ClientArrayKind kind) {
     auto &context = CurrentClientArrayState();
@@ -2901,21 +2914,68 @@ struct ProgramAttributeSet {
     }
 };
 
+struct ActiveProgramAttributeQuery {
+    uintptr_t sharegroupKey = 0;
+    GLuint program = 0;
+    bool invalidated = false;
+    ActiveProgramAttributeQuery *prev = nullptr;
+    ActiveProgramAttributeQuery *next = nullptr;
+};
+
 std::mutex programAttributeMutex;
+ActiveProgramAttributeQuery *activeProgramAttributeQueriesHead = nullptr;
 std::unordered_map<uintptr_t, std::unordered_map<GLuint,
     ProgramAttributeSet>> programAttributes;
+
+struct ScopedActiveProgramAttributeQuery {
+    ActiveProgramAttributeQuery node;
+    bool registered = false;
+
+    ScopedActiveProgramAttributeQuery(uintptr_t sharegroupKey, GLuint program) {
+        node.sharegroupKey = sharegroupKey;
+        node.program = program;
+    }
+
+    void RegisterLocked() {
+        node.invalidated = false;
+        node.prev = nullptr;
+        node.next = activeProgramAttributeQueriesHead;
+        if(activeProgramAttributeQueriesHead) {
+            activeProgramAttributeQueriesHead->prev = &node;
+        }
+        activeProgramAttributeQueriesHead = &node;
+        registered = true;
+    }
+
+    void UnregisterLocked() {
+        if(!registered) return;
+        if(node.prev) node.prev->next = node.next;
+        else activeProgramAttributeQueriesHead = node.next;
+        if(node.next) node.next->prev = node.prev;
+        node.prev = nullptr;
+        node.next = nullptr;
+        registered = false;
+    }
+
+    ~ScopedActiveProgramAttributeQuery() {
+        if(registered) {
+            std::lock_guard<std::mutex> lock(programAttributeMutex);
+            UnregisterLocked();
+        }
+    }
+};
 
 void ForgetProgramAttributes(GLuint program) {
     const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
     std::lock_guard<std::mutex> lock(programAttributeMutex);
+    for(ActiveProgramAttributeQuery *query = activeProgramAttributeQueriesHead;
+        query; query = query->next) {
+        if(query->sharegroupKey == sharegroupKey && query->program == program) {
+            query->invalidated = true;
+        }
+    }
     auto sharegroup = programAttributes.find(sharegroupKey);
     if(sharegroup != programAttributes.end()) sharegroup->second.erase(program);
-}
-
-void ForgetElementRangesForTarget(GLenum target) {
-    GLuint buffer = 0;
-    if(BoundBuffer(target, buffer))
-        ForgetElementRanges(CurrentGLSharegroupKey(), buffer);
 }
 
 void ForgetSharegroupElementRanges(uintptr_t sharegroupKey) {
@@ -2931,6 +2991,12 @@ void ForgetSharegroupElementRanges(uintptr_t sharegroupKey) {
         elementShadows.erase(sharegroupKey);
     }
     std::lock_guard<std::mutex> lock(programAttributeMutex);
+    for(ActiveProgramAttributeQuery *query = activeProgramAttributeQueriesHead;
+        query; query = query->next) {
+        if(query->sharegroupKey == sharegroupKey) {
+            query->invalidated = true;
+        }
+    }
     programAttributes.erase(sharegroupKey);
 }
 
@@ -3418,59 +3484,85 @@ void FilterClientArraysUsedByProgram(LC32EAGLContextStateLifetime *lifetime,
         }
         descriptors.Truncate(kept);
     };
-    {
-        std::lock_guard<std::mutex> lock(programAttributeMutex);
-        auto sharegroup = programAttributes.find(sharegroupKey);
-        if(sharegroup != programAttributes.end()) {
-            auto cached = sharegroup->second.find(
-                static_cast<GLuint>(program));
-            if(cached != sharegroup->second.end()) {
-                filterInPlace(cached->second);
-                return;
+    const GLuint programName = static_cast<GLuint>(program);
+    for(int attempt = 0; attempt < 3; ++attempt) {
+        ScopedActiveProgramAttributeQuery activeQuery(sharegroupKey,
+            programName);
+        {
+            std::lock_guard<std::mutex> lock(programAttributeMutex);
+            auto sharegroup = programAttributes.find(sharegroupKey);
+            if(sharegroup != programAttributes.end()) {
+                auto cached = sharegroup->second.find(programName);
+                if(cached != sharegroup->second.end()) {
+                    filterInPlace(cached->second);
+                    return;
+                }
             }
+            activeQuery.RegisterLocked();
         }
-    }
-    GLint linked = GL_FALSE;
-    glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if(!linked) return;
-    GLint attributeCount = 0;
-    glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &attributeCount);
-    if(attributeCount < 0) return;
-    ProgramAttributeSet used;
-    if(attributeCount > 0) {
-        GLint nameLength = 0;
-        glGetProgramiv(program, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &nameLength);
-        if(nameLength <= 0) return;
-        std::vector<GLchar> name(static_cast<size_t>(nameLength) + 1);
-        for(GLint index = 0; index < attributeCount; ++index) {
-            GLint size = 0;
-            GLenum type = 0;
-            glGetActiveAttrib(program, static_cast<GLuint>(index),
-                static_cast<GLsizei>(name.size()), nullptr, &size, &type,
-                name.data());
-            const GLint location = glGetAttribLocation(program, name.data());
-            if(location < 0) continue;
-            GLint columns = 1;
-            switch(type) {
-                case GL_FLOAT_MAT2: columns = 2; break;
-                case GL_FLOAT_MAT3: columns = 3; break;
-                case GL_FLOAT_MAT4: columns = 4; break;
+        bool queryOk = false;
+        ProgramAttributeSet used;
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if(linked) {
+            GLint attributeCount = 0;
+            glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &attributeCount);
+            if(attributeCount == 0) {
+                queryOk = true;
+            } else if(attributeCount > 0) {
+                GLint nameLength = 0;
+                glGetProgramiv(program, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH,
+                    &nameLength);
+                if(nameLength > 0) {
+                    std::vector<GLchar> name(
+                        static_cast<size_t>(nameLength) + 1);
+                    for(GLint index = 0; index < attributeCount; ++index) {
+                        GLint size = 0;
+                        GLenum type = 0;
+                        glGetActiveAttrib(program, static_cast<GLuint>(index),
+                            static_cast<GLsizei>(name.size()), nullptr, &size,
+                            &type, name.data());
+                        const GLint location = glGetAttribLocation(program,
+                            name.data());
+                        if(location < 0) continue;
+                        GLint columns = 1;
+                        switch(type) {
+                            case GL_FLOAT_MAT2: columns = 2; break;
+                            case GL_FLOAT_MAT3: columns = 3; break;
+                            case GL_FLOAT_MAT4: columns = 4; break;
 #ifdef GL_FLOAT_MAT2x3
-                case GL_FLOAT_MAT2x3: case GL_FLOAT_MAT2x4: columns = 2; break;
-                case GL_FLOAT_MAT3x2: case GL_FLOAT_MAT3x4: columns = 3; break;
-                case GL_FLOAT_MAT4x2: case GL_FLOAT_MAT4x3: columns = 4; break;
+                            case GL_FLOAT_MAT2x3:
+                            case GL_FLOAT_MAT2x4: columns = 2; break;
+                            case GL_FLOAT_MAT3x2:
+                            case GL_FLOAT_MAT3x4: columns = 3; break;
+                            case GL_FLOAT_MAT4x2:
+                            case GL_FLOAT_MAT4x3: columns = 4; break;
 #endif
-                default: break;
+                            default: break;
+                        }
+                        for(GLint slot = 0;
+                            slot < columns * std::max(size, 1); ++slot) {
+                            used.Insert(static_cast<GLuint>(location + slot));
+                        }
+                    }
+                    queryOk = true;
+                }
             }
-            for(GLint slot = 0; slot < columns * std::max(size, 1); ++slot)
-                used.Insert(static_cast<GLuint>(location + slot));
+        }
+        bool invalidated = false;
+        {
+            std::lock_guard<std::mutex> lock(programAttributeMutex);
+            invalidated = activeQuery.node.invalidated;
+            activeQuery.UnregisterLocked();
+            if(!invalidated && queryOk) {
+                programAttributes[sharegroupKey][programName] = used;
+            }
+        }
+        if(!invalidated) {
+            if(queryOk) filterInPlace(used);
+            return;
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(programAttributeMutex);
-        programAttributes[sharegroupKey][static_cast<GLuint>(program)] = used;
-    }
-    filterInPlace(used);
 }
 
 void DisableAllClientVertexAttribsForEmptyDraw(
@@ -4699,11 +4791,20 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             NoteTexture2DSize(U(0), I(1), I(5), I(6));
             return 0;
         case LC32OpenGLESOpCopyTexSubImage2D: REQUIRE(8); LC32_GL_TIME_NATIVE(glCopyTexSubImage2D(U(0), I(1), I(2), I(3), I(4), I(5), I(6), I(7))); return 0;
-        case LC32OpenGLESOpCopyBufferSubData:
+        case LC32OpenGLESOpCopyBufferSubData: {
             REQUIRE(5);
-            ForgetElementRangesForTarget(U(1));
-            glCopyBufferSubData(U(0), U(1), I(2), I(3), I(4));
+            GLuint dstBuffer = 0;
+            const bool hasDst = BoundBuffer(U(1), dstBuffer);
+            const uintptr_t sharegroupKey =
+                hasDst ? CurrentGLSharegroupKey() : 0;
+            if(hasDst) ForgetElementRanges(sharegroupKey, dstBuffer);
+            {
+                std::lock_guard<std::mutex> lock(mappedBufferMutex);
+                glCopyBufferSubData(U(0), U(1), I(2), I(3), I(4));
+                if(hasDst) ForgetElementRanges(sharegroupKey, dstBuffer);
+            }
             return 0;
+        }
         case LC32OpenGLESOpCopyTexSubImage3D:
             REQUIRE(9); glCopyTexSubImage3D(U(0), I(1), I(2), I(3), I(4),
                 I(5), I(6), I(7), I(8)); return 0;
@@ -4790,6 +4891,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             REQUIRE(1);
             ForgetProgramAttributes(U(0));
             glDeleteProgram(U(0));
+            ForgetProgramAttributes(U(0));
             return 0;
         case LC32OpenGLESOpDeleteShader: REQUIRE(1); glDeleteShader(U(0)); return 0;
         case LC32OpenGLESOpDeleteSyncAPPLE: {
@@ -4988,6 +5090,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             REQUIRE(1);
             ForgetProgramAttributes(U(0));
             LC32_GL_TIME_NATIVE(glLinkProgram(U(0)));
+            ForgetProgramAttributes(U(0));
             return 0;
         case LC32OpenGLESOpPixelStorei: REQUIRE(2); glPixelStorei(U(0), I(1)); return 0;
         case LC32OpenGLESOpPauseTransformFeedback:
@@ -5313,6 +5416,7 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             ForgetProgramAttributes(U(0));
             glProgramBinary(U(0), U(1), length ? binary.data() : nullptr,
                 length);
+            ForgetProgramAttributes(U(0));
             return 0;
         }
         case LC32OpenGLESOpGetActiveUniformBlockName: {
@@ -5611,13 +5715,17 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                 return 0;
             }
             const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
+            LC32EAGLContextStateLifetime *bufLifetime =
+                ContextStateLifetimeForContext(EAGLContext.currentContext);
+            const EAGLRenderingAPI bufApi =
+                bufLifetime ? bufLifetime->_api : kEAGLRenderingAPIOpenGLES1;
             ForgetElementRanges(sharegroupKey, buffer);
             uint32_t guestPointer = 0;
-            bool leftMapped = false;
             {
                 std::lock_guard<std::mutex> lock(mappedBufferMutex);
                 auto mapped = FindMappedBufferLocked(sharegroupKey, U(0),
                     buffer);
+                bool leftMapped = false;
                 LC32_GL_TIME_NATIVE(glBufferData(U(0), signedSize, data, U(3)));
                 if(mapped != mappedBuffers.end()) {
                     GLint stillMapped = GL_TRUE;
@@ -5630,25 +5738,21 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                         leftMapped = true;
                     }
                 }
-            }
-            LC32EAGLContextStateLifetime *bufLifetime =
-                ContextStateLifetimeForContext(EAGLContext.currentContext);
-            const EAGLRenderingAPI bufApi =
-                bufLifetime ? bufLifetime->_api : kEAGLRenderingAPIOpenGLES1;
-            bool recordedShadow = false;
-            if(!leftMapped && U(0) == GL_ELEMENT_ARRAY_BUFFER &&
-               (U(2) != 0 || signedSize == 0) &&
-               BufferUsageValid(U(3), bufApi)) {
-                GLint actualSize = -1;
-                glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE,
-                    &actualSize);
-                if(actualSize == signedSize) {
-                    RecordBufferData(sharegroupKey, buffer, bytes);
-                    recordedShadow = true;
+                bool recordedShadow = false;
+                if(!leftMapped && U(0) == GL_ELEMENT_ARRAY_BUFFER &&
+                   (U(2) != 0 || signedSize == 0) &&
+                   BufferUsageValid(U(3), bufApi)) {
+                    GLint actualSize = -1;
+                    glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER,
+                        GL_BUFFER_SIZE, &actualSize);
+                    if(actualSize == signedSize) {
+                        RecordBufferData(sharegroupKey, buffer, bytes);
+                        recordedShadow = true;
+                    }
                 }
-            }
-            if(!recordedShadow) {
-                ForgetElementRanges(sharegroupKey, buffer);
+                if(!recordedShadow) {
+                    ForgetElementRanges(sharegroupKey, buffer);
+                }
             }
             ReleaseGuestMappingPointer(guestPointer);
             return 0;
@@ -5663,27 +5767,33 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             }
             std::vector<uint8_t> bytes;
             if(!ReadGuestBytes(U(3), signedSize, bytes)) return 0;
+            GLuint buffer = 0;
+            if(!BoundBuffer(U(0), buffer)) {
+                LC32_GL_TIME_NATIVE(glBufferSubData(U(0), signedOffset,
+                    signedSize, signedSize ? bytes.data() : nullptr));
+                return 0;
+            }
+            const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
+            std::lock_guard<std::mutex> lock(mappedBufferMutex);
+            const bool isMapped = FindMappedBufferLocked(sharegroupKey, U(0),
+                buffer) != mappedBuffers.end();
+            GLint nativeMapped = GL_FALSE;
+            if(!isMapped && U(0) == GL_ELEMENT_ARRAY_BUFFER &&
+               signedOffset == 0 && signedSize > 0) {
+                glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER,
+                    GL_BUFFER_MAPPED_OES, &nativeMapped);
+            }
             LC32_GL_TIME_NATIVE(glBufferSubData(U(0), signedOffset, signedSize,
                 signedSize ? bytes.data() : nullptr));
-            GLuint buffer = 0;
-            if(BoundBuffer(U(0), buffer)) {
-                const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
-                bool isMapped = false;
-                {
-                    std::lock_guard<std::mutex> lock(mappedBufferMutex);
-                    isMapped = FindMappedBufferLocked(sharegroupKey, U(0),
-                        buffer) != mappedBuffers.end();
+            if(!isMapped && nativeMapped == GL_FALSE) {
+                GLint actualSize = -1;
+                if(U(0) == GL_ELEMENT_ARRAY_BUFFER && signedOffset == 0 &&
+                   signedSize > 0) {
+                    glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER,
+                        GL_BUFFER_SIZE, &actualSize);
                 }
-                if(!isMapped) {
-                    GLint actualSize = -1;
-                    if(U(0) == GL_ELEMENT_ARRAY_BUFFER && signedOffset == 0 &&
-                       signedSize > 0) {
-                        glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER,
-                            GL_BUFFER_SIZE, &actualSize);
-                    }
-                    RecordBufferSubData(sharegroupKey, buffer,
-                        static_cast<size_t>(signedOffset), bytes, actualSize);
-                }
+                RecordBufferSubData(sharegroupKey, buffer,
+                    static_cast<size_t>(signedOffset), bytes, actualSize);
             }
             return 0;
         }
@@ -6163,11 +6273,17 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             if(CurrentContextIsES3())
                 glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
             if(packBuffer) {
-                ForgetElementRanges(CurrentGLSharegroupKey(),
+                const uintptr_t sharegroupKey = CurrentGLSharegroupKey();
+                ForgetElementRanges(sharegroupKey,
                     static_cast<GLuint>(packBuffer));
-                LC32_GL_TIME_NATIVE(glReadPixels(I(0), I(1), I(2), I(3), U(4), U(5),
-                    reinterpret_cast<void *>(
-                        static_cast<uintptr_t>(U(6)))));
+                {
+                    std::lock_guard<std::mutex> lock(mappedBufferMutex);
+                    LC32_GL_TIME_NATIVE(glReadPixels(I(0), I(1), I(2), I(3), U(4), U(5),
+                        reinterpret_cast<void *>(
+                            static_cast<uintptr_t>(U(6)))));
+                    ForgetElementRanges(sharegroupKey,
+                        static_cast<GLuint>(packBuffer));
+                }
                 return 0;
             }
             GLint alignment = 4;
@@ -6501,10 +6617,78 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
             const bool valid = VertexAttribDescriptorValid(U(0), I(1), U(2),
                 I(3), true);
             if(!valid) {
+                const bool canCheckAcceptance =
+                    VertexAttribIndexValid(U(0)) && I(1) >= 1 && I(1) <= 4 &&
+                    I(3) >= 0 && ClientArrayScalarSize(U(2)) != 0;
+                const bool es3 = canCheckAcceptance && CurrentContextIsES3();
+                GLint beforeType = 0, beforeSize = 0, beforeStride = 0;
+                GLint beforeBinding = 0, beforeInteger = GL_FALSE;
+                if(canCheckAcceptance) {
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_TYPE,
+                        &beforeType);
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_SIZE,
+                        &beforeSize);
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_STRIDE,
+                        &beforeStride);
+                    glGetVertexAttribiv(U(0),
+                        GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &beforeBinding);
+#ifdef GL_VERTEX_ATTRIB_ARRAY_INTEGER
+                    if(es3) {
+                        glGetVertexAttribiv(U(0),
+                            GL_VERTEX_ATTRIB_ARRAY_INTEGER, &beforeInteger);
+                    }
+#endif
+                }
                 glVertexAttribIPointer(U(0), I(1), U(2), I(3), binding
                     ? reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(4)))
                     : nullptr);
+                if(canCheckAcceptance) {
+                    GLint afterType = 0, afterSize = 0, afterStride = 0;
+                    GLint afterBinding = 0, afterInteger = GL_TRUE;
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_TYPE,
+                        &afterType);
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_SIZE,
+                        &afterSize);
+                    glGetVertexAttribiv(U(0), GL_VERTEX_ATTRIB_ARRAY_STRIDE,
+                        &afterStride);
+                    glGetVertexAttribiv(U(0),
+                        GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &afterBinding);
+#ifdef GL_VERTEX_ATTRIB_ARRAY_INTEGER
+                    if(es3) {
+                        glGetVertexAttribiv(U(0),
+                            GL_VERTEX_ATTRIB_ARRAY_INTEGER, &afterInteger);
+                    }
+#endif
+                    const bool matches =
+                        afterType == static_cast<GLint>(U(2)) &&
+                        afterSize == I(1) && afterStride == I(3) &&
+                        afterBinding == binding && afterInteger != GL_FALSE;
+                    const bool changed =
+                        afterType != beforeType || afterSize != beforeSize ||
+                        afterStride != beforeStride ||
+                        afterBinding != beforeBinding ||
+                        (es3 && afterInteger != beforeInteger);
+                    if(matches &&
+                       (changed || TrackedVertexAttribIsInteger(U(0)))) {
+                        if(!binding) {
+                            ClientArrayDescriptor descriptor;
+                            descriptor.kind = ClientArrayKind::VertexAttrib;
+                            descriptor.index = U(0);
+                            descriptor.size = I(1);
+                            descriptor.type = U(2);
+                            descriptor.stride = I(3);
+                            descriptor.guestPointer = U(4);
+                            descriptor.integer = true;
+                            descriptor.valid = true;
+                            RememberVertexAttribPointer(&descriptor,
+                                descriptor.index);
+                        } else {
+                            RememberVertexAttribPointer(nullptr, U(0));
+                            GLAttribCheckNotePointer(U(0), binding, U(4));
+                        }
+                    }
+                }
                 return 0;
             }
             if(!binding) {
@@ -7034,9 +7218,15 @@ static uint32_t DispatchOpenGLESCall(uint32_t opcode, uint32_t guestCall,
                     "%d, 0x%x) ARRAY_BUFFER %d valid %d\n", U(0), I(1), U(2),
                     U(3), I(4), U(5), binding, valid);
             if(!valid) {
+                bool packedType = false;
+#ifdef GL_INT_2_10_10_10_REV
+                packedType = (U(2) == GL_INT_2_10_10_10_REV ||
+                    U(2) == GL_UNSIGNED_INT_2_10_10_10_REV) && I(1) == 4;
+#endif
                 const bool canCheckAcceptance =
                     VertexAttribIndexValid(U(0)) && I(1) >= 1 && I(1) <= 4 &&
-                    I(4) >= 0 && ClientArrayScalarSize(U(2)) != 0;
+                    I(4) >= 0 &&
+                    (ClientArrayScalarSize(U(2)) != 0 || packedType);
                 LC32_GL_TIME_NATIVE(glVertexAttribPointer(U(0), I(1), U(2), U(3), I(4), binding
                     ? reinterpret_cast<const void *>(
                         static_cast<uintptr_t>(U(5)))
