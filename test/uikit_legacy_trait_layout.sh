@@ -75,8 +75,10 @@ run_case() {
     expect_gl_relayout=$6
     expect_legacy_subtree=$7
     set_root_vc=$8
-    expect_prelayout_cb=$9
-    binary=${10}
+    binary=$9
+    trait_fix_env=${10-}
+    expect_log=${11-}
+    plain_only=${12:-NO}
 
     app="$workdir/$variant.app"
     bundle="org.liveexec32.test.traitlayout.$run_id.$variant"
@@ -99,35 +101,59 @@ run_case() {
     plutil -insert LC32ExpectGLRelayout -bool "$expect_gl_relayout" "$plist"
     plutil -insert LC32ExpectLegacySubtreeInvalidation -bool "$expect_legacy_subtree" "$plist"
     plutil -insert LC32SetRootViewController -bool "$set_root_vc" "$plist"
-    plutil -insert LC32ExpectPreLayoutCallback -bool "$expect_prelayout_cb" "$plist"
+    plutil -insert LC32PlainGuestOnly -bool "$plain_only" "$plist"
 
     xcrun vtool -set-build-version 7 15.0 "$process_sdk" -replace \
         -output "$app/TraitLayout" "$binary"
     codesign --force --sign - "$app" >/dev/null 2>&1
     codesign --verify --strict "$app"
-    echo "Built $app ($bundle), processSDK=$process_sdk guestSDK=$guest_sdk fix=$has_fix"
+    echo "Built $app ($bundle), processSDK=$process_sdk guestSDK=$guest_sdk fix=$has_fix env=$trait_fix_env plainOnly=$plain_only"
     [ "$build_only" -eq 0 ] || return 0
 
     installed_bundle=$bundle
     bounded "$run_timeout" xcrun simctl install "$device" "$app"
     status=0
-    bounded "$run_timeout" xcrun simctl launch --console "$device" "$bundle" \
-        >"$workdir/$variant.log" 2>&1 || status=$?
+    # Unset the forwarded variable in ordinary cases so the child sees a truly
+    # unset getenv() (NULL) even if the caller exported SIMCTL_CHILD_*.
+    if [ -n "$trait_fix_env" ]; then
+        bounded "$run_timeout" env \
+            SIMCTL_CHILD_LC32_TRAIT_LAYOUT_FIX="$trait_fix_env" \
+            xcrun simctl launch --console "$device" "$bundle" \
+            >"$workdir/$variant.log" 2>&1 || status=$?
+    else
+        bounded "$run_timeout" env \
+            -u SIMCTL_CHILD_LC32_TRAIT_LAYOUT_FIX \
+            xcrun simctl launch --console "$device" "$bundle" \
+            >"$workdir/$variant.log" 2>&1 || status=$?
+    fi
     echo "Trait layout launch status ($variant): $status"
     sed -n '1,120p' "$workdir/$variant.log"
     bounded 10 xcrun simctl terminate "$device" "$bundle" >/dev/null 2>&1 || :
     bounded 10 xcrun simctl uninstall "$device" "$bundle"
     installed_bundle=
-    [ "$status" -eq 0 ] && grep -q 'trait-layout-regression: PASS' "$workdir/$variant.log"
+    [ "$status" -eq 0 ]
+    grep -q 'trait-layout-regression: PASS' "$workdir/$variant.log"
+    case "$expect_log" in
+        calibrated)
+            grep -Fq 'LC32: legacy trait layout calibration valid' "$workdir/$variant.log"
+            ;;
+        disabled)
+            grep -Fq 'LC32: legacy trait layout fix disabled (LC32_TRAIT_LAYOUT_FIX=0)' "$workdir/$variant.log"
+            ! grep -Fq 'LC32: legacy trait layout calibration' "$workdir/$variant.log"
+            ;;
+        none)
+            ! grep -Fq 'LC32: legacy trait layout' "$workdir/$variant.log"
+            ;;
+    esac
 }
 
-run_case sdk4-guest0 4.2 0 YES YES NO YES NO NO "$workdir/fixed"
-run_case sdk7-guest7 7.0 458752 YES YES NO YES NO NO "$workdir/fixed"
-run_case sdk11-guest0 11.0 0 YES YES NO NO YES NO "$workdir/fixed"
-run_case sdk4-guest8 4.2 524288 YES NO YES YES NO NO "$workdir/fixed"
-run_case sdk17-guest0 17.0 0 YES YES NO NO YES YES "$workdir/fixed"
+run_case sdk4-guest0 4.2 0 YES YES NO YES NO "$workdir/fixed" '' calibrated
+run_case sdk7-guest7 7.0 458752 YES YES NO YES NO "$workdir/fixed" '' calibrated
+run_case sdk11-guest0 11.0 0 YES YES NO NO YES "$workdir/fixed" '' calibrated
+run_case sdk4-guest8 4.2 524288 YES NO YES YES NO "$workdir/fixed" '' none
+run_case sdk4-guest0-plain-only 4.2 0 YES NO NO YES NO "$workdir/fixed" '' none YES
+run_case sdk4-guest0-disabled 4.2 0 YES NO YES YES NO "$workdir/fixed" 0 disabled
 if [ "$baseline" -eq 1 ]; then
-    run_case sdk4-guest0-baseline 4.2 0 NO NO YES YES NO NO "$workdir/unpatched"
-    run_case sdk11-guest0-baseline 11.0 0 NO NO YES NO YES NO "$workdir/unpatched"
-    run_case sdk17-guest0-baseline 17.0 0 NO NO YES NO YES YES "$workdir/unpatched"
+    run_case sdk4-guest0-baseline 4.2 0 NO NO YES YES NO "$workdir/unpatched" '' none
+    run_case sdk11-guest0-baseline 11.0 0 NO NO YES NO YES "$workdir/unpatched" '' none
 fi

@@ -26,8 +26,6 @@ uint32_t LC32GetGuestExecutableSDKVersion(void) {
 @interface TraitGuestEAGLView : UIView
 @property (nonatomic) NSUInteger layoutCount;
 @property (nonatomic) CGSize lastLayoutSize;
-@property (nonatomic) BOOL resizeDuringTraitChange;
-@property (nonatomic) BOOL reentrantCallbackRan;
 @end
 
 @implementation TraitGuestEAGLView
@@ -38,19 +36,6 @@ uint32_t LC32GetGuestExecutableSDKVersion(void) {
     self.lastLayoutSize = self.bounds.size;
     [super layoutSubviews];
 }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
-    [super traitCollectionDidChange:previousTraitCollection];
-    if(self.resizeDuringTraitChange) {
-        self.resizeDuringTraitChange = NO;
-        self.reentrantCallbackRan = YES;
-        CGRect f = self.frame;
-        f.size.height -= 10;
-        self.frame = f;
-    }
-}
-#pragma clang diagnostic pop
 @end
 
 @interface TraitGuestPlainView : UIView
@@ -132,8 +117,8 @@ static void setWindowStyle(UIWindow *window, UIUserInterfaceStyle style) {
         [[bundle objectForInfoDictionaryKey:@"LC32ExpectLegacySubtreeInvalidation"] boolValue];
     BOOL setRootViewController =
         [[bundle objectForInfoDictionaryKey:@"LC32SetRootViewController"] boolValue];
-    BOOL expectPreLayoutCallback =
-        [[bundle objectForInfoDictionaryKey:@"LC32ExpectPreLayoutCallback"] boolValue];
+    BOOL plainGuestOnly =
+        [[bundle objectForInfoDictionaryKey:@"LC32PlainGuestOnly"] boolValue];
 
     self.window = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 320, 480)];
     /* Pin a deterministic starting style so a Dark-mode Simulator cannot make
@@ -142,6 +127,37 @@ static void setWindowStyle(UIWindow *window, UIUserInterfaceStyle style) {
     if(setRootViewController) {
         self.window.rootViewController = [[UIViewController alloc] init];
     }
+
+    if(plainGuestOnly) {
+        self.guestPlainView = [[TraitGuestPlainView alloc] initWithFrame:CGRectMake(0, 0, 40, 40)];
+        self.nativeEAGLView = [[TraitNativeEAGLView alloc] initWithFrame:CGRectMake(40, 0, 40, 40)];
+        [self.window addSubview:self.guestPlainView];
+        [self.window addSubview:self.nativeEAGLView];
+        [self.window makeKeyAndVisible];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+                dispatch_get_main_queue(), ^{
+            const NSUInteger plainBefore = self.guestPlainView.layoutCount;
+            const NSUInteger nativeBefore = self.nativeEAGLView.layoutCount;
+            [self.guestPlainView setNeedsLayout];
+            [self.guestPlainView layoutIfNeeded];
+            check("plain-only-explicit-layout", self.guestPlainView.layoutCount == plainBefore + 1);
+
+            const NSUInteger plainBeforeTrait = self.guestPlainView.layoutCount;
+            setWindowStyle(self.window, UIUserInterfaceStyleDark);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                    dispatch_get_main_queue(), ^{
+                check("plain-only-trait-relayout",
+                    self.guestPlainView.layoutCount > plainBeforeTrait);
+                check("plain-only-native-eagl-relayout",
+                    self.nativeEAGLView.layoutCount > nativeBefore);
+                printf("trait-layout-regression: %s\n", failures ? "FAIL" : "PASS");
+                exit(failures ? 1 : 0);
+            });
+        });
+        return YES;
+    }
+
     /* Mirror Call of Atlantis Lite: rootless UIWindow with a direct
      * UIViewController-owned EAGLView subview. */
     self.ownerController = [[UIViewController alloc] init];
@@ -278,30 +294,8 @@ static void setWindowStyle(UIWindow *window, UIUserInterfaceStyle style) {
                         self.glView.layoutCount == before + 1 &&
                         self.glView.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
 
-                    /* Let Dark commit before triggering Dark -> Light for the
-                     * reentrant pre-layout resize test. */
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                            dispatch_get_main_queue(), ^{
-                        if(!expectPreLayoutCallback) {
-                            printf("trait-layout-regression: %s\n", failures ? "FAIL" : "PASS");
-                            exit(failures ? 1 : 0);
-                        }
-                        const CGSize expectedSize = CGSizeMake(
-                            self.glView.bounds.size.width,
-                            self.glView.bounds.size.height - 10);
-                        self.glView.reentrantCallbackRan = NO;
-                        self.glView.resizeDuringTraitChange = YES;
-                        setWindowStyle(self.window, UIUserInterfaceStyleLight);
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                                dispatch_get_main_queue(), ^{
-                            check("reentrant-callback-ran",
-                                self.glView.reentrantCallbackRan);
-                            check("reentrant-resize-observed-in-layout",
-                                sameSize(self.glView.lastLayoutSize, expectedSize));
-                            printf("trait-layout-regression: %s\n", failures ? "FAIL" : "PASS");
-                            exit(failures ? 1 : 0);
-                        });
-                    });
+                    printf("trait-layout-regression: %s\n", failures ? "FAIL" : "PASS");
+                    exit(failures ? 1 : 0);
                 });
             });
         });

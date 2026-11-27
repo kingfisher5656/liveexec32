@@ -198,6 +198,14 @@ static NSArray<LC32SettingsSection *> *LC32GlobalSettingSections(void) {
                 @[@[@"Default (32 MB)", NSNull.null], @[@"16 MB", @"16"],
                   @[@"64 MB", @"64"], @[@"128 MB", @"128"]]),
         ]),
+        LC32Section(LC32SectionKindSettings, @"Compatibility", nil, @[
+            LC32SwitchSetting(@"LC32_TRAIT_LAYOUT_FIX",
+                @"Legacy Trait Layout Fix",
+                @"Ignores iOS trait-change layout triggers on pre-iOS-8 OpenGL "
+                "views so appearance updates do not tear down their renderer. "
+                "Turn off only for diagnostics.",
+                YES, NO, @"1", @"0"),
+        ]),
         LC32Section(LC32SectionKindSettings, @"Diagnostics", nil, @[
             LC32SwitchSetting(@"LC32_PROFILE", @"Performance Profiler",
                 @"Logs where each game thread's time goes every 5 seconds. "
@@ -258,6 +266,11 @@ static NSArray<LC32SettingsSection *> *LC32GameSettingSections(void) {
                   @[@"iPad 2 (iPad2,1)", @"iPad2,1"],
                   @[@"iPad 4 (iPad3,4)", @"iPad3,4"],
                   @[@"iPad Air (iPad4,1)", @"iPad4,1"]]),
+            LC32ChoiceSetting(@"LC32_TRAIT_LAYOUT_FIX",
+                @"Legacy Trait Layout Fix",
+                @"Turn off only for diagnostics if this game needs "
+                "trait-triggered OpenGL view layout.",
+                @[inherit, @[@"On", @"1"], @[@"Off", @"0"]]),
         ]),
     ];
 }
@@ -293,6 +306,8 @@ static NSString *LC32SummaryForGameValue(NSString *key, NSString *value) {
         return [NSString stringWithFormat:@"JIT %@ MB", value];
     if([key isEqualToString:@"LC32_GUEST_MACHINE"])
         return value.length ? value : @"Real device";
+    if([key isEqualToString:@"LC32_TRAIT_LAYOUT_FIX"])
+        return [value hasPrefix:@"0"] ? @"Trait layout fix off" : @"Trait layout fix on";
     return key;
 }
 
